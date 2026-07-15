@@ -294,12 +294,26 @@ def _content_length(response: Any) -> int | None:
     return value if value >= 0 else None
 
 
-class TavilyClient:
-    """Tavily REST client with bounded retries and no secret persistence."""
+class _RateLimitSignal(Exception):
+    """Internal signal: current API key got a 429, try rotating to the next."""
 
     def __init__(
         self,
-        api_key: str | None = None,
+        *,
+        retry_after: float | None = None,
+        inner: Exception | None = None,
+    ) -> None:
+        self.retry_after = retry_after
+        self.inner = inner
+        super().__init__("rate limited")
+
+
+class TavilyClient:
+    """Tavily REST client with bounded retries, multi-key rotation, and no secret persistence."""
+
+    def __init__(
+        self,
+        api_key: str | Sequence[str] | None = None,
         *,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = 3,
@@ -307,9 +321,12 @@ class TavilyClient:
         sleep: Callable[[float], None] = time.sleep,
         opener: Callable[..., Any] | None = None,
     ) -> None:
-        key = (api_key if api_key is not None else os.getenv("TAVILY_API_KEY", "")).strip()
-        if not key:
-            raise TavilyConfigError("TAVILY_API_KEY is required")
+        keys = self._resolve_keys(api_key)
+        if not keys:
+            raise TavilyConfigError(
+                "At least one Tavily API key is required "
+                "(TAVILY_API_KEYS or TAVILY_API_KEY)"
+            )
         if timeout <= 0 or not math.isfinite(timeout):
             raise TavilyConfigError("timeout must be finite and greater than zero")
         if max_retries < 0:
@@ -317,29 +334,148 @@ class TavilyClient:
         if backoff_base < 0 or not math.isfinite(backoff_base):
             raise TavilyConfigError("backoff_base must be finite and non-negative")
 
-        self.__api_key = key
+        self._keys: list[str] = keys
+        self._key_index: int = 0
+        # Per-key rate-limit cooldown: key_str -> epoch_seconds when usable again.
+        self._rate_limited_until: dict[str, float] = {}
         self.timeout = float(timeout)
         self.max_retries = int(max_retries)
         self.backoff_base = float(backoff_base)
         self._sleep = sleep
         self._opener = opener or _NO_REDIRECT_OPENER.open
 
+    # ------------------------------------------------------------------
+    # Key management
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_keys(api_key: str | Sequence[str] | None) -> list[str]:
+        """Collect keys from the constructor argument and/or environment.
+
+        Priority:
+        1. ``api_key`` argument (string or sequence of strings).
+        2. ``TAVILY_API_KEYS`` env var — comma- or whitespace-separated list.
+        3. ``TAVILY_API_KEY`` env var — single key (backward compatible).
+        """
+        keys: list[str] = []
+        if api_key is not None:
+            if isinstance(api_key, str):
+                keys.append(api_key.strip())
+            else:
+                for k in api_key:
+                    if isinstance(k, str) and k.strip():
+                        keys.append(k.strip())
+        else:
+            multi = os.getenv("TAVILY_API_KEYS", "")
+            if multi.strip():
+                for part in re.split(r"[\s,]+", multi):
+                    part = part.strip()
+                    if part:
+                        keys.append(part)
+            if not keys:
+                single = os.getenv("TAVILY_API_KEY", "").strip()
+                if single:
+                    keys.append(single)
+
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for k in keys:
+            if k not in seen:
+                seen.add(k)
+                unique.append(k)
+        return unique
+
+    @property
+    def num_keys(self) -> int:
+        return len(self._keys)
+
+    def _current_key(self) -> str:
+        return self._keys[self._key_index]
+
+    def _advance_key(self) -> bool:
+        """Try to advance to the next usable key.
+
+        Returns ``True`` if a usable key was found, ``False`` if all keys
+        are rate-limited (or only one key exists).
+        """
+        now_ts = time.time()
+        num = len(self._keys)
+        for offset in range(1, num + 1):
+            idx = (self._key_index + offset) % num
+            key = self._keys[idx]
+            cooldown = self._rate_limited_until.get(key, 0.0)
+            if cooldown <= now_ts:
+                self._key_index = idx
+                return True
+        return False
+
+    def _mark_rate_limited(self, key: str, retry_after: float | None) -> None:
+        """Mark a key as rate-limited for the given duration."""
+        if retry_after is not None:
+            delay = min(retry_after + 1.0, MAX_RETRY_DELAY)
+        else:
+            delay = 60.0  # Default cooldown if no Retry-After header.
+        self._rate_limited_until[key] = time.time() + delay
+
+    # ------------------------------------------------------------------
+    # HTTP
+    # ------------------------------------------------------------------
+
     def _post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         if path not in {"/search", "/extract"}:
             raise ValueError("unsupported Tavily endpoint")
 
-        request = urllib.request.Request(
-            f"{API_BASE_URL}{path}",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.__api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
+        last_error: Exception | None = None
+
+        # Try each key; rotate on 429 rate-limit.
+        for _key_attempt in range(len(self._keys)):
+            api_key = self._current_key()
+            try:
+                return self._post_with_key(path, payload, api_key)
+            except _RateLimitSignal as exc:
+                # Mark current key as rate-limited, try to advance.
+                self._mark_rate_limited(api_key, exc.retry_after)
+                if not self._advance_key():
+                    # All keys rate-limited — sleep for the shortest cooldown
+                    # then retry the original key one more time.
+                    remaining = self._shortest_cooldown()
+                    if remaining > 0:
+                        self._sleep(_bounded_retry_delay(remaining))
+                    # Clear all cooldowns and retry from current key.
+                    self._rate_limited_until.clear()
+                last_error = exc.inner if exc.inner else None
+                continue
+            except TavilyHTTPError:
+                raise
+            except (TavilyNetworkError, TavilyResponseError) as exc:
+                last_error = exc
+                # For non-rate-limit errors, still try next key.
+                if self._advance_key():
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise TavilyNetworkError("All Tavily API keys exhausted after rotation")
+
+    def _post_with_key(
+        self, path: str, payload: Mapping[str, Any], api_key: str
+    ) -> dict[str, Any]:
+        """Send a single request with the given key, retrying transient errors."""
 
         for attempt in range(self.max_retries + 1):
+            request = urllib.request.Request(
+                f"{API_BASE_URL}{path}",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+
             try:
                 with self._opener(request, timeout=self.timeout) as response:
                     length = _content_length(response)
@@ -355,13 +491,12 @@ class TavilyClient:
                             f"Tavily response exceeds {MAX_RESPONSE_BYTES} bytes"
                         )
             except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    # Rate limited — signal key rotation instead of retrying.
+                    retry_after = _retry_after_seconds(exc)
+                    raise _RateLimitSignal(retry_after=retry_after) from None
                 if exc.code in _TRANSIENT_HTTP_CODES and attempt < self.max_retries:
-                    retry_after = _retry_after_seconds(exc) if exc.code == 429 else None
-                    delay = (
-                        retry_after
-                        if retry_after is not None
-                        else self.backoff_base * (2**attempt)
-                    )
+                    delay = self.backoff_base * (2**attempt)
                     self._sleep(_bounded_retry_delay(delay))
                     continue
                 raise TavilyHTTPError(f"Tavily API returned HTTP {exc.code}") from None
@@ -382,6 +517,16 @@ class TavilyClient:
             return decoded
 
         raise TavilyNetworkError("Tavily API request failed after retries")
+
+    def _shortest_cooldown(self) -> float:
+        """Return the shortest remaining cooldown across all keys."""
+        now = time.time()
+        remaining = [
+            cooldown - now
+            for cooldown in self._rate_limited_until.values()
+            if cooldown > now
+        ]
+        return min(remaining) if remaining else 0.0
 
     def search_product(
         self, product: Mapping[str, Any], max_results: int = 5

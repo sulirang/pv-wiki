@@ -40,11 +40,10 @@ REQUIRED_ENVIRONMENT = (
     "PGUSER",
     "PGPASSWORD",
     "PGSSLMODE",
-    "TAVILY_API_KEY",
     "WIKIJS_URL",
     "WIKIJS_TOKEN",
 )
-SECRET_ENVIRONMENT = ("PGPASSWORD", "TAVILY_API_KEY", "WIKIJS_TOKEN")
+SECRET_ENVIRONMENT = ("PGPASSWORD", "TAVILY_API_KEY", "TAVILY_API_KEYS", "WIKIJS_TOKEN")
 MAX_JSON_INPUT_BYTES = 1_000_000
 
 
@@ -159,6 +158,11 @@ def _wiki_tags(product: dict[str, Any], decision: dict[str, Any]) -> list[str]:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     missing = missing_environment(REQUIRED_ENVIRONMENT)
+    # Tavily keys: accept either TAVILY_API_KEYS (multi) or TAVILY_API_KEY (single).
+    tavily_keys = os.getenv("TAVILY_API_KEYS", "").strip()
+    tavily_single = os.getenv("TAVILY_API_KEY", "").strip()
+    if not tavily_keys and not tavily_single:
+        missing.append("TAVILY_API_KEYS or TAVILY_API_KEY")
     state = _store()
     checks: dict[str, Any] = {
         "state": {
@@ -209,7 +213,13 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             new_page_published=wiki_settings.new_page_published,
         )
         probe_path = f"{wiki_settings.path_prefix}/__pv-wiki-doctor__"
-        client.get_page(probe_path, wiki_settings.locale)
+        try:
+            client.get_page(probe_path, wiki_settings.locale)
+        except WikiJSError as exc:
+            if "does not exist" in str(exc).casefold():
+                pass  # Page not found is expected — API is reachable.
+            else:
+                raise
         checks["wikijs"] = {"ok": True, "read_probe": probe_path}
         checks["tavily"] = {
             "ok": True,

@@ -34,8 +34,26 @@ scriptJs
 content
 createdAt
 updatedAt
-editor
 locale
+tags { tag }
+""".strip()
+
+# Subset of _PAGE_FIELDS used in mutation responses (create/update).
+# Wiki.js may return null for editor, locale, scriptCss, scriptJs when
+# the page is created/updated via API key, causing GraphQL to reject
+# the response if those non-nullable fields are requested.
+_PAGE_FIELDS_MUTATION = """
+id
+path
+title
+description
+isPrivate
+isPublished
+publishStartDate
+publishEndDate
+content
+createdAt
+updatedAt
 tags { tag }
 """.strip()
 
@@ -90,7 +108,7 @@ mutation HermesCreatePage(
       title: $title
     ) {{
       responseResult {{ succeeded errorCode slug message }}
-      page {{ {_PAGE_FIELDS} }}
+      page {{ {_PAGE_FIELDS_MUTATION} }}
     }}
   }}
 }}
@@ -131,7 +149,7 @@ mutation HermesUpdatePage(
       title: $title
     ) {{
       responseResult {{ succeeded errorCode slug message }}
-      page {{ {_PAGE_FIELDS} }}
+      page {{ {_PAGE_FIELDS_MUTATION} }}
     }}
   }}
 }}
@@ -392,6 +410,7 @@ class WikiJSClient:
                 "Authorization": f"Bearer {self.__token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
+                "User-Agent": "pv-wiki/1.0 (Wiki.js sync agent)",
             },
             method="POST",
         )
@@ -490,7 +509,15 @@ class WikiJSClient:
 
         locale = _clean_string(locale, "locale")
         path = _clean_path(path)
-        data = self._post(_SINGLE_BY_PATH, {"locale": locale, "path": path})
+        try:
+            data = self._post(_SINGLE_BY_PATH, {"locale": locale, "path": path})
+        except WikiJSGraphQLError as exc:
+            # Wiki.js returns a GraphQL error (not null) when the page
+            # doesn't exist.  Treat that as "not found".
+            msg = str(exc).casefold()
+            if "does not exist" in msg or "not found" in msg:
+                return None
+            raise
         page = self._pages(data).get("singleByPath")
         if page is None:
             return None
