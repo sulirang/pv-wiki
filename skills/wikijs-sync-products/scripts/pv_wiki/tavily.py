@@ -1,0 +1,580 @@
+"""Small, dependency-free Tavily Search/Extract client.
+
+The module deliberately talks only to Tavily's fixed API endpoints.  It never
+downloads a search result URL itself; callers may pass at most five public web
+URLs to Tavily Extract.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import math
+import os
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Mapping, Sequence
+from email.utils import parsedate_to_datetime
+from typing import Any
+
+from .render import validate_public_http_url
+
+
+API_BASE_URL = "https://api.tavily.com"
+DEFAULT_TIMEOUT = 20.0
+MAX_PRODUCT_QUERIES = 3
+MAX_EXTRACT_URLS = 5
+MAX_RESPONSE_BYTES = 20 * 1024 * 1024
+MAX_RETRY_DELAY = 60.0
+_TRANSIENT_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
+_TRACKING_QUERY_KEYS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "mc_cid",
+        "mc_eid",
+        "ref",
+        "source",
+    }
+)
+
+
+class TavilyError(RuntimeError):
+    """Base class for Tavily client errors."""
+
+
+class TavilyConfigError(TavilyError):
+    """Raised when required Tavily configuration is missing or invalid."""
+
+
+class TavilyHTTPError(TavilyError):
+    """Raised for a non-retryable or exhausted Tavily HTTP response."""
+
+
+class TavilyNetworkError(TavilyError):
+    """Raised when Tavily cannot be reached after retries."""
+
+
+class TavilyResponseError(TavilyError):
+    """Raised when Tavily returns malformed JSON."""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn every redirect into an HTTP error without replaying credentials."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        fp: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> urllib.request.Request | None:
+        del new_url
+        raise urllib.error.HTTPError(
+            request.full_url, code, message, headers, fp
+        )
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _clean_term(value: Any) -> str:
+    """Convert a product attribute into a short, query-safe string."""
+
+    if value is None:
+        return ""
+    if isinstance(value, Mapping):
+        for key in ("name", "label", "title", "code", "value"):
+            if key in value:
+                return _clean_term(value[key])
+        return ""
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            cleaned = _clean_term(item)
+            if cleaned:
+                return cleaned
+        return ""
+
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value))
+    text = re.sub(r"\s+", " ", text.replace('"', " ")).strip()
+    return text[:120]
+
+
+def _pick(product: Mapping[str, Any], keys: Sequence[str]) -> str:
+    for key in keys:
+        cleaned = _clean_term(product.get(key))
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _quote(term: str) -> str:
+    return f'"{term}"'
+
+
+def build_queries(product: Mapping[str, Any]) -> list[str]:
+    """Build up to three focused datasheet/documentation queries.
+
+    Common PostgreSQL column aliases are accepted so the skill does not need a
+    hard dependency on one product schema.  At least one human-meaningful name,
+    manufacturer, or model/part number is required.
+    """
+
+    if not isinstance(product, Mapping):
+        raise TypeError("product must be a mapping")
+
+    manufacturer = _pick(product, ("manufacturer", "brand", "vendor", "maker"))
+    model = _pick(
+        product,
+        (
+            "model",
+            "model_number",
+            "part_number",
+            "mpn",
+            "sku",
+            "product_code",
+            "code",
+        ),
+    )
+    name = _pick(product, ("name", "product_name", "title", "model_name"))
+    category = _pick(product, ("category", "product_type", "type"))
+
+    identity: list[str] = []
+    for term in (manufacturer, model or name):
+        if term and term.casefold() not in {item.casefold() for item in identity}:
+            identity.append(term)
+    if not identity:
+        raise ValueError("product needs a manufacturer, model/part number, or name")
+
+    exact_identity = " ".join(_quote(term) for term in identity)
+    candidates = [
+        f"{exact_identity} datasheet PDF",
+        f"{exact_identity} specifications technical manual",
+    ]
+
+    extra = ""
+    if name and name.casefold() not in {item.casefold() for item in identity}:
+        extra = _quote(name)
+    elif category and category.casefold() not in {item.casefold() for item in identity}:
+        extra = _quote(category)
+    candidates.append(
+        f"{exact_identity} {extra} official product documentation support downloads".strip()
+    )
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for query in candidates:
+        query = re.sub(r"\s+", " ", query).strip()[:400]
+        key = query.casefold()
+        if query and key not in seen:
+            seen.add(key)
+            queries.append(query)
+        if len(queries) == MAX_PRODUCT_QUERIES:
+            break
+    return queries
+
+
+def _canonical_url(url: str, *, validate_public: bool) -> tuple[str, str]:
+    """Return a normalized URL and a less noisy deduplication key."""
+
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("URL must be a non-empty string")
+    candidate = validate_public_http_url(url) if validate_public else url.strip()
+    try:
+        parts = urllib.parse.urlsplit(candidate)
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("invalid URL") from exc
+
+    scheme = parts.scheme.lower()
+    hostname = (parts.hostname or "").lower().rstrip(".")
+    if scheme not in {"http", "https"} or not hostname:
+        raise ValueError("only absolute HTTP(S) URLs are allowed")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("URLs containing credentials are not allowed")
+    if port not in {None, 80, 443}:
+        raise ValueError("non-standard URL ports are not allowed")
+
+    if validate_public:
+        # validate_public_http_url already rejects private, ambiguous numeric,
+        # malformed IDNA, credential-bearing, and local/internal hostnames.
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:  # Defense in depth.
+            raise ValueError("non-public IP URLs are not allowed")
+
+    default_port = (scheme == "http" and port in {None, 80}) or (
+        scheme == "https" and port in {None, 443}
+    )
+    netloc = hostname if default_port else f"{hostname}:{port}"
+    if ":" in hostname and not hostname.startswith("["):
+        netloc = f"[{hostname}]" if default_port else f"[{hostname}]:{port}"
+
+    path = parts.path or "/"
+    normalized_query = urllib.parse.urlencode(
+        urllib.parse.parse_qsl(parts.query, keep_blank_values=True), doseq=True
+    )
+    normalized = urllib.parse.urlunsplit((scheme, netloc, path, normalized_query, ""))
+
+    dedupe_pairs = []
+    for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        lowered = key.casefold()
+        if lowered.startswith("utm_") or lowered in _TRACKING_QUERY_KEYS:
+            continue
+        dedupe_pairs.append((key, value))
+    dedupe_pairs.sort()
+    dedupe_query = urllib.parse.urlencode(dedupe_pairs, doseq=True)
+    dedupe_path = path.rstrip("/") or "/"
+    dedupe_key = urllib.parse.urlunsplit(
+        (scheme, netloc, dedupe_path, dedupe_query, "")
+    ).casefold()
+    return normalized, dedupe_key
+
+
+def _finite_number(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _credit_value(value: Any) -> int | float:
+    number = _finite_number(value)
+    return int(number) if number.is_integer() else number
+
+
+def _retry_after_seconds(error: urllib.error.HTTPError) -> float | None:
+    raw = error.headers.get("Retry-After") if error.headers is not None else None
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+        if not math.isfinite(seconds):
+            return MAX_RETRY_DELAY if seconds > 0 else None
+        return min(MAX_RETRY_DELAY, max(0.0, seconds))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+        if retry_at.tzinfo is None:
+            return None
+        return min(
+            MAX_RETRY_DELAY,
+            max(0.0, retry_at.timestamp() - time.time()),
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _bounded_retry_delay(value: float) -> float:
+    if not math.isfinite(value):
+        return MAX_RETRY_DELAY if value > 0 else 0.0
+    return min(MAX_RETRY_DELAY, max(0.0, value))
+
+
+def _content_length(response: Any) -> int | None:
+    headers = getattr(response, "headers", None)
+    raw = headers.get("Content-Length") if headers is not None else None
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+class TavilyClient:
+    """Tavily REST client with bounded retries and no secret persistence."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        max_retries: int = 3,
+        backoff_base: float = 1.0,
+        sleep: Callable[[float], None] = time.sleep,
+        opener: Callable[..., Any] | None = None,
+    ) -> None:
+        key = (api_key if api_key is not None else os.getenv("TAVILY_API_KEY", "")).strip()
+        if not key:
+            raise TavilyConfigError("TAVILY_API_KEY is required")
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise TavilyConfigError("timeout must be finite and greater than zero")
+        if max_retries < 0:
+            raise TavilyConfigError("max_retries cannot be negative")
+        if backoff_base < 0 or not math.isfinite(backoff_base):
+            raise TavilyConfigError("backoff_base must be finite and non-negative")
+
+        self.__api_key = key
+        self.timeout = float(timeout)
+        self.max_retries = int(max_retries)
+        self.backoff_base = float(backoff_base)
+        self._sleep = sleep
+        self._opener = opener or _NO_REDIRECT_OPENER.open
+
+    def _post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        if path not in {"/search", "/extract"}:
+            raise ValueError("unsupported Tavily endpoint")
+
+        request = urllib.request.Request(
+            f"{API_BASE_URL}{path}",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.__api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                with self._opener(request, timeout=self.timeout) as response:
+                    length = _content_length(response)
+                    if length is not None and length > MAX_RESPONSE_BYTES:
+                        raise TavilyResponseError(
+                            f"Tavily response exceeds {MAX_RESPONSE_BYTES} bytes"
+                        )
+                    body = response.read(MAX_RESPONSE_BYTES + 1)
+                    if not isinstance(body, bytes):
+                        raise TavilyResponseError("Tavily response body must be bytes")
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        raise TavilyResponseError(
+                            f"Tavily response exceeds {MAX_RESPONSE_BYTES} bytes"
+                        )
+            except urllib.error.HTTPError as exc:
+                if exc.code in _TRANSIENT_HTTP_CODES and attempt < self.max_retries:
+                    retry_after = _retry_after_seconds(exc) if exc.code == 429 else None
+                    delay = (
+                        retry_after
+                        if retry_after is not None
+                        else self.backoff_base * (2**attempt)
+                    )
+                    self._sleep(_bounded_retry_delay(delay))
+                    continue
+                raise TavilyHTTPError(f"Tavily API returned HTTP {exc.code}") from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < self.max_retries:
+                    self._sleep(
+                        _bounded_retry_delay(self.backoff_base * (2**attempt))
+                    )
+                    continue
+                raise TavilyNetworkError("Tavily API request failed after retries") from exc
+
+            try:
+                decoded = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise TavilyResponseError("Tavily returned invalid JSON") from exc
+            if not isinstance(decoded, dict):
+                raise TavilyResponseError("Tavily response must be a JSON object")
+            return decoded
+
+        raise TavilyNetworkError("Tavily API request failed after retries")
+
+    def search_product(
+        self, product: Mapping[str, Any], max_results: int = 5
+    ) -> dict[str, Any]:
+        """Search a product with focused queries and return a deduplicated bundle."""
+
+        if isinstance(max_results, bool) or not isinstance(max_results, int):
+            raise TypeError("max_results must be an integer")
+        if not 1 <= max_results <= 20:
+            raise ValueError("max_results must be between 1 and 20")
+
+        queries = build_queries(product)
+        merged: dict[str, dict[str, Any]] = {}
+        credits: int | float = 0
+        request_ids: list[str] = []
+
+        for query in queries:
+            response = self._post(
+                "/search",
+                {
+                    "query": query,
+                    "search_depth": "basic",
+                    "max_results": max_results,
+                    "topic": "general",
+                    "include_answer": False,
+                    "include_raw_content": False,
+                    "include_images": False,
+                    "include_usage": True,
+                },
+            )
+            usage = response.get("usage")
+            if isinstance(usage, Mapping):
+                credits += _credit_value(usage.get("credits"))
+            request_id = response.get("request_id")
+            if isinstance(request_id, str) and request_id:
+                request_ids.append(request_id)
+
+            results = response.get("results")
+            if not isinstance(results, list):
+                continue
+            for raw_result in results:
+                if not isinstance(raw_result, Mapping):
+                    continue
+                raw_url = raw_result.get("url")
+                try:
+                    url, dedupe_key = _canonical_url(raw_url, validate_public=True)
+                except (TypeError, ValueError):
+                    continue
+
+                score = _finite_number(raw_result.get("score"))
+                candidate = {
+                    "title": _clean_term(raw_result.get("title")),
+                    "url": url,
+                    "content": str(raw_result.get("content") or ""),
+                    "score": score,
+                    "source_queries": [query],
+                }
+                existing = merged.get(dedupe_key)
+                if existing is None:
+                    merged[dedupe_key] = candidate
+                else:
+                    if query not in existing["source_queries"]:
+                        existing["source_queries"].append(query)
+                    if score > existing["score"]:
+                        candidate["source_queries"] = existing["source_queries"]
+                        merged[dedupe_key] = candidate
+
+        ranked = sorted(
+            merged.values(), key=lambda item: (-item["score"], item["url"])
+        )[:max_results]
+        return {
+            "queries": queries,
+            "search_depth": "basic",
+            "max_results": max_results,
+            "results": ranked,
+            "usage": {"credits": _credit_value(credits)},
+            "request_ids": request_ids,
+        }
+
+    def extract_urls(self, urls: Sequence[str], query: str) -> dict[str, Any]:
+        """Ask Tavily to extract at most five validated public web URLs."""
+
+        if isinstance(urls, (str, bytes)) or not isinstance(urls, Sequence):
+            raise TypeError("urls must be a sequence of URL strings")
+        clean_query = re.sub(r"\s+", " ", str(query or "")).strip()
+        if not clean_query:
+            raise ValueError("query must be non-empty")
+        if len(clean_query) > 400:
+            raise ValueError("query must not exceed 400 characters")
+
+        submitted: list[str] = []
+        seen: set[str] = set()
+        for raw_url in urls:
+            normalized, dedupe_key = _canonical_url(raw_url, validate_public=True)
+            if dedupe_key not in seen:
+                seen.add(dedupe_key)
+                submitted.append(normalized)
+        if not submitted:
+            raise ValueError("at least one public HTTP(S) URL is required")
+        if len(submitted) > MAX_EXTRACT_URLS:
+            raise ValueError(f"at most {MAX_EXTRACT_URLS} unique URLs may be extracted")
+
+        response = self._post(
+            "/extract",
+            {
+                "urls": submitted,
+                "query": clean_query,
+                "chunks_per_source": 3,
+                "extract_depth": "basic",
+                "format": "markdown",
+                "include_images": False,
+                "include_usage": True,
+            },
+        )
+
+        results: list[dict[str, Any]] = []
+        raw_results = response.get("results")
+        if isinstance(raw_results, list):
+            for item in raw_results:
+                if not isinstance(item, Mapping):
+                    continue
+                raw_url = item.get("url")
+                try:
+                    result_url, _ = _canonical_url(raw_url, validate_public=True)
+                except (TypeError, ValueError):
+                    continue
+                result: dict[str, Any] = {
+                    "url": result_url,
+                    "raw_content": str(item.get("raw_content") or ""),
+                }
+                if isinstance(item.get("favicon"), str):
+                    result["favicon"] = item["favicon"]
+                results.append(result)
+
+        failed_results: list[dict[str, str]] = []
+        raw_failed = response.get("failed_results")
+        if isinstance(raw_failed, list):
+            for item in raw_failed:
+                if not isinstance(item, Mapping):
+                    continue
+                failed_results.append(
+                    {
+                        "url": str(item.get("url") or ""),
+                        "error": str(item.get("error") or "extraction failed"),
+                    }
+                )
+
+        usage = response.get("usage")
+        credit_count: int | float = 0
+        if isinstance(usage, Mapping):
+            credit_count = _credit_value(usage.get("credits"))
+        request_id = response.get("request_id")
+        return {
+            "query": clean_query,
+            "urls": submitted,
+            "extract_depth": "basic",
+            "results": results,
+            "failed_results": failed_results,
+            "usage": {"credits": credit_count},
+            "request_id": request_id if isinstance(request_id, str) else None,
+        }
+
+
+def search_product(
+    product: Mapping[str, Any],
+    max_results: int = 5,
+    *,
+    client: TavilyClient | None = None,
+) -> dict[str, Any]:
+    """Module-level convenience wrapper for :meth:`TavilyClient.search_product`."""
+
+    return (client or TavilyClient()).search_product(product, max_results=max_results)
+
+
+def extract_urls(
+    urls: Sequence[str],
+    query: str,
+    *,
+    client: TavilyClient | None = None,
+) -> dict[str, Any]:
+    """Module-level convenience wrapper for :meth:`TavilyClient.extract_urls`."""
+
+    return (client or TavilyClient()).extract_urls(urls, query)
+
+
+__all__ = [
+    "TavilyClient",
+    "TavilyConfigError",
+    "TavilyError",
+    "TavilyHTTPError",
+    "TavilyNetworkError",
+    "TavilyResponseError",
+    "build_queries",
+    "extract_urls",
+    "search_product",
+]
