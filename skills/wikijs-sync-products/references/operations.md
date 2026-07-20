@@ -36,6 +36,15 @@ authentication, group permissions, and the intended path boundary, explicitly
 change those settings if unattended runs should publish new pages. Updates to
 existing pages preserve the visibility returned by Wiki.js.
 
+## Homepage refresh
+
+Run `pv-wiki publish-home` after a product maintenance batch or on a separate
+daily schedule. It performs no Tavily or PostgreSQL work: the command reads
+successful publications already recorded in the durable SQLite state and
+refreshes the homepage's brand/category indexes, publication counts, and
+recently updated list. A product remains counted after a source change or
+temporary refresh failure because its last successful Wiki page still exists.
+
 ## State and retries
 
 The SQLite file defaults to `~/.hermes/data/pv-wiki/state.sqlite3`. Back it up

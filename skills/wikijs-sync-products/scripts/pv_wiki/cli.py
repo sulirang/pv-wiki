@@ -26,7 +26,11 @@ from .config import (
     state_path,
 )
 from .db import DatabaseConfigurationError, ProductReader, validate_postgres_sslmode
-from .decision import DecisionError, validate_decision
+from .decision import (
+    DecisionError,
+    canonical_product_category,
+    validate_decision,
+)
 from .render import render_home_page, render_product_page, stable_path, stable_slug
 from .state import Lease, LeaseLostError, StateError, StateStore
 from .tavily import TavilyClient, TavilyError
@@ -119,11 +123,8 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
     identity: dict[str, Any] = {"model": public_name, "product_name": public_name}
     if include_internal_search_hints():
         brand = str(product.get("brand_code") or "").strip()
-        family = str(product.get("family_code") or "").strip()
         if brand:
             identity["manufacturer"] = brand
-        if family:
-            identity["category"] = family
     return identity
 
 
@@ -149,10 +150,56 @@ def _wiki_tags(product: dict[str, Any], decision: dict[str, Any]) -> list[str]:
     tags = {"product", "datasheet-found", "managed-by-hermes"}
     for item in decision["datasheets"] + decision["sources"]:
         tags.add(f"source-{item['source_type']}")
-    brand_tag = _tag_slug("brand", product.get("brand_code"))
+    brand_tag = _tag_slug(
+        "brand", decision.get("manufacturer") or product.get("brand_code")
+    )
     if brand_tag:
         tags.add(brand_tag)
+    category_tag = _tag_slug(
+        "category", _decision_product_category(decision)
+    )
+    if category_tag:
+        tags.add(category_tag)
     return sorted(tags)
+
+
+def _decision_product_category(decision: dict[str, Any]) -> str:
+    """Read the public category, including a narrow legacy-fact fallback."""
+
+    value = decision.get("product_category")
+    if isinstance(value, str) and value.strip():
+        return canonical_product_category(value)
+    for fact in decision.get("facts", []):
+        if not isinstance(fact, dict):
+            continue
+        name = str(fact.get("name") or "").strip().casefold()
+        if name not in {
+            "product category",
+            "product type",
+            "产品类别",
+            "产品类型",
+        }:
+            continue
+        legacy_value = fact.get("value")
+        if isinstance(legacy_value, str) and legacy_value.strip():
+            return canonical_product_category(legacy_value)
+    return ""
+
+
+def _home_catalogue_product(item: Any, *, path_prefix: str) -> dict[str, Any]:
+    payload = item.payload
+    decision = item.decision
+    return {
+        "product_id": item.product_id,
+        "product_name": payload.get("product_name"),
+        "model": decision.get("model") or payload.get("product_name"),
+        "manufacturer": (
+            decision.get("manufacturer") or payload.get("brand_code")
+        ),
+        "product_category": _decision_product_category(decision),
+        "wiki_path": item.wiki_path or stable_path(payload, prefix=path_prefix),
+        "published_at": item.published_at,
+    }
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -558,11 +605,13 @@ def _cmd_publish_home(_args: argparse.Namespace) -> int:
     with _store() as store:
         counts = store.status_counts()
         due_now = len(store.list_due(limit=1_000_000))
+        published = store.published_products()
 
     managed = render_home_page(
-        counts,
-        due_now=due_now,
-        product_path_prefix=settings.path_prefix,
+        [
+            _home_catalogue_product(item, path_prefix=settings.path_prefix)
+            for item in published
+        ],
         title=settings.home_title,
     )
     client = WikiJSClient(
@@ -576,7 +625,7 @@ def _cmd_publish_home(_args: argparse.Namespace) -> int:
         settings.home_path,
         settings.locale,
         settings.home_title,
-        "Cited product knowledge base and catalogue synchronization status.",
+        "按品牌、产品类别和最近更新浏览经过资料核验的产品百科。",
         managed,
         ["homepage", "managed-by-hermes", "product-catalogue"],
     )
@@ -590,6 +639,7 @@ def _cmd_publish_home(_args: argparse.Namespace) -> int:
                 "path": settings.home_path,
                 "locale": settings.locale,
             },
+            "updated_products": len(published),
             "counts": counts,
             "due_now": due_now,
         }

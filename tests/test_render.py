@@ -92,30 +92,66 @@ class UrlAndEscapingTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
-    def test_home_page_is_deterministic_and_contains_catalogue_status(self) -> None:
-        counts = {"due": 10, "leased": 1, "backoff": 2, "synced": 7}
+    def test_home_page_is_a_deterministic_reader_catalogue(self) -> None:
+        products = [
+            {
+                "product_id": "HP-1",
+                "model": "HeatPro 1",
+                "manufacturer": "Acme",
+                "product_category": "热泵",
+                "wiki_path": "products/hp-1-a1",
+                "published_at": datetime(2026, 7, 18, tzinfo=timezone.utc),
+            },
+            {
+                "product_id": "INV-1",
+                "model": "SUN 1",
+                "manufacturer": "Huawei",
+                "product_category": "光伏逆变器",
+                "wiki_path": "products/inv-1-b2",
+                "published_at": datetime(2026, 7, 19, tzinfo=timezone.utc),
+            },
+            {
+                "product_id": "HP-2",
+                "model": "HeatPro 2",
+                "manufacturer": "Acme",
+                "product_category": "热泵",
+                "wiki_path": "products/hp-2-c3",
+                "published_at": datetime(2026, 7, 20, tzinfo=timezone.utc),
+            },
+        ]
 
         rendered = render.render_home_page(
-            counts,
-            due_now=3,
-            product_path_prefix="products",
+            products,
             title="PV Wiki",
         )
 
         self.assertTrue(rendered.startswith(render.AUTO_BEGIN + "\n"))
         self.assertTrue(rendered.endswith(render.AUTO_END + "\n"))
-        self.assertIn("| Total catalogue products | 20 |", rendered)
-        self.assertIn("| Pages synchronized | 7 |", rendered)
-        self.assertIn("| Due now | 3 |", rendered)
+        self.assertIn("当前已更新 **3** 款产品", rendered)
+        self.assertIn("| 已更新产品 | 3 |", rendered)
+        self.assertIn("| [Acme](/t/brand-acme) | 2 |", rendered)
+        self.assertIn(
+            "| [热泵](/t/category-%E7%83%AD%E6%B3%B5) | 2 |",
+            rendered,
+        )
+        self.assertLess(rendered.index("HeatPro 2"), rendered.index("SUN 1"))
+        self.assertNotIn("Due now", rendered)
+        self.assertNotIn("family_code", rendered)
         self.assertEqual(
             rendered,
             render.render_home_page(
-                dict(reversed(list(counts.items()))),
-                due_now=3,
-                product_path_prefix="products",
+                list(reversed(products)),
                 title="PV Wiki",
             ),
         )
+
+    def test_empty_home_page_has_no_broken_tables_or_links(self) -> None:
+        rendered = render.render_home_page([], title="GTI 产品百科")
+
+        self.assertIn("当前已更新 **0** 款产品", rendered)
+        self.assertIn("暂无已分类产品", rendered)
+        self.assertIn("暂无已收录品牌", rendered)
+        self.assertIn("暂无已更新产品", rendered)
 
     def test_render_is_deterministic_and_sorts_unordered_content(self) -> None:
         product = {
@@ -172,6 +208,9 @@ class RenderTests(unittest.TestCase):
             {
                 "outcome": "publish",
                 "confidence": 0.93,
+                "manufacturer": "Acme",
+                "model": "PV-42",
+                "product_category": "光伏逆变器",
                 "summary": "Acme PV-42 is a grid-connected inverter for commercial rooftops.",
                 "review_summary": "Installers praise its compact enclosure and clear commissioning workflow.",
                 "datasheets": [
@@ -214,6 +253,7 @@ class RenderTests(unittest.TestCase):
             },
         )
 
+        self.assertIn("| 产品类别 | 光伏逆变器 |", rendered)
         self.assertIn("| 直流输入 | Input voltage | 48 V |", rendered)
         self.assertIn("**市场与用户反馈：**", rendered)
         self.assertIn("（官方数据表）", rendered)

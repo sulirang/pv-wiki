@@ -2,10 +2,11 @@
 
 ## Entity match
 
-Compare the database name, brand hint, family hint, full manufacturer model,
-suffix, electrical/mechanical variant, region, and revision. A shared family
-name or partial model is not enough. If two variants remain plausible, return
-`ambiguous`.
+Compare the database name, optional brand hint, full manufacturer model,
+suffix, electrical/mechanical variant, region, and revision. Internal family
+codes are not public product categories and must not be used to infer product
+type. A shared family name or partial model is not enough. If two variants
+remain plausible, return `ambiguous`.
 
 ## Source tiers
 
@@ -46,6 +47,15 @@ the manufacturer, product type, intended use, and distinguishing features in
 plain language using the official datasheet. Put internal identity reasoning
 only in `decision_notes`. Put sourced market or user feedback in
 `review_summary` and list its evidence in `review_evidence_urls`.
+
+`product_category` is the broad, reader-facing product type used by the Wiki
+homepage and tag indexes. It is required for publication and must come from
+the verified product evidence, never from `family_code` or another internal
+catalogue identifier. Use concise, stable Chinese categories and group
+subtypes under the category a reader would browse: for example, air-source,
+ground-source, water-source, and air-to-water units all use `热泵`; solar,
+photovoltaic, and PV inverters use `光伏逆变器`. Put narrower subtype details
+in the summary or specifications instead of fragmenting the public index.
 
 The decision `confidence` represents exact product identity plus document
 authenticity, not prose quality. Default auto-publish threshold is 0.85.

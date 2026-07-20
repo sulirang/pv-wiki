@@ -229,6 +229,17 @@ class AttemptRecord:
     extract_usage: dict[str, Any] | None
 
 
+@dataclass(frozen=True, slots=True)
+class PublishedProduct:
+    """The latest successful Wiki publication metadata for one product."""
+
+    product_id: str
+    payload: dict[str, Any]
+    decision: dict[str, Any]
+    wiki_path: str | None
+    published_at: datetime
+
+
 def _utc(value: datetime | None = None) -> datetime:
     value = value or datetime.now(timezone.utc)
     if value.tzinfo is None:
@@ -1417,6 +1428,90 @@ class StateStore:
         if include_zero:
             return {status: counts.get(status, 0) for status in PRODUCT_STATUSES}
         return counts
+
+    def published_products(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[PublishedProduct]:
+        """Return one latest successful Wiki publication per product.
+
+        ``products.status`` is deliberately not used: a page remains published
+        when a changed catalogue row becomes due again or a later refresh is
+        waiting for retry.  ``last_success_at`` and the latest successful
+        attempt therefore define the reader-visible catalogue.
+        """
+
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+        ):
+            raise ValueError("limit must be a positive integer or None")
+        query = """
+            SELECT
+                p.product_id,
+                p.payload_json,
+                p.last_success_at,
+                a.details_json
+            FROM products AS p
+            JOIN attempts AS a
+              ON a.attempt_id = (
+                  SELECT latest.attempt_id
+                  FROM attempts AS latest
+                  WHERE latest.product_id = p.product_id
+                    AND latest.outcome = 'synced'
+                    AND latest.finished_at IS NOT NULL
+                  ORDER BY latest.attempt_id DESC
+                  LIMIT 1
+              )
+            WHERE p.last_success_at IS NOT NULL
+            ORDER BY p.last_success_at DESC, p.product_id
+        """
+        parameters: tuple[Any, ...] = ()
+        if limit is not None:
+            query += "\nLIMIT ?"
+            parameters = (limit,)
+
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+
+        published: list[PublishedProduct] = []
+        for row in rows:
+            payload_value = json.loads(row["payload_json"])
+            payload = dict(payload_value) if isinstance(payload_value, Mapping) else {}
+            details_value = (
+                json.loads(row["details_json"])
+                if row["details_json"] is not None
+                else {}
+            )
+            details = details_value if isinstance(details_value, Mapping) else {}
+            recorded_payload = details.get("payload")
+            decision_value = (
+                recorded_payload.get("decision")
+                if isinstance(recorded_payload, Mapping)
+                else None
+            )
+            decision = (
+                dict(decision_value) if isinstance(decision_value, Mapping) else {}
+            )
+            wiki_path_value = details.get("wiki_path")
+            wiki_path = (
+                wiki_path_value.strip()
+                if isinstance(wiki_path_value, str) and wiki_path_value.strip()
+                else None
+            )
+            published_at = _parse_time(row["last_success_at"])
+            if published_at is None:  # guarded by SQL; retain a fail-closed boundary
+                continue
+            published.append(
+                PublishedProduct(
+                    product_id=row["product_id"],
+                    payload=payload,
+                    decision=decision,
+                    wiki_path=wiki_path,
+                    published_at=published_at,
+                )
+            )
+        return published
 
     @staticmethod
     def _product_state(row: sqlite3.Row) -> ProductState:

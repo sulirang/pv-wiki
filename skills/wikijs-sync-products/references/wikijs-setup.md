@@ -33,6 +33,13 @@ then select `WIKIJS_HOME_PATH` as the Wiki.js home page in administration.
 The command replaces only the managed block, so introductory or operational
 notes written outside that block are preserved.
 
+The landing page is a reader-facing catalogue, not a scheduler dashboard. It
+shows the number of products with at least one successful Wiki publication,
+counts those products by verified manufacturer and public product category,
+links each group to Wiki.js's native tag index, and lists the most recently
+published products. Run `publish-home` after a maintenance batch to refresh
+these static counts and links.
+
 New pages are private drafts by default. After validating the staging output
 and confirming the Wiki.js access boundary, set the two visibility variables
 explicitly if new pages should be published. Existing pages always retain the

@@ -20,6 +20,7 @@ def valid_decision() -> dict:
         "confidence": 0.95,
         "manufacturer": "Acme",
         "model": "PV-42",
+        "product_category": "Solar Inverter",
         "summary": "A documented product.",
         "decision_notes": "Exact model and official document match.",
         "datasheets": [
@@ -60,6 +61,7 @@ class DecisionTests(unittest.TestCase):
             expected_lease_token="1234567890abcdef",
         )
         self.assertEqual("publish", result["outcome"])
+        self.assertEqual("光伏逆变器", result["product_category"])
 
     def test_rejects_lease_mismatch_and_low_confidence(self) -> None:
         with self.assertRaisesRegex(DecisionError, "lease_token"):
@@ -182,6 +184,17 @@ class DecisionTests(unittest.TestCase):
             }
         ]
         with self.assertRaisesRegex(DecisionError, "conflicted fields"):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+    def test_publish_requires_a_public_product_category(self) -> None:
+        item = valid_decision()
+        item.pop("product_category")
+
+        with self.assertRaisesRegex(DecisionError, "product_category"):
             validate_decision(
                 item,
                 expected_product_id="P-42",

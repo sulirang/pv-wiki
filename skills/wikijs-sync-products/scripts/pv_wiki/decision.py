@@ -16,6 +16,22 @@ SOURCE_TYPES = frozenset(
     {"manufacturer", "regulatory", "authorized", "mirror", "community"}
 )
 TRUSTED_TYPES = frozenset({"manufacturer", "regulatory", "authorized"})
+_PRODUCT_CATEGORY_ALIASES = {
+    "heat pump": "热泵",
+    "heat pumps": "热泵",
+    "air source heat pump": "热泵",
+    "air-to-water heat pump": "热泵",
+    "ground source heat pump": "热泵",
+    "water source heat pump": "热泵",
+    "空气源热泵": "热泵",
+    "空气能热泵": "热泵",
+    "地源热泵": "热泵",
+    "水源热泵": "热泵",
+    "solar inverter": "光伏逆变器",
+    "photovoltaic inverter": "光伏逆变器",
+    "pv inverter": "光伏逆变器",
+    "太阳能逆变器": "光伏逆变器",
+}
 _TOP_LEVEL = frozenset(
     {
         "schema_version",
@@ -25,6 +41,7 @@ _TOP_LEVEL = frozenset(
         "confidence",
         "manufacturer",
         "model",
+        "product_category",
         "summary",
         "review_summary",
         "review_evidence_urls",
@@ -39,6 +56,13 @@ _TOP_LEVEL = frozenset(
 
 class DecisionError(ValueError):
     """Raised when an agent decision is incomplete or unsafe to apply."""
+
+
+def canonical_product_category(value: str) -> str:
+    """Normalize common source-language aliases into broad reader categories."""
+
+    cleaned = " ".join(value.split())
+    return _PRODUCT_CATEGORY_ALIASES.get(cleaned.casefold(), cleaned)
 
 
 def _text(value: Any, field: str, *, required: bool = False, limit: int = 2000) -> str:
@@ -171,6 +195,9 @@ def validate_decision(
             raise DecisionError("decision cites URLs not extracted for this lease")
 
     summary = _text(raw.get("summary"), "summary", limit=2000)
+    product_category = canonical_product_category(
+        _text(raw.get("product_category"), "product_category", limit=100)
+    )
     review_summary = _text(
         raw.get("review_summary"), "review_summary", limit=1500
     )
@@ -297,6 +324,11 @@ def validate_decision(
     if outcome == "publish":
         if confidence < minimum_confidence:
             raise DecisionError("publish confidence is below the configured threshold")
+        if not product_category:
+            raise DecisionError(
+                "publish requires a public product_category; internal family codes "
+                "must not be used"
+            )
         if not summary:
             raise DecisionError("publish requires a user-facing product summary")
         if len(facts) < 5:
@@ -330,6 +362,7 @@ def validate_decision(
         "confidence": confidence,
         "manufacturer": _text(raw.get("manufacturer"), "manufacturer", limit=300),
         "model": _text(raw.get("model"), "model", limit=300),
+        "product_category": product_category,
         "summary": summary,
         "review_summary": review_summary,
         "review_evidence_urls": review_evidence_urls,
@@ -343,4 +376,9 @@ def validate_decision(
     }
 
 
-__all__ = ["DecisionError", "validate_decision", "validate_public_url"]
+__all__ = [
+    "DecisionError",
+    "canonical_product_category",
+    "validate_decision",
+    "validate_public_url",
+]

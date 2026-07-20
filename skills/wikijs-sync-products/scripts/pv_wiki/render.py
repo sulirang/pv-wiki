@@ -337,12 +337,17 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
     )
 
 
-def _product_rows(product: Any) -> list[tuple[str, Any]]:
+def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
     fields = (
-        ("产品 ID", ("product_id", "id")),
-        ("品牌/制造商", ("manufacturer", "brand", "vendor", "maker", "brand_code")),
+        ("产品 ID", product, ("product_id", "id")),
+        (
+            "品牌/制造商",
+            decision,
+            ("manufacturer", "brand", "vendor", "maker"),
+        ),
         (
             "型号/料号",
+            decision,
             (
                 "model",
                 "model_number",
@@ -353,14 +358,35 @@ def _product_rows(product: Any) -> list[tuple[str, Any]]:
                 "code",
             ),
         ),
-        ("产品名称", ("product_name", "name", "title")),
-        ("类别", ("category", "product_type", "type")),
-        ("计量单位", ("unit_of_measure", "uom", "unit")),
-        ("数据库描述", ("description",)),
+        (
+            "产品类别",
+            decision,
+            ("product_category", "category", "product_type", "type"),
+        ),
+        ("产品名称", product, ("product_name", "name", "title")),
+        ("计量单位", product, ("unit_of_measure", "uom", "unit")),
+        ("数据库描述", product, ("description",)),
     )
     rows = []
-    for label, aliases in fields:
-        value = _first(product, aliases)
+    for label, owner, aliases in fields:
+        value = _first(owner, aliases)
+        if value is None and label == "品牌/制造商":
+            value = _first(
+                product, ("manufacturer", "brand", "vendor", "maker", "brand_code")
+            )
+        elif value is None and label == "型号/料号":
+            value = _first(
+                product,
+                (
+                    "model",
+                    "model_number",
+                    "part_number",
+                    "mpn",
+                    "sku",
+                    "product_code",
+                    "code",
+                ),
+            )
         if value is not None:
             rows.append((label, value))
     return rows
@@ -374,71 +400,232 @@ def _checked_at(value: Any) -> str:
     return _plain_text(value)
 
 
+def _internal_link(label: Any, path: Any) -> str:
+    """Build a safe root-relative Wiki.js link."""
+
+    clean_path = _plain_text(path).strip("/")
+    parts = clean_path.split("/")
+    if (
+        not clean_path
+        or any(not part or part in {".", ".."} for part in parts)
+        or any(ord(character) < 32 for character in clean_path)
+    ):
+        raise ValueError("internal Wiki.js path is invalid")
+    encoded = urllib.parse.quote(clean_path, safe="/-._~")
+    return f"[{_escape_markdown_text(label) or '查看'}](/{encoded})"
+
+
+def _tag_index_link(label: Any, prefix: str, value: Any) -> str:
+    tag = f"{prefix}-{stable_slug(value, max_length=64)}"
+    return _internal_link(label, f"t/{tag}")
+
+
+def _home_catalogue_entries(products: Sequence[Any]) -> list[dict[str, str]]:
+    if isinstance(products, (str, bytes, bytearray)) or not isinstance(
+        products, Sequence
+    ):
+        raise TypeError("published_products must be a sequence")
+
+    entries: list[dict[str, str]] = []
+    for index, product in enumerate(products):
+        product_id = _first(product, ("product_id", "id"))
+        title = _first(
+            product,
+            ("model", "product_name", "name", "title", "product_id", "id"),
+        )
+        wiki_path = _first(product, ("wiki_path", "path"))
+        published_at = _first(
+            product, ("published_at", "last_success_at", "updated_at")
+        )
+        if product_id is None or title is None or wiki_path is None:
+            raise ValueError(
+                f"published_products[{index}] needs product_id, title, and wiki_path"
+            )
+        published_text = _checked_at(published_at)
+        if not published_text:
+            raise ValueError(
+                f"published_products[{index}] needs a publication timestamp"
+            )
+        # Validate the path before it can influence counts or links.
+        _internal_link(title, wiki_path)
+        entries.append(
+            {
+                "product_id": _plain_text(product_id),
+                "title": _plain_text(title),
+                "brand": _plain_text(
+                    _first(
+                        product,
+                        ("manufacturer", "brand", "vendor", "maker", "brand_code"),
+                    )
+                ),
+                "category": _plain_text(
+                    _first(
+                        product,
+                        ("product_category", "category", "product_type", "type"),
+                    )
+                ),
+                "wiki_path": _plain_text(wiki_path).strip("/"),
+                "published_at": published_text,
+            }
+        )
+
+    # Select the newest successful publication if a caller supplies duplicates.
+    entries.sort(key=lambda item: (item["product_id"].casefold(), item["product_id"]))
+    entries.sort(key=lambda item: item["published_at"], reverse=True)
+    unique: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        unique.setdefault(entry["product_id"], entry)
+    return list(unique.values())
+
+
+def _group_counts(
+    entries: Sequence[Mapping[str, str]],
+    field: str,
+) -> list[tuple[str, int]]:
+    counts: dict[str, tuple[str, int]] = {}
+    for entry in entries:
+        value = entry.get(field, "").strip()
+        if not value:
+            continue
+        key = value.casefold()
+        label, count = counts.get(key, (value, 0))
+        counts[key] = (label, count + 1)
+    return sorted(
+        counts.values(),
+        key=lambda item: (-item[1], item[0].casefold(), item[0]),
+    )
+
+
+def _display_publication_date(value: str) -> str:
+    match = re.match(r"\d{4}-\d{2}-\d{2}", value)
+    return match.group(0) if match else value
+
+
 def render_home_page(
-    counts: Mapping[str, Any],
+    published_products: Sequence[Any],
     *,
-    due_now: int,
-    product_path_prefix: str,
     title: str = "PV Wiki",
+    recent_limit: int = 10,
 ) -> str:
-    """Render a deterministic managed block for the Wiki.js landing page."""
+    """Render a reader-facing Wiki.js product encyclopaedia landing page."""
 
-    if not isinstance(counts, Mapping):
-        raise TypeError("counts must be a mapping")
-    normalized_counts: dict[str, int] = {}
-    for status in ("due", "leased", "backoff", "synced"):
-        value = counts.get(status, 0)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"count for {status} must be a non-negative integer")
-        normalized_counts[status] = value
-    if isinstance(due_now, bool) or not isinstance(due_now, int) or due_now < 0:
-        raise ValueError("due_now must be a non-negative integer")
-
+    if (
+        isinstance(recent_limit, bool)
+        or not isinstance(recent_limit, int)
+        or not 1 <= recent_limit <= 100
+    ):
+        raise ValueError("recent_limit must be an integer between 1 and 100")
     clean_title = _plain_text(title)
     if not clean_title:
         raise ValueError("title must be non-empty")
-    prefix = "/".join(
-        stable_slug(part) for part in product_path_prefix.strip("/").split("/")
+
+    entries = _home_catalogue_entries(published_products)
+    brands = _group_counts(entries, "brand")
+    categories = _group_counts(entries, "category")
+    unclassified = sum(1 for entry in entries if not entry["category"])
+    latest = (
+        _display_publication_date(entries[0]["published_at"]) if entries else "暂无"
     )
-    total = sum(normalized_counts.values())
 
     lines = [
         AUTO_BEGIN,
         f"# {_escape_markdown_text(clean_title)}",
         "",
-        (
-            "A cited product knowledge base maintained from a read-only catalogue "
-            "and verified public sources."
-        ),
-        "",
-        "## Find a product",
+        "面向客户与新同事的产品百科。可按型号、品牌或产品类别查找已经核验的产品资料。",
         "",
         (
-            "Use the Wiki.js search box to find a model, manufacturer, or product "
-            f"ID. Managed product pages are stored beneath `{prefix}/`."
+            f"当前已更新 **{len(entries)}** 款产品，覆盖 **{len(brands)}** 个品牌"
+            f"和 **{len(categories)}** 个产品类别。"
         ),
         "",
-        "## Catalogue status",
+        "## 查找产品",
         "",
-        "| Metric | Count |",
+        "使用页面顶部的搜索框输入产品型号、品牌或产品 ID，或者从下面的品牌和类别入口开始浏览。",
+        "",
+        f"{_internal_link('浏览全部产品', 't/product')} · {_internal_link('浏览全部标签', 't')}",
+        "",
+        "## 收录概览",
+        "",
+        "| 指标 | 数量/时间 |",
         "| --- | ---: |",
-        f"| Total catalogue products | {total} |",
-        f"| Pages synchronized | {normalized_counts['synced']} |",
-        f"| Awaiting first processing | {normalized_counts['due']} |",
-        f"| Waiting for retry | {normalized_counts['backoff']} |",
-        f"| Currently leased | {normalized_counts['leased']} |",
-        f"| Due now | {due_now} |",
+        f"| 已更新产品 | {len(entries)} |",
+        f"| 已收录品牌 | {len(brands)} |",
+        f"| 已收录产品类别 | {len(categories)} |",
+        f"| 待分类产品 | {unclassified} |",
+        f"| 最近更新 | {escape_table_cell(latest)} |",
         "",
-        "## About this wiki",
+        "## 按产品类别浏览",
         "",
-        (
-            "Product pages distinguish catalogue identity from externally verified "
-            "facts. Specifications are published only with cited evidence; "
-            "ambiguous matches remain queued for later review."
-        ),
-        "",
-        AUTO_END,
     ]
+    if categories:
+        lines.extend(
+            [
+                "| 产品类别 | 已更新产品 |",
+                "| --- | ---: |",
+                *(
+                    f"| {_tag_index_link(category, 'category', category)} | {count} |"
+                    for category, count in categories
+                ),
+            ]
+        )
+    else:
+        lines.append("暂无已分类产品。产品重新核验后会自动出现在这里。")
+
+    lines.extend(["", "## 按品牌浏览", ""])
+    if brands:
+        lines.extend(
+            [
+                "| 品牌 | 已更新产品 |",
+                "| --- | ---: |",
+                *(
+                    f"| {_tag_index_link(brand, 'brand', brand)} | {count} |"
+                    for brand, count in brands
+                ),
+            ]
+        )
+    else:
+        lines.append("暂无已收录品牌。")
+
+    lines.extend(["", "## 最近更新的产品", ""])
+    if entries:
+        lines.extend(
+            [
+                "| 产品 | 品牌 | 产品类别 | 更新时间 |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        for entry in entries[:recent_limit]:
+            product_link = _internal_link(entry["title"], entry["wiki_path"])
+            brand = (
+                _tag_index_link(entry["brand"], "brand", entry["brand"])
+                if entry["brand"]
+                else "待确认"
+            )
+            category = (
+                _tag_index_link(entry["category"], "category", entry["category"])
+                if entry["category"]
+                else "待分类"
+            )
+            lines.append(
+                f"| {product_link} | {brand} | {category} | "
+                f"{escape_table_cell(_display_publication_date(entry['published_at']))} |"
+            )
+    else:
+        lines.append("暂无已更新产品。")
+
+    lines.extend(
+        [
+            "",
+            "## 关于本 Wiki",
+            "",
+            (
+                "产品信息优先依据制造商官方数据表和可信公开资料整理。规格参数附有参考文献；"
+                "无法确认型号或资料相互冲突时，不会自动发布未经证实的结论。"
+            ),
+            "",
+            AUTO_END,
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -467,7 +654,7 @@ def render_product_page(
         "| 字段 | 值 |",
         "| --- | --- |",
     ]
-    rows = _product_rows(product)
+    rows = _product_rows(product, decision)
     if rows:
         lines.extend(
             f"| {escape_table_cell(label)} | {escape_table_cell(value)} |"

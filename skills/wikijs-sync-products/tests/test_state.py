@@ -130,6 +130,41 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(history[0].details["wiki_path"], "/products/p-1")
         self.assertEqual(history[0].payload["product_name"], "Panel")
 
+    def test_published_products_uses_latest_success_not_queue_status(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("worker-a", now=T0)
+        self.store.record_outcome(
+            lease,
+            "synced",
+            payload={
+                "decision": {
+                    "manufacturer": "Acme Public",
+                    "model": "Panel One",
+                    "product_category": "光伏组件",
+                }
+            },
+            wiki_path="products/p-1-a1",
+            now=T0 + timedelta(minutes=1),
+        )
+
+        changed_at = T0 + timedelta(days=1)
+        self.store.upsert_product(
+            product(name="Panel revision B", updated_at=changed_at),
+            now=changed_at,
+        )
+
+        current = self.store.get_product("P-1")
+        self.assertEqual("due", current.status)
+        published = self.store.published_products()
+        self.assertEqual(1, len(published))
+        self.assertEqual("P-1", published[0].product_id)
+        self.assertEqual("Acme Public", published[0].decision["manufacturer"])
+        self.assertEqual("products/p-1-a1", published[0].wiki_path)
+        self.assertEqual(T0 + timedelta(minutes=1), published[0].published_at)
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            self.store.published_products(limit=0)
+
     def test_failures_back_off_30_90_then_180_days(self):
         self.store.upsert_product(product(), now=T0)
         current = T0

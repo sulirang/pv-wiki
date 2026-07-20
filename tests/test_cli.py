@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -38,6 +39,7 @@ def decision(token: str, outcome: str = "publish") -> dict:
         "confidence": 0.95 if outcome == "publish" else 0.6,
         "manufacturer": "Acme",
         "model": "PV-42",
+        "product_category": "Solar Inverter",
         "summary": "Exact product match.",
         "decision_notes": "Official manufacturer model and document agree.",
         "datasheets": [],
@@ -199,6 +201,21 @@ class CLITests(unittest.TestCase):
         self.assertFalse(after["wakeAgent"])
 
     def test_publish_home_upserts_managed_landing_page(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("homepage-test")
+            store.record_outcome(
+                lease,
+                "synced",
+                payload={
+                    "decision": {
+                        "manufacturer": "Acme",
+                        "model": "HeatPro 42",
+                        "product_category": "热泵",
+                    }
+                },
+                wiki_path="products/p-42-c8d5a4d2d3",
+                now=datetime(2026, 7, 20, tzinfo=timezone.utc),
+            )
         os.environ.update(
             {
                 "WIKIJS_URL": "https://wiki.example.com",
@@ -225,11 +242,14 @@ class CLITests(unittest.TestCase):
             },
             payload["home"],
         )
-        self.assertEqual(1, payload["counts"]["due"])
+        self.assertEqual(1, payload["updated_products"])
         arguments = client.upsert_page.call_args.args
         self.assertEqual("home", arguments[0])
         self.assertEqual("PV Wiki", arguments[2])
-        self.assertIn("| Total catalogue products | 1 |", arguments[4])
+        self.assertIn("当前已更新 **1** 款产品", arguments[4])
+        self.assertIn("[热泵](/t/category-%E7%83%AD%E6%B3%B5)", arguments[4])
+        self.assertIn("[Acme](/t/brand-acme)", arguments[4])
+        self.assertIn("HeatPro 42", arguments[4])
 
     def test_search_uses_leased_snapshot_and_bounded_client(self) -> None:
         token = self.claim()
@@ -257,6 +277,27 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(2, code)
         self.assertIn("AttemptBudgetError", error)
+
+    def test_internal_search_hints_never_treat_family_code_as_category(self) -> None:
+        os.environ["PV_WIKI_TAVILY_INCLUDE_INTERNAL_HINTS"] = "true"
+
+        identity = cli._search_identity(product())
+
+        self.assertEqual("Acme", identity["manufacturer"])
+        self.assertNotIn("category", identity)
+        self.assertNotIn("family_code", identity)
+
+    def test_legacy_public_category_fact_is_normalized_for_homepage(self) -> None:
+        category = cli._decision_product_category(
+            {
+                "facts": [
+                    {"name": "Product Category", "value": "Solar Inverter"}
+                ],
+                "family_code": "SO003",
+            }
+        )
+
+        self.assertEqual("光伏逆变器", category)
 
     def test_unresolved_decision_records_backoff_without_wiki_credentials(self) -> None:
         token = self.claim()
@@ -328,6 +369,7 @@ class CLITests(unittest.TestCase):
         tags = client.upsert_page.call_args.args[5]
         self.assertIn("managed-by-hermes", tags)
         self.assertNotIn("family-pv", tags)
+        self.assertIn("category-光伏逆变器", tags)
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
             self.assertEqual("synced", current.status)

@@ -435,6 +435,7 @@ class WikiJSUpsertTests(unittest.TestCase):
             content=current,
             tags=(
                 "brand-old",
+                "category-old",
                 "human-review",
                 "product",
                 "source-mirror",
@@ -464,6 +465,7 @@ class WikiJSUpsertTests(unittest.TestCase):
             render.AUTO_BEGIN + "\nnew\n" + render.AUTO_END,
             [
                 "brand-new",
+                "category-new",
                 "datasheet-found",
                 "managed-by-hermes",
                 "product",
@@ -513,6 +515,7 @@ class WikiJSUpsertTests(unittest.TestCase):
         self.assertEqual(
             [
                 "brand-new",
+                "category-new",
                 "datasheet-found",
                 "human-review",
                 "managed-by-hermes",
@@ -522,6 +525,7 @@ class WikiJSUpsertTests(unittest.TestCase):
             variables["tags"],
         )
         self.assertNotIn("brand-old", variables["tags"])
+        self.assertNotIn("category-old", variables["tags"])
         self.assertNotIn("source-mirror", variables["tags"])
 
     def test_conflict_refuses_update(self) -> None:

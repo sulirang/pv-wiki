@@ -8,6 +8,7 @@
 | 产品 ID | `{{ product_id }}` |
 | 品牌/制造商 | {{ manufacturer }} |
 | 型号/料号 | {{ model }} |
+| 产品类别 | {{ product_category }} |
 | 产品名称 | {{ product_name }} |
 | 计量单位 | {{ unit_of_measure }} |
 

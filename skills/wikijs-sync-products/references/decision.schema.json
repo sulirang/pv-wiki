@@ -26,6 +26,7 @@
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     "manufacturer": {"type": "string"},
     "model": {"type": "string"},
+    "product_category": {"type": "string", "maxLength": 100},
     "summary": {"type": "string", "maxLength": 2000},
     "review_summary": {"type": "string", "maxLength": 1500},
     "review_evidence_urls": {
@@ -118,8 +119,9 @@
         "required": ["outcome"]
       },
       "then": {
-        "required": ["summary"],
+        "required": ["product_category", "summary"],
         "properties": {
+          "product_category": {"minLength": 1},
           "summary": {"minLength": 1},
           "datasheets": {"minItems": 1},
           "facts": {"minItems": 5}

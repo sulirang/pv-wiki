@@ -51,8 +51,11 @@ tests/                     offline unit tests
    while weaker modes are rejected.
 3. Install the runtime with `python3 -m pip install -e .`.
 4. Run `pv-wiki doctor --live`, then `pv-wiki sync-db`.
-   Run `pv-wiki publish-home` once to create the Wiki.js landing page, and set
-   that configured path as the Wiki.js home page.
+   Run `pv-wiki publish-home` to create or refresh the reader-facing Wiki.js
+   landing page, then set that configured path as the Wiki.js home page. The
+   page links to native Wiki.js brand/category indexes, shows recently
+   published products, and counts products that have at least one successful
+   Wiki publication.
 5. Add this repository as a private Hermes tap, install the skill, and invoke
    it manually once. A private tap requires `GITHUB_TOKEN` in Hermes's `.env`.
 

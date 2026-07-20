@@ -112,9 +112,11 @@ the intended product path. Do not continue if durable SQLite storage is missing.
    decision conforming to
    [references/decision.schema.json](references/decision.schema.json). Give
    concise decision notes, not hidden reasoning or invented specifications.
-   For `publish`, write a reader-facing `summary`, capture the detailed
-   datasheet rows for the exact model as categorized `facts`, and include a
-   `review_summary` only when at least two extracted sources support it.
+   For `publish`, set the broad, reader-facing Chinese `product_category`
+   defined by the source policy, write a reader-facing `summary`, capture the
+   detailed datasheet rows for the exact model as categorized `facts`, and
+   include a `review_summary` only when at least two extracted sources support
+   it. Never use the catalogue `family_code` as the public product category.
 9. Run `pv-wiki publish --decision-file FILE`. The
    runtime enforces confidence, source, URL, lease, path, and conflict checks.
 10. Report the outcome, Wiki path if published, source count, Tavily usage when

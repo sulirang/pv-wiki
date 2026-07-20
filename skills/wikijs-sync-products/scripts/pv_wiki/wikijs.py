@@ -18,7 +18,7 @@ _DUPLICATE_PAGE_CODES = frozenset({6002, 6006})
 _MANAGED_TAGS = frozenset(
     {"product", "datasheet-found", "managed-by-hermes"}
 )
-_MANAGED_TAG_PREFIXES = ("source-", "brand-", "family-")
+_MANAGED_TAG_PREFIXES = ("source-", "brand-", "category-", "family-")
 
 _PAGE_FIELDS = """
 id
