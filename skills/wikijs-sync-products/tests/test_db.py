@@ -141,8 +141,11 @@ class ProductReaderTests(unittest.TestCase):
         self.assertIs(result, sentinel)
         connect.assert_called_once_with(sslmode="require")
 
-    def test_accepts_and_normalizes_secure_sslmodes(self):
+    def test_accepts_and_normalizes_explicit_sslmodes(self):
         for raw, normalized in (
+            ("disable", "disable"),
+            (" ALLOW ", "allow"),
+            ("Prefer", "prefer"),
             ("require", "require"),
             (" VERIFY-CA ", "verify-ca"),
             ("Verify-Full", "verify-full"),
@@ -160,8 +163,8 @@ class ProductReaderTests(unittest.TestCase):
                 self.assertIs(result, sentinel)
                 connect.assert_called_once_with(sslmode=normalized)
 
-    def test_rejects_missing_weak_and_unknown_sslmodes_before_connecting(self):
-        for raw in (None, "", "   ", "disable", "allow", "prefer", "unknown"):
+    def test_rejects_missing_and_unknown_sslmodes_before_connecting(self):
+        for raw in (None, "", "   ", "unknown"):
             with self.subTest(raw=raw):
                 values = {} if raw is None else {"PGSSLMODE": raw}
                 connect = mock.Mock()
@@ -181,7 +184,7 @@ class ProductReaderTests(unittest.TestCase):
         with (
             mock.patch.dict(
                 os.environ,
-                {"PGSSLMODE": "prefer", "PGPASSWORD": secret},
+                {"PGSSLMODE": "unknown", "PGPASSWORD": secret},
                 clear=True,
             ),
             self.assertRaises(db.DatabaseConfigurationError) as raised,

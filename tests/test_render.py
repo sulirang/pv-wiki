@@ -289,6 +289,24 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(1, merged.count(render.AUTO_END))
         self.assertTrue(merged.startswith("Human notes\n\n"))
 
+    def test_migrates_one_legacy_hermes_block_in_place(self) -> None:
+        existing = (
+            "Manual before\n\n"
+            + render.LEGACY_AUTO_BEGIN
+            + "\nold generated text\n"
+            + render.LEGACY_AUTO_END
+            + "\n\nManual after\n"
+        )
+
+        merged = render.merge_auto_block(existing, "new generated text")
+
+        self.assertEqual(1, merged.count(render.AUTO_BEGIN))
+        self.assertEqual(1, merged.count(render.AUTO_END))
+        self.assertNotIn(render.LEGACY_AUTO_BEGIN, merged)
+        self.assertNotIn(render.LEGACY_AUTO_END, merged)
+        self.assertTrue(merged.startswith("Manual before\n\n"))
+        self.assertTrue(merged.endswith("\n\nManual after\n"))
+
     def test_malformed_existing_or_managed_markers_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             render.merge_auto_block(render.AUTO_BEGIN + "\nbroken", "new")
@@ -299,6 +317,27 @@ class MergeTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             render.merge_auto_block("", f"outside\n{render.AUTO_BEGIN}\nx\n{render.AUTO_END}")
+        with self.assertRaises(ValueError):
+            render.merge_auto_block(
+                "",
+                f"{render.LEGACY_AUTO_BEGIN}\nx\n{render.LEGACY_AUTO_END}",
+            )
+        with self.assertRaises(ValueError):
+            render.merge_auto_block(
+                render.AUTO_BEGIN
+                + "\nok\n"
+                + render.AUTO_END
+                + render.LEGACY_AUTO_BEGIN,
+                "new",
+            )
+        with self.assertRaises(ValueError):
+            render.merge_auto_block(
+                render.LEGACY_AUTO_BEGIN
+                + "\nok\n"
+                + render.LEGACY_AUTO_END
+                + render.AUTO_END,
+                "new",
+            )
 
 
 if __name__ == "__main__":

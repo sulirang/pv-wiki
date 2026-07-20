@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import re
+import unicodedata
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
@@ -16,6 +19,20 @@ SOURCE_TYPES = frozenset(
     {"manufacturer", "regulatory", "authorized", "mirror", "community"}
 )
 TRUSTED_TYPES = frozenset({"manufacturer", "regulatory", "authorized"})
+_KNOWN_VARIANT_PREFIXES = ("hc",)
+_EXPLICIT_REVISION_SUFFIX_PATTERN = (
+    r"(?:"
+    r"(?:[^\w\r\n]|_)+"
+    r"(?:rev(?:ision)?|ver(?:sion)?)(?![^\W_])"
+    r"(?:[^\w\r\n]|_)*"
+    r"(?:"
+    r"[^\W\d_]{1,3}\d{0,3}"
+    r"|\d{1,4}[^\W\d_]{1,3}"
+    r"|\d{1,4}(?:\.\d{1,3})*"
+    r")"
+    r"(?![^\W_])"
+    r")?"
+)
 _PRODUCT_CATEGORY_ALIASES = {
     "heat pump": "热泵",
     "heat pumps": "热泵",
@@ -55,7 +72,7 @@ _TOP_LEVEL = frozenset(
 
 
 class DecisionError(ValueError):
-    """Raised when an agent decision is incomplete or unsafe to apply."""
+    """Raised when an AI decision proposal is incomplete or unsafe to apply."""
 
 
 def canonical_product_category(value: str) -> str:
@@ -85,6 +102,204 @@ def _confidence(value: Any, field: str) -> float:
     if not 0.0 <= number <= 1.0:
         raise DecisionError(f"{field} must be between 0 and 1")
     return number
+
+
+def _scalar(value: Any, field: str) -> Any:
+    if isinstance(value, (dict, list)) or value is None:
+        raise DecisionError(f"{field} must be scalar")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise DecisionError(f"{field} must be finite")
+    return value
+
+
+def identity_key(value: str) -> str:
+    """Normalize a model identity for exact punctuation-insensitive matching."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def text_contains_exact_identity(expected: str, body: str) -> bool:
+    """Match a complete model with flexible internal punctuation, not variants."""
+
+    if not isinstance(expected, str) or not isinstance(body, str):
+        return False
+    expected_text = unicodedata.normalize("NFKC", expected).casefold()
+    body_text = unicodedata.normalize("NFKC", body).casefold()
+    tokens = re.findall(r"[^\W_]+", expected_text, flags=re.UNICODE)
+    if not tokens:
+        return False
+    pattern = (
+        r"(?<![^\W_])(?<![^\W_][.\-_/])"
+        + r"[\W_]*".join(re.escape(token) for token in tokens)
+        + r"(?![^\W_])(?![.\-_/][^\W_])"
+    )
+    return re.search(pattern, body_text, flags=re.UNICODE) is not None
+
+
+def _variable_model_token_pattern(token: str) -> str:
+    if token.isdecimal():
+        # Consume a directly attached alphabetic revision as part of the
+        # candidate (for example, PV-42A must not collapse to PV-42).
+        return r"\d+[^\W_]*"
+    if any(character.isdecimal() for character in token):
+        return r"[^\W_]*\d[^\W_]*"
+    return r"[^\W\d_]+"
+
+
+def _contains_compact_affix(expected: str, body: str) -> bool:
+    """Detect a compact prefix/suffix split from a model by OCR or layout."""
+
+    expected_text = unicodedata.normalize("NFKC", expected)
+    body_text = unicodedata.normalize("NFKC", body)
+    tokens = re.findall(r"[^\W_]+", expected_text, flags=re.UNICODE)
+    if not tokens:
+        return False
+    expected_core = r"[\W_]*".join(re.escape(token) for token in tokens)
+    expected_pattern = (
+        r"(?<![^\W_])(?<![^\W_][.\-_/])"
+        + expected_core
+        + r"(?![^\W_])(?![.\-_/][^\W_])"
+    )
+    # Case is intentionally preserved for the suffix. Technical suffixes are
+    # conventionally uppercase; requiring that avoids treating the English
+    # article in "PV-42 a documented product" as a model variant.
+    bare_suffix = (
+        r"(?:[A-Z]|[A-Z]{1,3}\d{1,3}|\d{1,3}[A-Z]{1,3})"
+    )
+    parenthesized_suffix = bare_suffix
+    suffix_pattern = (
+        r"(?i:"
+        + expected_pattern
+        + r")"
+        + r"(?:"
+        + r"[^\S\r\n]+"
+        + bare_suffix
+        + r"(?![A-Za-z0-9_])"
+        + r"|[^\S\r\n]*\([^\S\r\n]*"
+        + parenthesized_suffix
+        + r"[^\S\r\n]*\)"
+        + r")"
+    )
+    known_prefixes = "|".join(
+        re.escape(prefix) for prefix in _KNOWN_VARIANT_PREFIXES
+    )
+    known_prefix_pattern = (
+        r"(?<![A-Za-z0-9_])"
+        + r"(?i:(?:"
+        + known_prefixes
+        + r"))"
+        + r"(?:"
+        + r"(?i:"
+        + expected_core
+        + r")"
+        + r"|(?:[^\w\r\n]|_)+"
+        + r"(?i:"
+        + expected_core
+        + r")"
+        + r")"
+        + r"(?![^\W_])(?![.\-_/][^\W_])"
+    )
+    return any(
+        re.search(candidate, body_text, flags=re.UNICODE) is not None
+        for candidate in (
+            suffix_pattern,
+            known_prefix_pattern,
+        )
+    )
+
+
+def text_contains_competing_identity(expected: str, body: str) -> bool:
+    """Detect sibling model/revision identifiers sharing the expected stem."""
+
+    if not isinstance(expected, str) or not isinstance(body, str):
+        return False
+    expected_text = unicodedata.normalize("NFKC", expected).casefold()
+    body_text = unicodedata.normalize("NFKC", body).casefold()
+    tokens = re.findall(r"[^\W_]+", expected_text, flags=re.UNICODE)
+    if not tokens:
+        return False
+    if len(tokens) == 1:
+        prefix_match = re.match(r"[^\W\d_]+", tokens[0], flags=re.UNICODE)
+        if (
+            prefix_match is None
+            or prefix_match.end() == len(tokens[0])
+            or len(prefix_match.group()) < 2
+        ):
+            return False
+        pattern = (
+            r"(?<![^\W_])"
+            + re.escape(prefix_match.group())
+            + r"[^\W_]*\d[^\W_]*"
+            + r"(?:[.\-_/][^\W_]+)*"
+        )
+    else:
+        pattern = (
+            r"(?<![^\W_])"
+            + re.escape(tokens[0])
+            + "".join(
+                r"[\W_]*" + _variable_model_token_pattern(token)
+                for token in tokens[1:]
+            )
+            + r"(?:[.\-_/][^\W_]+)*"
+        )
+    # Also treat an explicit, immediately following compact revision label as
+    # part of the model candidate. The bounded value grammar catches forms
+    # such as "PV-42 Rev.B" and "PV-42 Version 2.1" without interpreting
+    # ordinary prose such as "PV-42 revision history" as a sibling model.
+    pattern += _EXPLICIT_REVISION_SUFFIX_PATTERN
+    expected_key = identity_key(expected)
+    if any(
+        identity_key(match.group()) != expected_key
+        for match in re.finditer(pattern, body_text, flags=re.UNICODE)
+    ):
+        return True
+    return _contains_compact_affix(expected, body)
+
+
+def _hostname_matches_domain(hostname: str, domain: str) -> bool:
+    host = hostname.rstrip(".").casefold()
+    trusted = domain.rstrip(".").casefold()
+    return host == trusted or host.endswith(f".{trusted}")
+
+
+def _url_has_trusted_domain(url: str, trusted_domains: frozenset[str]) -> bool:
+    hostname = urlsplit(url).hostname or ""
+    return any(
+        _hostname_matches_domain(hostname, domain)
+        for domain in trusted_domains
+    )
+
+
+def _fact_value_present(value: Any, unit: str, normalized_body: str) -> bool:
+    value_key = identity_key(str(value))
+    unit_key = identity_key(unit)
+    if not value_key:
+        return False
+    target = f"{value_key}{unit_key}" if unit_key else value_key
+    return target in normalized_body
+
+
+def _quote_supports_fact(
+    quote: str,
+    *,
+    name: str,
+    value: Any,
+    unit: str,
+    expected_product_name: str,
+    normalized_body: str,
+) -> bool:
+    quote_key = identity_key(quote)
+    name_key = identity_key(name)
+    return (
+        len(quote_key) >= 8
+        and len(name_key) >= 2
+        and quote_key in normalized_body
+        and name_key in quote_key
+        and _fact_value_present(value, unit, quote_key)
+        and text_contains_exact_identity(expected_product_name, quote)
+        and not text_contains_competing_identity(expected_product_name, quote)
+    )
 
 
 def validate_public_url(value: Any, field: str) -> str:
@@ -118,6 +333,9 @@ def validate_decision(
     minimum_fact_confidence: float = 0.8,
     mirrors_allowed: bool = False,
     allowed_evidence_urls: set[str] | None = None,
+    trusted_source_domains: set[str] | frozenset[str] | None = None,
+    expected_product_name: str | None = None,
+    evidence_text_by_url: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return a normalized decision or reject it before any Wiki mutation."""
 
@@ -141,6 +359,12 @@ def validate_decision(
         raise DecisionError("outcome is invalid")
     confidence = _confidence(raw.get("confidence"), "confidence")
 
+    trusted_domains = frozenset(
+        domain.strip().rstrip(".").casefold()
+        for domain in (trusted_source_domains or set())
+        if isinstance(domain, str) and domain.strip()
+    )
+
     datasheets: list[dict[str, Any]] = []
     for index, item in enumerate(_require_list(raw, "datasheets", 10)):
         if not isinstance(item, Mapping):
@@ -153,9 +377,19 @@ def validate_decision(
             raise DecisionError(f"datasheets[{index}].source_type is invalid")
         if not isinstance(item.get("is_primary"), bool):
             raise DecisionError(f"datasheets[{index}].is_primary must be boolean")
+        url = validate_public_url(item.get("url"), f"datasheets[{index}].url")
+        if (
+            outcome == "publish"
+            and source_type in TRUSTED_TYPES
+            and not _url_has_trusted_domain(url, trusted_domains)
+        ):
+            raise DecisionError(
+                f"datasheets[{index}] claims a trusted source type for "
+                "a domain not approved by the operator"
+            )
         datasheets.append(
             {
-                "url": validate_public_url(item.get("url"), f"datasheets[{index}].url"),
+                "url": url,
                 "title": _text(
                     item.get("title"), f"datasheets[{index}].title", required=True, limit=500
                 ),
@@ -174,9 +408,19 @@ def validate_decision(
         source_type = item.get("source_type")
         if source_type not in SOURCE_TYPES:
             raise DecisionError(f"sources[{index}].source_type is invalid")
+        url = validate_public_url(item.get("url"), f"sources[{index}].url")
+        if (
+            outcome == "publish"
+            and source_type in TRUSTED_TYPES
+            and not _url_has_trusted_domain(url, trusted_domains)
+        ):
+            raise DecisionError(
+                f"sources[{index}] claims a trusted source type for "
+                "a domain not approved by the operator"
+            )
         sources.append(
             {
-                "url": validate_public_url(item.get("url"), f"sources[{index}].url"),
+                "url": url,
                 "title": _text(
                     item.get("title"), f"sources[{index}].title", required=True, limit=500
                 ),
@@ -193,6 +437,34 @@ def validate_decision(
         undeclared = declared_urls - normalized_allowed
         if undeclared:
             raise DecisionError("decision cites URLs not extracted for this lease")
+
+    normalized_evidence_text: dict[str, str] = {}
+    if evidence_text_by_url is not None:
+        if not isinstance(evidence_text_by_url, Mapping) or len(evidence_text_by_url) > 5:
+            raise DecisionError(
+                "evidence_text_by_url must map at most 5 URLs to extracted text"
+            )
+        for raw_url, body in evidence_text_by_url.items():
+            url = validate_public_url(raw_url, "evidence_text_by_url")
+            if not isinstance(body, str) or not body.strip() or len(body) > 200_000:
+                raise DecisionError(
+                    "evidence_text_by_url values must be bounded non-empty strings"
+                )
+            if outcome == "publish" and (
+                not text_contains_exact_identity(
+                    expected_product_name or "",
+                    body,
+                )
+                or text_contains_competing_identity(
+                    expected_product_name or "",
+                    body,
+                )
+            ):
+                raise DecisionError(
+                    "publish evidence must contain the matching model identity "
+                    "and no detected sibling model or revision"
+                )
+            normalized_evidence_text[url] = identity_key(body)
 
     summary = _text(raw.get("summary"), "summary", limit=2000)
     product_category = canonical_product_category(
@@ -234,6 +506,7 @@ def validate_decision(
         )
 
     facts: list[dict[str, Any]] = []
+    fact_name_keys: set[str] = set()
     for index, item in enumerate(_require_list(raw, "facts", 100)):
         if not isinstance(item, Mapping):
             raise DecisionError(f"facts[{index}] must be an object")
@@ -244,12 +517,11 @@ def validate_decision(
             "unit",
             "confidence",
             "evidence_urls",
+            "evidence_quotes",
         }
         if unknown_item:
             raise DecisionError(f"facts[{index}] has unknown fields")
-        value = item.get("value")
-        if isinstance(value, (dict, list)) or value is None:
-            raise DecisionError(f"facts[{index}].value must be scalar")
+        value = _scalar(item.get("value"), f"facts[{index}].value")
         evidence_raw = item.get("evidence_urls")
         if not isinstance(evidence_raw, list) or not evidence_raw:
             raise DecisionError(f"facts[{index}].evidence_urls must be non-empty")
@@ -272,14 +544,81 @@ def validate_decision(
             raise DecisionError(
                 f"facts[{index}] cannot use community review evidence"
             )
+        name = _text(
+            item.get("name"),
+            f"facts[{index}].name",
+            required=True,
+            limit=200,
+        )
+        name_key = identity_key(name)
+        if not name_key or name_key in fact_name_keys:
+            raise DecisionError("fact names must be non-empty and unique")
+        fact_name_keys.add(name_key)
+        unit = (
+            _text(item.get("unit"), f"facts[{index}].unit", limit=80)
+            if "unit" in item
+            else ""
+        )
+        quotes_raw = item.get("evidence_quotes")
+        if quotes_raw is None and outcome != "publish":
+            quotes_raw = []
+        if not isinstance(quotes_raw, list) or len(quotes_raw) > 5:
+            raise DecisionError(
+                f"facts[{index}].evidence_quotes must be an array of at most 5 entries"
+            )
+        if outcome == "publish" and not quotes_raw:
+            raise DecisionError(
+                f"facts[{index}].evidence_quotes must contain 1-5 entries"
+            )
+        evidence_quotes: list[dict[str, str]] = []
+        for quote_index, quote_item in enumerate(quotes_raw):
+            if not isinstance(quote_item, Mapping):
+                raise DecisionError(
+                    f"facts[{index}].evidence_quotes[{quote_index}] "
+                    "must be an object"
+                )
+            if set(quote_item) != {"url", "quote"}:
+                raise DecisionError(
+                    f"facts[{index}].evidence_quotes[{quote_index}] "
+                    "must contain only url and quote"
+                )
+            quote_url = validate_public_url(
+                quote_item.get("url"),
+                f"facts[{index}].evidence_quotes[{quote_index}].url",
+            )
+            quote = _text(
+                quote_item.get("quote"),
+                f"facts[{index}].evidence_quotes[{quote_index}].quote",
+                required=True,
+                limit=500,
+            )
+            if quote_url not in evidence:
+                raise DecisionError(
+                    f"facts[{index}].evidence_quotes URLs must also be "
+                    "listed in evidence_urls"
+                )
+            if outcome == "publish" and not _quote_supports_fact(
+                quote,
+                name=name,
+                value=value,
+                unit=unit,
+                expected_product_name=expected_product_name or "",
+                normalized_body=normalized_evidence_text.get(quote_url, ""),
+            ):
+                raise DecisionError(
+                    f"facts[{index}].evidence_quotes[{quote_index}] is not "
+                    "an exact supporting extract span"
+                )
+            evidence_quotes.append({"url": quote_url, "quote": quote})
         fact = {
-            "name": _text(item.get("name"), f"facts[{index}].name", required=True, limit=200),
+            "name": name,
             "value": value,
             "confidence": fact_confidence,
             "evidence_urls": evidence,
+            "evidence_quotes": evidence_quotes,
         }
         if "unit" in item:
-            fact["unit"] = _text(item.get("unit"), f"facts[{index}].unit", limit=80)
+            fact["unit"] = unit
         if "category" in item:
             fact["category"] = _text(
                 item.get("category"), f"facts[{index}].category", limit=100
@@ -298,11 +637,13 @@ def validate_decision(
         field = _text(
             item.get("field"), f"conflicts[{index}].field", required=True, limit=200
         )
-        conflict_fields.add(field.casefold())
+        conflict_fields.add(identity_key(field))
         if not isinstance(item.get("values"), list) or len(item["values"]) < 2:
             raise DecisionError(f"conflicts[{index}].values needs at least two values")
-        if any(isinstance(value, (dict, list)) or value is None for value in item["values"]):
-            raise DecisionError(f"conflicts[{index}].values must contain scalars")
+        values = [
+            _scalar(value, f"conflicts[{index}].values")
+            for value in item["values"]
+        ]
         urls = item.get("source_urls")
         if not isinstance(urls, list) or not urls:
             raise DecisionError(f"conflicts[{index}].source_urls must be non-empty")
@@ -314,10 +655,12 @@ def validate_decision(
                 f"conflicts[{index}].source_urls must reference declared sources"
             )
         normalized_conflicts.append(
-            {"field": field, "values": list(item["values"]), "source_urls": normalized_urls}
+            {"field": field, "values": values, "source_urls": normalized_urls}
         )
 
-    disputed_facts = {item["name"].casefold() for item in facts} & conflict_fields
+    disputed_facts = {
+        identity_key(item["name"]) for item in facts
+    } & conflict_fields
     if disputed_facts:
         raise DecisionError("conflicted fields must not also appear as verified facts")
 
@@ -331,6 +674,14 @@ def validate_decision(
             )
         if not summary:
             raise DecisionError("publish requires a user-facing product summary")
+        expected_identity = identity_key(expected_product_name or "")
+        proposed_identity = identity_key(
+            _text(raw.get("model"), "model", required=True, limit=300)
+        )
+        if not expected_identity or proposed_identity != expected_identity:
+            raise DecisionError(
+                "publish model does not exactly match the catalogue product name"
+            )
         if len(facts) < 5:
             raise DecisionError(
                 "publish requires at least 5 cited specification facts"
@@ -338,7 +689,13 @@ def validate_decision(
         primary = [item for item in datasheets if item["is_primary"]]
         if not primary:
             raise DecisionError("publish requires a primary datasheet")
-        if not any(item["source_type"] in TRUSTED_TYPES for item in primary):
+        trusted_primary = [
+            item
+            for item in primary
+            if item["source_type"] in TRUSTED_TYPES
+            and _url_has_trusted_domain(item["url"], trusted_domains)
+        ]
+        if not trusted_primary:
             mirror_domains = {
                 ".".join((urlsplit(item["url"]).hostname or "").split(".")[-2:])
                 for item in primary
@@ -353,6 +710,34 @@ def validate_decision(
                 raise DecisionError(
                     "primary datasheet needs a trusted source or two enabled independent mirrors"
                 )
+        trusted_fact_urls = {
+            item["url"]
+            for item in datasheets + sources
+            if item["source_type"] in TRUSTED_TYPES
+            and _url_has_trusted_domain(item["url"], trusted_domains)
+        }
+        for index, fact in enumerate(facts):
+            quoted_urls = {
+                item["url"] for item in fact["evidence_quotes"]
+            }
+            if trusted_primary:
+                trusted_evidence = quoted_urls & trusted_fact_urls
+                if not trusted_evidence:
+                    raise DecisionError(
+                        f"facts[{index}] needs evidence from an "
+                        "operator-approved trusted domain"
+                    )
+            else:
+                matching_mirror_domains = {
+                    ".".join((urlsplit(url).hostname or "").split(".")[-2:])
+                    for url in quoted_urls
+                    if source_types_by_url.get(url) == "mirror"
+                }
+                if len(matching_mirror_domains) < 2:
+                    raise DecisionError(
+                        f"facts[{index}] needs its value in two independent "
+                        "mirror extracts"
+                    )
 
     return {
         "schema_version": "1",
@@ -379,6 +764,9 @@ def validate_decision(
 __all__ = [
     "DecisionError",
     "canonical_product_category",
+    "identity_key",
+    "text_contains_competing_identity",
+    "text_contains_exact_identity",
     "validate_decision",
     "validate_public_url",
 ]

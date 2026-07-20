@@ -74,7 +74,13 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["name", "value", "confidence", "evidence_urls"],
+        "required": [
+          "name",
+          "value",
+          "confidence",
+          "evidence_urls",
+          "evidence_quotes"
+        ],
         "properties": {
           "name": {"type": "string", "minLength": 1},
           "category": {"type": "string", "maxLength": 100},
@@ -85,6 +91,20 @@
             "type": "array",
             "minItems": 1,
             "items": {"type": "string", "format": "uri"}
+          },
+          "evidence_quotes": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["url", "quote"],
+              "properties": {
+                "url": {"type": "string", "format": "uri"},
+                "quote": {"type": "string", "minLength": 1, "maxLength": 500}
+              }
+            }
           }
         }
       }

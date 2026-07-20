@@ -20,6 +20,7 @@ from collections.abc import Callable, Mapping, Sequence
 from email.utils import parsedate_to_datetime
 from typing import Any
 
+from .config import is_placeholder_value
 from .render import validate_public_http_url
 
 
@@ -381,7 +382,7 @@ class TavilyClient:
         seen: set[str] = set()
         unique: list[str] = []
         for k in keys:
-            if k not in seen:
+            if not is_placeholder_value(k) and k not in seen:
                 seen.add(k)
                 unique.append(k)
         return unique
@@ -700,7 +701,7 @@ class TavilyClient:
         return {
             "query": clean_query,
             "urls": submitted,
-            "extract_depth": "basic",
+            "extract_depth": "advanced",
             "results": results,
             "failed_results": failed_results,
             "usage": {"credits": credit_count},

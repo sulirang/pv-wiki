@@ -1,0 +1,33 @@
+name: pv-wiki-worker
+
+services:
+  pv-wiki-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - worker.env
+    volumes:
+      - pv_wiki_state:/data
+      - type: bind
+        source: ${CATALOGUE_CA_PATH:?set CATALOGUE_CA_PATH in .env}
+        target: /run/pv-wiki/catalogue-ca.pem
+        read_only: true
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  pv_wiki_state:

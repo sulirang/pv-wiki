@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -10,13 +11,31 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "wikijs-sync-products" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from pv_wiki.config import ConfigError, WikiSettings, allow_mirrors, state_path  # noqa: E402
+from pv_wiki.config import (  # noqa: E402
+    ConfigError,
+    WikiSettings,
+    allow_mirrors,
+    missing_environment,
+    state_path,
+    trusted_source_domains,
+)
 
 
 class ConfigTests(unittest.TestCase):
     def test_defaults_do_not_require_secrets(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertTrue(str(state_path()).endswith(".hermes/data/pv-wiki/state.sqlite3"))
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HOME": tempfile.gettempdir(),
+                "USERPROFILE": tempfile.gettempdir(),
+            },
+            clear=True,
+        ):
+            self.assertTrue(
+                state_path().as_posix().endswith(
+                    ".local/state/pv-wiki/state.sqlite3"
+                )
+            )
             self.assertFalse(allow_mirrors())
 
     def test_wiki_settings_require_https_origin(self) -> None:
@@ -45,9 +64,41 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 WikiSettings.from_env()
 
+    def test_placeholders_and_invalid_trusted_domains_fail_closed(self) -> None:
+        values = {
+            "WIKIJS_URL": "https://wiki.example.com",
+            "WIKIJS_TOKEN": "replace-with-a-restricted-token",
+            "PGPASSWORD": "replace-me",
+            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON":
+                '{"Acme":["https://maker.example/path"]}',
+        }
+        with mock.patch.dict(os.environ, values, clear=True):
+            with self.assertRaisesRegex(ConfigError, "placeholder"):
+                WikiSettings.from_env()
+            self.assertEqual(
+                ["PGPASSWORD"],
+                missing_environment(("PGPASSWORD",)),
+            )
+            with self.assertRaisesRegex(ConfigError, "hostnames"):
+                trusted_source_domains("Acme")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON":
+                    '{"Acme":["maker.example","docs.maker.example"]}'
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                frozenset({"maker.example", "docs.maker.example"}),
+                trusted_source_domains("Acme"),
+            )
+
         values.update(
             {
                 "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "secret",
                 "WIKIJS_HOME_PATH": "../home",
             }
         )

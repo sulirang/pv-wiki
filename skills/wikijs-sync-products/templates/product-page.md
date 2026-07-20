@@ -1,4 +1,4 @@
-<!-- HERMES-AUTO:BEGIN -->
+<!-- PV-WIKI-AUTO:BEGIN -->
 # {{ title }}
 
 ## 产品信息
@@ -31,4 +31,4 @@
 ## 参考文献
 
 {{ references }}
-<!-- HERMES-AUTO:END -->
+<!-- PV-WIKI-AUTO:END -->

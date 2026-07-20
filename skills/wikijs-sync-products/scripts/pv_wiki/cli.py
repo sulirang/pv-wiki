@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .ai import AIError, AISettings, OpenAICompatibleClient
 from .config import (
     ConfigError,
     WikiSettings,
@@ -23,15 +24,21 @@ from .config import (
     min_fact_confidence,
     min_publish_confidence,
     missing_environment,
+    redact_environment_secrets,
     state_path,
+    trusted_source_domain_map,
+    trusted_source_domains,
 )
 from .db import DatabaseConfigurationError, ProductReader, validate_postgres_sslmode
 from .decision import (
     DecisionError,
     canonical_product_category,
+    text_contains_competing_identity,
+    text_contains_exact_identity,
     validate_decision,
 )
 from .render import render_home_page, render_product_page, stable_path, stable_slug
+from .server import WorkerConfigError, WorkerSettings, serve
 from .state import Lease, LeaseLostError, StateError, StateStore
 from .tavily import TavilyClient, TavilyError
 from .wikijs import WikiJSClient, WikiJSConflictError, WikiJSError
@@ -46,8 +53,18 @@ REQUIRED_ENVIRONMENT = (
     "PGSSLMODE",
     "WIKIJS_URL",
     "WIKIJS_TOKEN",
+    "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON",
 )
-SECRET_ENVIRONMENT = ("PGPASSWORD", "TAVILY_API_KEY", "TAVILY_API_KEYS", "WIKIJS_TOKEN")
+SECRET_ENVIRONMENT = (
+    "PGPASSWORD",
+    "TAVILY_API_KEY",
+    "TAVILY_API_KEYS",
+    "WIKIJS_TOKEN",
+    "AI_API_KEY",
+    "LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "PV_WIKI_WORKER_TOKEN",
+)
 MAX_JSON_INPUT_BYTES = 1_000_000
 
 
@@ -74,11 +91,11 @@ def _emit(value: Any, *, stream: Any = None) -> None:
 
 def _safe_error(error: BaseException) -> str:
     message = str(error) or error.__class__.__name__
-    for name in SECRET_ENVIRONMENT:
-        secret = os.getenv(name, "")
-        if secret:
-            message = message.replace(secret, "[REDACTED]")
-    return message[:2000]
+    return redact_environment_secrets(
+        message,
+        SECRET_ENVIRONMENT,
+        limit=2000,
+    )
 
 
 def _read_json(path_value: str) -> dict[str, Any]:
@@ -96,6 +113,28 @@ def _read_json(path_value: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CLIError("JSON input must be an object")
     return value
+
+
+def _read_evidence_texts(path_value: str) -> dict[str, str]:
+    payload = _read_json(path_value)
+    container = payload.get("extract", payload)
+    if not isinstance(container, dict):
+        raise CLIError("evidence file must contain an extract object")
+    results = container.get("results")
+    if not isinstance(results, list) or len(results) > 5:
+        raise CLIError("evidence file must contain at most 5 extract results")
+    evidence: dict[str, str] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            raise CLIError("evidence extract results must be objects")
+        url = item.get("url")
+        body = item.get("raw_content")
+        if not isinstance(url, str) or not isinstance(body, str) or not body.strip():
+            continue
+        if url in evidence and evidence[url] != body:
+            raise CLIError("evidence file has duplicate URLs with different content")
+        evidence[url] = body
+    return evidence
 
 
 def _store() -> StateStore:
@@ -131,9 +170,7 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
 def _worker_id(explicit: str | None) -> str:
     if explicit and explicit.strip():
         return explicit.strip()[:200]
-    session = os.getenv("HERMES_SESSION_ID", "").strip()
-    suffix = session[:80] if session else str(os.getpid())
-    return f"hermes:{socket.gethostname()[:80]}:{suffix}"
+    return f"pv-wiki:{socket.gethostname()[:80]}:{os.getpid()}"
 
 
 def _tag_slug(prefix: str, value: Any) -> str | None:
@@ -147,7 +184,7 @@ def _tag_slug(prefix: str, value: Any) -> str | None:
 
 
 def _wiki_tags(product: dict[str, Any], decision: dict[str, Any]) -> list[str]:
-    tags = {"product", "datasheet-found", "managed-by-hermes"}
+    tags = {"product", "datasheet-found", "managed-by-pv-wiki"}
     for item in decision["datasheets"] + decision["sources"]:
         tags.add(f"source-{item['source_type']}")
     brand_tag = _tag_slug(
@@ -228,18 +265,58 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         checks["wikijs_config"] = {"ok": False, "error": _safe_error(exc)}
 
+    trusted_domain_mapping: dict[str, frozenset[str]] | None = None
+    try:
+        trusted_domain_mapping = trusted_source_domain_map()
+        checks["trusted_sources_config"] = {
+            "ok": True,
+            "brand_mappings": len(trusted_domain_mapping),
+            "domains": sum(
+                len(domains) for domains in trusted_domain_mapping.values()
+            ),
+        }
+    except ConfigError as exc:
+        checks["trusted_sources_config"] = {
+            "ok": False,
+            "error": _safe_error(exc),
+        }
+
+    ai_settings: AISettings | None = None
+    try:
+        ai_settings = AISettings.from_env()
+        checks["ai_config"] = {
+            "ok": True,
+            "base_url": ai_settings.base_url,
+            "model": ai_settings.model,
+            "note": "configuration validated; doctor does not spend AI tokens",
+        }
+    except AIError as exc:
+        checks["ai_config"] = {"ok": False, "error": _safe_error(exc)}
+
     pg_sslmode: str | None = None
     try:
         pg_sslmode = validate_postgres_sslmode()
         checks["postgresql_tls"] = {
             "ok": True,
             "sslmode": pg_sslmode,
-            "minimum": "require",
+            "recommended": "verify-full",
         }
+        if pg_sslmode in {"disable", "allow", "prefer"}:
+            checks["postgresql_tls"]["warning"] = (
+                "catalogue transport may be unencrypted; use this mode only "
+                "after the operator accepts the network risk"
+            )
     except DatabaseConfigurationError as exc:
         checks["postgresql_tls"] = {"ok": False, "error": _safe_error(exc)}
 
-    if args.live and not missing and wiki_settings is not None and pg_sslmode:
+    if (
+        args.live
+        and not missing
+        and wiki_settings is not None
+        and ai_settings is not None
+        and trusted_domain_mapping is not None
+        and pg_sslmode
+    ):
         generator = ProductReader().iter_products(batch_size=1)
         try:
             first = next(generator, None)
@@ -286,21 +363,25 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_sync_db(_args: argparse.Namespace) -> int:
+    _emit(sync_catalogue())
+    return 0
+
+
+def sync_catalogue() -> dict[str, Any]:
+    """Refresh the durable queue from the read-only product catalogue."""
+
     products = ProductReader().fetch_products(batch_size=500)
     with _store() as store:
         results = store.upsert_products(products)
         counts = store.status_counts()
-    _emit(
-        {
-            "ok": True,
-            "source_records": len(products),
-            "created": sum(item.created for item in results),
-            "changed": sum(item.changed and not item.created for item in results),
-            "rescheduled": sum(item.rescheduled for item in results),
-            "queue": counts,
-        }
-    )
-    return 0
+    return {
+        "ok": True,
+        "source_records": len(products),
+        "created": sum(item.created for item in results),
+        "changed": sum(item.changed and not item.created for item in results),
+        "rescheduled": sum(item.rescheduled for item in results),
+        "queue": counts,
+    }
 
 
 def _cmd_precheck(_args: argparse.Namespace) -> int:
@@ -311,7 +392,7 @@ def _cmd_precheck(_args: argparse.Namespace) -> int:
         {
             "ok": True,
             "due": len(due),
-            "wakeAgent": bool(due),
+            "workAvailable": bool(due),
             "counts": counts,
         }
     )
@@ -340,34 +421,53 @@ def _cmd_claim(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_search(
+    store: StateStore,
+    lease: Lease,
+    *,
+    max_results: int,
+    timeout: float,
+) -> dict[str, Any]:
+    store.begin_search(lease)
+    try:
+        client = TavilyClient(timeout=timeout)
+        bundle = client.search_product(
+            _search_identity(lease.payload), max_results=max_results
+        )
+        store.finish_search(
+            lease,
+            [
+                item["url"]
+                for item in bundle.get("results", [])
+                if isinstance(item, dict) and isinstance(item.get("url"), str)
+            ],
+            bundle.get("usage", {}),
+        )
+    except Exception as exc:
+        try:
+            store.record_outcome(
+                lease,
+                "tavily_error",
+                error=_safe_error(exc),
+            )
+        except StateError:
+            pass
+        raise
+    final_check = store.precheck(lease)
+    if not final_check.ready:
+        raise LeaseLostError(f"source changed during search: {final_check.reason}")
+    return bundle
+
+
 def _cmd_search(args: argparse.Namespace) -> int:
     with _store() as store:
         lease = _require_lease(store, args.lease_token)
-        store.begin_search(lease)
-        try:
-            client = TavilyClient(timeout=args.timeout)
-            bundle = client.search_product(
-                _search_identity(lease.payload), max_results=args.max_results
-            )
-            store.finish_search(
-                lease,
-                [item["url"] for item in bundle.get("results", [])],
-                bundle.get("usage", {}),
-            )
-        except Exception as exc:
-            try:
-                store.record_outcome(
-                    lease,
-                    "tavily_error",
-                    error=_safe_error(exc),
-                )
-            except StateError:
-                pass
-            raise
-        # Refuse to present evidence for a product changed while Tavily ran.
-        final_check = store.precheck(lease)
-        if not final_check.ready:
-            raise LeaseLostError(f"source changed during search: {final_check.reason}")
+        bundle = _run_search(
+            store,
+            lease,
+            max_results=args.max_results,
+            timeout=args.timeout,
+        )
     _emit(
         {
             "ok": True,
@@ -380,6 +480,65 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_extract(
+    store: StateStore,
+    lease: Lease,
+    *,
+    urls: list[str],
+    query: str,
+    timeout: float,
+) -> dict[str, Any]:
+    submitted = store.begin_extract(lease, urls)
+    try:
+        client = TavilyClient(timeout=timeout)
+        bundle = client.extract_urls(submitted, query)
+        limit = max_extract_chars()
+        for result in bundle.get("results", []):
+            content = result.get("raw_content")
+            if isinstance(content, str) and len(content) > limit:
+                result["raw_content_sha256"] = hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest()
+                result["raw_content"] = content[:limit]
+                result["truncated"] = True
+        expected_identity = str(lease.payload.get("product_name") or "")
+        successful_urls = [
+            item["url"]
+            for item in bundle.get("results", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("url"), str)
+            and isinstance(item.get("raw_content"), str)
+            and item["raw_content"].strip()
+            and text_contains_exact_identity(
+                expected_identity,
+                item["raw_content"],
+            )
+            and not text_contains_competing_identity(
+                expected_identity,
+                item["raw_content"],
+            )
+        ]
+        store.finish_extract(
+            lease,
+            successful_urls,
+            bundle.get("usage", {}),
+        )
+    except Exception as exc:
+        try:
+            store.record_outcome(
+                lease,
+                "tavily_error",
+                error=_safe_error(exc),
+            )
+        except StateError:
+            pass
+        raise
+    final_check = store.precheck(lease)
+    if not final_check.ready:
+        raise LeaseLostError(f"source changed during extract: {final_check.reason}")
+    return bundle
+
+
 def _cmd_extract(args: argparse.Namespace) -> int:
     request = _read_json(args.request_file)
     urls = request.get("urls")
@@ -388,33 +547,13 @@ def _cmd_extract(args: argparse.Namespace) -> int:
         raise CLIError("extract request needs string query and array urls")
     with _store() as store:
         lease = _require_lease(store, args.lease_token)
-        submitted = store.begin_extract(lease, urls)
-        try:
-            client = TavilyClient(timeout=args.timeout)
-            bundle = client.extract_urls(submitted, query)
-            store.finish_extract(lease, bundle.get("usage", {}))
-            limit = max_extract_chars()
-            for result in bundle.get("results", []):
-                content = result.get("raw_content")
-                if isinstance(content, str) and len(content) > limit:
-                    result["raw_content_sha256"] = hashlib.sha256(
-                        content.encode("utf-8")
-                    ).hexdigest()
-                    result["raw_content"] = content[:limit]
-                    result["truncated"] = True
-        except Exception as exc:
-            try:
-                store.record_outcome(
-                    lease,
-                    "tavily_error",
-                    error=_safe_error(exc),
-                )
-            except StateError:
-                pass
-            raise
-        final_check = store.precheck(lease)
-        if not final_check.ready:
-            raise LeaseLostError(f"source changed during extract: {final_check.reason}")
+        bundle = _run_extract(
+            store,
+            lease,
+            urls=urls,
+            query=query,
+            timeout=args.timeout,
+        )
     _emit(
         {
             "ok": True,
@@ -426,141 +565,461 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_publish(args: argparse.Namespace) -> int:
-    raw = _read_json(args.decision_file)
-    with _store() as store:
-        lease = _require_lease(store, str(raw.get("lease_token") or ""))
-        try:
-            allowed_urls = set(store.allowed_evidence_urls(lease.token))
-            decision = validate_decision(
-                raw,
-                expected_product_id=lease.product_id,
-                expected_lease_token=lease.token,
-                minimum_confidence=min_publish_confidence(),
-                minimum_fact_confidence=min_fact_confidence(),
-                mirrors_allowed=allow_mirrors(),
-                allowed_evidence_urls=allowed_urls,
+def _apply_decision(
+    store: StateStore,
+    lease: Lease,
+    raw: dict[str, Any],
+    *,
+    audit: dict[str, Any] | None = None,
+    evidence_text_by_url: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    try:
+        allowed_urls = set(store.allowed_evidence_urls(lease.token))
+        trusted_domains = (
+            trusted_source_domains(
+                str(lease.payload.get("brand_code") or "")
             )
-        except DecisionError as exc:
-            store.record_outcome(
-                lease,
-                "invalid_decision",
-                error=_safe_error(exc),
-            )
-            raise
+            if raw.get("outcome") == "publish"
+            else frozenset()
+        )
+        decision = validate_decision(
+            raw,
+            expected_product_id=lease.product_id,
+            expected_lease_token=lease.token,
+            minimum_confidence=min_publish_confidence(),
+            minimum_fact_confidence=min_fact_confidence(),
+            mirrors_allowed=allow_mirrors(),
+            allowed_evidence_urls=allowed_urls,
+            trusted_source_domains=trusted_domains,
+            expected_product_name=str(
+                lease.payload.get("product_name") or ""
+            ),
+            evidence_text_by_url=evidence_text_by_url,
+        )
+    except DecisionError as exc:
+        store.record_outcome(
+            lease,
+            "invalid_decision",
+            error=_safe_error(exc),
+        )
+        raise
+    except ConfigError as exc:
+        store.record_outcome(
+            lease,
+            "configuration_error",
+            error=_safe_error(exc),
+        )
+        raise
 
-        if decision["outcome"] != "publish":
-            outcome = store.record_outcome(
-                lease,
-                decision["outcome"],
-                payload={"decision": decision},
-            )
-            _emit(
-                {
-                    "ok": True,
-                    "published": False,
-                    "product_id": lease.product_id,
-                    "outcome": outcome.outcome,
-                    "next_attempt_at": outcome.next_attempt_at,
-                }
-            )
-            return 0
+    audit_payload: dict[str, Any] = {"decision": decision}
+    if audit:
+        audit_payload["automation"] = audit
 
-        path: str | None = None
-        try:
-            settings = WikiSettings.from_env()
-            path = stable_path(lease.payload, prefix=settings.path_prefix)
-            product = {
-                **lease.payload,
-                "manufacturer": decision.get("manufacturer")
-                or lease.payload.get("brand_code"),
-                "model": decision.get("model") or lease.payload.get("product_name"),
-            }
-            title = " ".join(
-                str(
-                    decision.get("model")
-                    or lease.payload.get("product_name")
-                    or lease.product_id
-                ).split()
-            )
-            summary = " ".join(str(decision.get("summary") or "").split())
-            description = (
-                summary or f"Datasheet and cited specifications for {title}."
-            )[:500]
-            managed = render_product_page(
-                product, decision, datetime.now(timezone.utc)
-            )
-            tags = _wiki_tags(lease.payload, decision)
-
-            # The source may have changed after AI evaluation; check once more
-            # immediately before the only external mutation in the workflow.
-            check = store.precheck(lease)
-            if not check.ready:
-                raise LeaseLostError(f"lease cannot publish: {check.reason}")
-
-            client = WikiJSClient(
-                settings.base_url,
-                settings.token,
-                timeout=settings.timeout,
-                new_page_private=settings.new_page_private,
-                new_page_published=settings.new_page_published,
-            )
-            result = client.upsert_page(
-                path,
-                settings.locale,
-                title,
-                description,
-                managed,
-                tags,
-            )
-        except LeaseLostError:
-            raise
-        except Exception as exc:
-            failure = (
-                "wikijs_conflict"
-                if isinstance(exc, WikiJSConflictError)
-                else "wikijs_error"
-                if isinstance(exc, WikiJSError)
-                else "publish_error"
-            )
-            try:
-                store.record_outcome(
-                    lease,
-                    failure,
-                    payload={"decision": decision},
-                    wiki_path=path,
-                    error=_safe_error(exc),
-                )
-            except StateError:
-                pass
-            raise
-
+    if decision["outcome"] != "publish":
         outcome = store.record_outcome(
             lease,
-            "synced",
-            payload={
-                "decision": decision,
-                "wiki_action": result.get("action"),
-            },
-            wiki_path=path,
+            decision["outcome"],
+            payload=audit_payload,
         )
-
-    page = result.get("page") if isinstance(result.get("page"), dict) else {}
-    _emit(
-        {
+        return {
             "ok": True,
-            "published": True,
+            "processed": True,
+            "published": False,
             "product_id": lease.product_id,
-            "wiki": {
-                "action": result.get("action"),
-                "id": page.get("id"),
-                "path": path,
-                "locale": settings.locale,
-            },
-            "sources": len(decision["datasheets"]) + len(decision["sources"]),
+            "outcome": outcome.outcome,
             "next_attempt_at": outcome.next_attempt_at,
         }
+
+    path: str | None = None
+    try:
+        settings = WikiSettings.from_env()
+        path = stable_path(lease.payload, prefix=settings.path_prefix)
+        product = {
+            **lease.payload,
+            "manufacturer": decision.get("manufacturer")
+            or lease.payload.get("brand_code"),
+            "model": decision.get("model") or lease.payload.get("product_name"),
+        }
+        title = " ".join(
+            str(
+                decision.get("model")
+                or lease.payload.get("product_name")
+                or lease.product_id
+            ).split()
+        )
+        summary = " ".join(str(decision.get("summary") or "").split())
+        description = (
+            summary or f"Datasheet and cited specifications for {title}."
+        )[:500]
+        managed = render_product_page(
+            product, decision, datetime.now(timezone.utc)
+        )
+        tags = _wiki_tags(lease.payload, decision)
+
+        check = store.precheck(lease)
+        if not check.ready:
+            raise LeaseLostError(f"lease cannot publish: {check.reason}")
+
+        client = WikiJSClient(
+            settings.base_url,
+            settings.token,
+            timeout=settings.timeout,
+            new_page_private=settings.new_page_private,
+            new_page_published=settings.new_page_published,
+        )
+        result = client.upsert_page(
+            path,
+            settings.locale,
+            title,
+            description,
+            managed,
+            tags,
+        )
+    except LeaseLostError:
+        raise
+    except Exception as exc:
+        failure = (
+            "wikijs_conflict"
+            if isinstance(exc, WikiJSConflictError)
+            else "wikijs_error"
+            if isinstance(exc, WikiJSError)
+            else "publish_error"
+        )
+        try:
+            store.record_outcome(
+                lease,
+                failure,
+                payload=audit_payload,
+                wiki_path=path,
+                error=_safe_error(exc),
+            )
+        except StateError:
+            pass
+        raise
+
+    outcome = store.record_outcome(
+        lease,
+        "synced",
+        payload={
+            **audit_payload,
+            "wiki_action": result.get("action"),
+        },
+        wiki_path=path,
     )
+    page = result.get("page") if isinstance(result.get("page"), dict) else {}
+    return {
+        "ok": True,
+        "processed": True,
+        "published": True,
+        "product_id": lease.product_id,
+        "outcome": outcome.outcome,
+        "wiki": {
+            "action": result.get("action"),
+            "id": page.get("id"),
+            "path": path,
+            "locale": settings.locale,
+        },
+        "sources": len(decision["datasheets"]) + len(decision["sources"]),
+        "next_attempt_at": outcome.next_attempt_at,
+    }
+
+
+def _cmd_publish(args: argparse.Namespace) -> int:
+    raw = _read_json(args.decision_file)
+    evidence_text_by_url = (
+        _read_evidence_texts(args.evidence_file)
+        if args.evidence_file
+        else None
+    )
+    with _store() as store:
+        lease = _require_lease(store, str(raw.get("lease_token") or ""))
+        result = _apply_decision(
+            store,
+            lease,
+            raw,
+            evidence_text_by_url=evidence_text_by_url,
+        )
+    _emit(result)
+    return 0
+
+
+def _nonpublish_decision(
+    lease: Lease,
+    outcome: str,
+    note: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "1",
+        "product_id": lease.product_id,
+        "lease_token": lease.token,
+        "outcome": outcome,
+        "confidence": 1.0,
+        "manufacturer": "",
+        "model": str(lease.payload.get("product_name") or "").strip(),
+        "product_category": "",
+        "summary": "",
+        "review_summary": "",
+        "review_evidence_urls": [],
+        "decision_notes": note,
+        "datasheets": [],
+        "sources": [],
+        "facts": [],
+        "conflicts": [],
+    }
+
+
+def _record_active_failure(
+    store: StateStore,
+    lease: Lease,
+    outcome: str,
+    error: BaseException | str,
+) -> None:
+    try:
+        active = store.get_by_lease(lease.token)
+        if active is not None:
+            safe_exception = (
+                error if isinstance(error, BaseException) else Exception(error)
+            )
+            store.record_outcome(
+                active,
+                outcome,
+                error=_safe_error(safe_exception),
+            )
+    except StateError:
+        pass
+
+
+def run_one(
+    *,
+    worker_id: str | None = None,
+    lease_seconds: int = 3600,
+    max_results: int = 5,
+    tavily_timeout: float = 30.0,
+) -> dict[str, Any]:
+    """Run one bounded Search → Extract → AI → Wiki.js product cycle."""
+
+    if (
+        isinstance(max_results, bool)
+        or not isinstance(max_results, int)
+        or not 1 <= max_results <= 5
+    ):
+        raise CLIError("run-one max_results must be between 1 and 5")
+    if (
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or not 300 <= lease_seconds <= 7200
+    ):
+        raise CLIError("run-one lease_seconds must be between 300 and 7200")
+    if (
+        isinstance(tavily_timeout, bool)
+        or not isinstance(tavily_timeout, (int, float))
+        or not 1 <= float(tavily_timeout) <= 120
+    ):
+        raise CLIError("run-one tavily_timeout must be between 1 and 120 seconds")
+
+    with _store() as store:
+        lease = store.lease_next(
+            _worker_id(worker_id),
+            lease_seconds=lease_seconds,
+        )
+        if lease is None:
+            return {
+                "ok": True,
+                "processed": False,
+                "reason": "no_due_product",
+            }
+
+        try:
+            product_name = " ".join(
+                str(lease.payload.get("product_name") or "").split()
+            )
+            if not product_name:
+                return _apply_decision(
+                    store,
+                    lease,
+                    _nonpublish_decision(
+                        lease,
+                        "insufficient_identity",
+                        "The catalogue record has no public product name.",
+                    ),
+                )
+
+            search = _run_search(
+                store,
+                lease,
+                max_results=max_results,
+                timeout=tavily_timeout,
+            )
+            urls = [
+                item["url"]
+                for item in search.get("results", [])[:5]
+                if isinstance(item, dict) and isinstance(item.get("url"), str)
+            ]
+            if not urls:
+                return _apply_decision(
+                    store,
+                    lease,
+                    _nonpublish_decision(
+                        lease,
+                        "no_datasheet",
+                        "The bounded search returned no public candidates.",
+                    ),
+                    audit={
+                        "tavily": {
+                            "search_usage": search.get("usage", {}),
+                            "candidate_count": 0,
+                        }
+                    },
+                )
+
+            query = (
+                f"{product_name[:180]} official datasheet complete specifications "
+                "input output efficiency protection communication dimensions "
+                "weight review reliability"
+            )
+            extract = _run_extract(
+                store,
+                lease,
+                urls=urls,
+                query=query[:400],
+                timeout=tavily_timeout,
+            )
+            extracted = [
+                item
+                for item in extract.get("results", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("url"), str)
+                and isinstance(item.get("raw_content"), str)
+                and item["raw_content"].strip()
+            ]
+            if not extracted:
+                error = CLIError(
+                    "Tavily returned no successfully extracted evidence"
+                )
+                _record_active_failure(store, lease, "tavily_error", error)
+                raise error
+            identity_urls = set(store.allowed_evidence_urls(lease.token))
+            evidence = [
+                item for item in extracted if item["url"] in identity_urls
+            ]
+            if not evidence:
+                return _apply_decision(
+                    store,
+                    lease,
+                    _nonpublish_decision(
+                        lease,
+                        "insufficient_identity",
+                        "Extracted candidates did not contain the complete "
+                        "catalogue product name.",
+                    ),
+                    audit={
+                        "tavily": {
+                            "search_usage": search.get("usage", {}),
+                            "extract_usage": extract.get("usage", {}),
+                            "candidate_count": len(urls),
+                            "evidence_count": 0,
+                        }
+                    },
+                )
+
+            try:
+                trusted_source_domains(
+                    str(lease.payload.get("brand_code") or "")
+                )
+            except ConfigError as exc:
+                _record_active_failure(
+                    store,
+                    lease,
+                    "configuration_error",
+                    exc,
+                )
+                raise
+
+            check = store.precheck(lease)
+            if not check.ready:
+                raise LeaseLostError(
+                    f"lease cannot call AI: {check.reason}"
+                )
+
+            try:
+                ai_settings = AISettings.from_env()
+                proposal = OpenAICompatibleClient(ai_settings).decide(
+                    product=lease.payload,
+                    search=search,
+                    extract={**extract, "results": evidence},
+                )
+            except AIError as exc:
+                _record_active_failure(store, lease, "ai_error", exc)
+                raise
+
+            check = store.precheck(lease)
+            if not check.ready:
+                raise LeaseLostError(
+                    f"source changed during AI analysis: {check.reason}"
+                )
+
+            raw = {
+                **proposal,
+                "schema_version": "1",
+                "product_id": lease.product_id,
+                "lease_token": lease.token,
+            }
+            return _apply_decision(
+                store,
+                lease,
+                raw,
+                evidence_text_by_url={
+                    item["url"]: item["raw_content"]
+                    for item in evidence
+                },
+                audit={
+                    "ai": {"model": ai_settings.model},
+                    "tavily": {
+                        "search_usage": search.get("usage", {}),
+                        "extract_usage": extract.get("usage", {}),
+                        "candidate_count": len(urls),
+                        "evidence_count": len(evidence),
+                    },
+                },
+            )
+        except LeaseLostError as exc:
+            _record_active_failure(store, lease, "error", exc)
+            raise
+        except (
+            AIError,
+            ConfigError,
+            DecisionError,
+            StateError,
+            TavilyError,
+            WikiJSError,
+            CLIError,
+        ):
+            raise
+        except Exception as exc:
+            _record_active_failure(store, lease, "error", exc)
+            raise
+
+
+def _cmd_run_one(args: argparse.Namespace) -> int:
+    _emit(
+        run_one(
+            worker_id=args.worker_id,
+            lease_seconds=args.lease_seconds,
+            max_results=args.max_results,
+            tavily_timeout=args.tavily_timeout,
+        )
+    )
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    configured = WorkerSettings.from_env()
+    settings = WorkerSettings(
+        token=configured.token,
+        host=args.host or configured.host,
+        port=args.port or configured.port,
+    )
+    serve(settings)
     return 0
 
 
@@ -601,6 +1060,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_publish_home(_args: argparse.Namespace) -> int:
+    _emit(publish_home())
+    return 0
+
+
+def publish_home() -> dict[str, Any]:
+    """Create or update the reader-facing catalogue landing page."""
+
     settings = WikiSettings.from_env()
     with _store() as store:
         counts = store.status_counts()
@@ -627,24 +1093,21 @@ def _cmd_publish_home(_args: argparse.Namespace) -> int:
         settings.home_title,
         "按品牌、产品类别和最近更新浏览经过资料核验的产品百科。",
         managed,
-        ["homepage", "managed-by-hermes", "product-catalogue"],
+        ["homepage", "managed-by-pv-wiki", "product-catalogue"],
     )
     page = result.get("page") if isinstance(result.get("page"), dict) else {}
-    _emit(
-        {
-            "ok": True,
-            "home": {
-                "action": result.get("action"),
-                "id": page.get("id"),
-                "path": settings.home_path,
-                "locale": settings.locale,
-            },
-            "updated_products": len(published),
-            "counts": counts,
-            "due_now": due_now,
-        }
-    )
-    return 0
+    return {
+        "ok": True,
+        "home": {
+            "action": result.get("action"),
+            "id": page.get("id"),
+            "path": settings.home_path,
+            "locale": settings.locale,
+        },
+        "updated_products": len(published),
+        "counts": counts,
+        "due_now": due_now,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -684,7 +1147,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     publish = subparsers.add_parser("publish", help="validate a decision and apply its outcome")
     publish.add_argument("--decision-file", required=True)
+    publish.add_argument(
+        "--evidence-file",
+        help="Tavily extract JSON required when the decision outcome is publish",
+    )
     publish.set_defaults(func=_cmd_publish)
+
+    run_one_parser = subparsers.add_parser(
+        "run-one",
+        help="process one due product with Tavily, configured AI, and Wiki.js",
+    )
+    run_one_parser.add_argument("--worker-id")
+    run_one_parser.add_argument("--lease-seconds", type=int, default=3600)
+    run_one_parser.add_argument("--max-results", type=int, default=5)
+    run_one_parser.add_argument("--tavily-timeout", type=float, default=30.0)
+    run_one_parser.set_defaults(func=_cmd_run_one)
+
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="serve fixed authenticated operations for an internal n8n workflow",
+    )
+    serve_parser.add_argument("--host")
+    serve_parser.add_argument("--port", type=int)
+    serve_parser.set_defaults(func=_cmd_serve)
 
     fail = subparsers.add_parser("fail", help="record a bounded failure and release a lease")
     fail.add_argument("--lease-token", required=True)
@@ -710,11 +1195,13 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except (
         CLIError,
+        AIError,
         ConfigError,
         DecisionError,
         LeaseLostError,
         StateError,
         TavilyError,
+        WorkerConfigError,
         WikiJSError,
         ValueError,
     ) as exc:
@@ -727,7 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
             stream=sys.stderr,
         )
         return 2
-    except Exception as exc:  # Last-resort JSON boundary for cron/CLI operation.
+    except Exception as exc:  # Last-resort JSON boundary for scheduler/CLI use.
         _emit(
             {
                 "ok": False,

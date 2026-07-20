@@ -220,6 +220,11 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(result.next_run_at, conflict_start + timedelta(hours=24))
             conflict_start = result.next_run_at
 
+        self.store.upsert_product(product("P-AI"), now=T0)
+        ai_lease = self.store.lease_next("worker-ai", now=T0)
+        ai_result = self.store.record_outcome(ai_lease, "ai_error", now=T0)
+        self.assertEqual(T0 + timedelta(hours=1), ai_result.next_run_at)
+
     def test_search_and_extract_audit_bind_completed_evidence(self):
         self.store.upsert_product(product(), now=T0)
         lease = self.store.lease_next("worker-a", lease_seconds=3600, now=T0)
@@ -266,6 +271,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(
             self.store.finish_extract(
                 lease,
+                selected,
                 {"credits": 1},
                 now=T0 + timedelta(seconds=3),
             ),
@@ -285,6 +291,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(attempt.search_usage["credits"], 3)
         self.assertEqual(attempt.extract_started_at, T0 + timedelta(seconds=2))
         self.assertEqual(attempt.extract_urls, selected)
+        self.assertEqual(attempt.extract_success_urls, selected)
         self.assertEqual(attempt.extract_usage, {"credits": 1})
 
     def test_web_budget_is_one_shot_and_ordered_fail_closed(self):
@@ -330,15 +337,26 @@ class StateStoreTests(unittest.TestCase):
                 now=T0,
             )
         with self.assertRaises(state.AttemptBudgetError):
-            self.store.finish_extract(lease, {}, now=T0)
+            self.store.finish_extract(lease, [], {}, now=T0)
 
         self.store.begin_extract(lease, search_urls[:5], now=T0)
         with self.assertRaises(state.AttemptBudgetError):
             self.store.begin_extract(lease, search_urls[:1], now=T0)
-        self.assertEqual(self.store.allowed_evidence_urls(lease.token, now=T0), [])
-        self.store.finish_extract(lease, {"credits": 1}, now=T0)
         with self.assertRaises(state.AttemptBudgetError):
-            self.store.finish_extract(lease, {"credits": 2}, now=T0)
+            self.store.finish_extract(
+                lease,
+                ["https://outside.example/not-searched"],
+                {"credits": 1},
+                now=T0,
+            )
+        self.assertEqual(self.store.allowed_evidence_urls(lease.token, now=T0), [])
+        self.store.finish_extract(lease, search_urls[:3], {"credits": 1}, now=T0)
+        self.assertEqual(
+            self.store.allowed_evidence_urls(lease.token, now=T0),
+            search_urls[:3],
+        )
+        with self.assertRaises(state.AttemptBudgetError):
+            self.store.finish_extract(lease, search_urls[:3], {"credits": 2}, now=T0)
 
         self.store.record_outcome(lease, "synced", now=T0)
         with self.assertRaises(state.LeaseLostError):
@@ -435,7 +453,7 @@ class StateStoreTests(unittest.TestCase):
         finally:
             other.close()
 
-    def test_migrates_v2_attempt_audit_to_v3(self):
+    def test_migrates_v2_attempt_audit_to_current_schema(self):
         legacy_path = Path(self.tempdir.name) / "legacy-v2.sqlite3"
         timestamp = "2026-01-01T12:00:00.000000Z"
         lease_until = "2027-01-01T12:00:00.000000Z"
@@ -487,13 +505,14 @@ class StateStoreTests(unittest.TestCase):
 
         migrated = state.StateStore(legacy_path)
         try:
-            self.assertEqual(migrated.schema_version, 3)
+            self.assertEqual(migrated.schema_version, state.SCHEMA_VERSION)
             attempt = migrated.attempt_history("LEGACY")[0]
             self.assertIsNone(attempt.search_started_at)
             self.assertIsNone(attempt.search_urls)
             self.assertIsNone(attempt.search_usage)
             self.assertIsNone(attempt.extract_started_at)
             self.assertIsNone(attempt.extract_urls)
+            self.assertIsNone(attempt.extract_success_urls)
             self.assertIsNone(attempt.extract_usage)
             migrated_connection = sqlite3.connect(legacy_path)
             try:
@@ -512,6 +531,7 @@ class StateStoreTests(unittest.TestCase):
                     "search_usage_json",
                     "extract_started_at",
                     "extract_urls_json",
+                    "extract_success_urls_json",
                     "extract_usage_json",
                 }.issubset(columns)
             )

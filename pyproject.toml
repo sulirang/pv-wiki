@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pv-wiki"
-version = "0.1.0"
-description = "A slow, resumable Hermes skill that researches PostgreSQL products and maintains Wiki.js pages."
+version = "0.2.0"
+description = "An n8n-scheduled worker that researches PostgreSQL products and maintains cited Wiki.js pages."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}

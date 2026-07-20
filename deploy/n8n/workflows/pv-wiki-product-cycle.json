@@ -1,0 +1,84 @@
+{
+  "name": "PV Wiki - Product Cycle",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "59e201e8-924a-4d94-ae64-bf28a5c066f0",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-560, 120]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 4,
+              "triggerAtMinute": 5
+            }
+          ]
+        }
+      },
+      "id": "880c75ed-3b3f-4bc2-96e2-06ea85af3830",
+      "name": "Every 4 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-560, -80]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pv-wiki-worker:8080/sync-catalogue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "4fb553d4-a3b0-4b86-83ae-d229ec231289",
+      "name": "Sync Catalogue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "position": [-260, 20]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pv-wiki-worker:8080/run-one",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "2cdf0411-34e7-468f-b00c-f5e3385f80c3",
+      "name": "Run One Product",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [40, 20]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{"node": "Sync Catalogue", "type": "main", "index": 0}]]
+    },
+    "Every 4 Hours": {
+      "main": [[{"node": "Sync Catalogue", "type": "main", "index": 0}]]
+    },
+    "Sync Catalogue": {
+      "main": [[{"node": "Run One Product", "type": "main", "index": 0}]]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Shanghai"
+  },
+  "tags": []
+}

@@ -23,16 +23,18 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 BACKOFF_DAYS = (30, 90, 180)
 TRANSIENT_BACKOFF_HOURS = (1, 6, 24)
 TRANSIENT_OUTCOMES = frozenset(
     {
         "tavily_error",
+        "ai_error",
         "wikijs_error",
         "error",
         "lease_expired",
         "invalid_decision",
+        "configuration_error",
         "publish_error",
     }
 )
@@ -226,6 +228,7 @@ class AttemptRecord:
     search_usage: dict[str, Any] | None
     extract_started_at: datetime | None
     extract_urls: list[str] | None
+    extract_success_urls: list[str] | None
     extract_usage: dict[str, Any] | None
 
 
@@ -552,6 +555,15 @@ class StateStore:
                     connection.execute(f"ALTER TABLE attempts ADD COLUMN {column}")
                 connection.execute("PRAGMA user_version = 3")
                 current = 3
+            if current < 4:
+                # Only URLs that Tavily actually extracted may become evidence.
+                # Existing active attempts fail closed because their successful
+                # subset cannot be reconstructed from the v3 audit record.
+                connection.execute(
+                    "ALTER TABLE attempts ADD COLUMN extract_success_urls_json TEXT"
+                )
+                connection.execute("PRAGMA user_version = 4")
+                current = 4
         return current
 
     @property
@@ -1121,32 +1133,45 @@ class StateStore:
     def finish_extract(
         self,
         lease_or_token: Lease | str,
+        successful_urls: Sequence[str],
         usage: Mapping[str, Any],
         *,
         now: datetime | None = None,
     ) -> list[str]:
-        """Persist extract usage and mark its selected URLs as completed evidence."""
+        """Persist usage and the successfully extracted evidence URL subset."""
 
+        normalized_success_urls = _canonical_urls(successful_urls)
+        success_urls_json = _canonical_json(normalized_success_urls)
         usage_json = _usage_json(usage)
         timestamp = _utc(now)
         with self._write_transaction() as connection:
             row = self._active_attempt(connection, lease_or_token, timestamp)
             if row["extract_started_at"] is None or row["extract_urls_json"] is None:
                 raise AttemptBudgetError("extract must begin before it can finish")
-            urls = json.loads(row["extract_urls_json"])
+            submitted_urls = list(json.loads(row["extract_urls_json"]))
+            outside = [
+                url for url in normalized_success_urls if url not in set(submitted_urls)
+            ]
+            if outside:
+                raise AttemptBudgetError(
+                    "successful extract URLs must belong to the submitted set"
+                )
             if row["extract_usage_json"] is not None:
-                if row["extract_usage_json"] == usage_json:
-                    return urls
+                if (
+                    row["extract_usage_json"] == usage_json
+                    and row["extract_success_urls_json"] == success_urls_json
+                ):
+                    return normalized_success_urls
                 raise AttemptBudgetError("extract audit is already completed")
             connection.execute(
                 """
                 UPDATE attempts
-                SET extract_usage_json = ?
+                SET extract_success_urls_json = ?, extract_usage_json = ?
                 WHERE attempt_id = ? AND extract_usage_json IS NULL
                 """,
-                (usage_json, row["attempt_id"]),
+                (success_urls_json, usage_json, row["attempt_id"]),
             )
-        return urls
+        return normalized_success_urls
 
     def allowed_evidence_urls(
         self,
@@ -1159,9 +1184,12 @@ class StateStore:
         timestamp = _utc(now)
         with self._connection() as connection:
             row = self._active_attempt(connection, lease_token, timestamp)
-        if row["extract_usage_json"] is None or row["extract_urls_json"] is None:
+        if (
+            row["extract_usage_json"] is None
+            or row["extract_success_urls_json"] is None
+        ):
             return []
-        return list(json.loads(row["extract_urls_json"]))
+        return list(json.loads(row["extract_success_urls_json"]))
 
     def reclaim_expired_leases(self, *, now: datetime | None = None) -> int:
         """Close expired attempts and place their products in transient backoff."""
@@ -1568,6 +1596,11 @@ class StateStore:
             extract_urls=(
                 json.loads(row["extract_urls_json"])
                 if row["extract_urls_json"] is not None
+                else None
+            ),
+            extract_success_urls=(
+                json.loads(row["extract_success_urls_json"])
+                if row["extract_success_urls_json"] is not None
                 else None
             ),
             extract_usage=(

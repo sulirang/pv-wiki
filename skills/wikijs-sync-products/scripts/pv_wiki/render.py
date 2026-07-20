@@ -1,8 +1,9 @@
 """Deterministic, injection-resistant Markdown rendering for product pages.
 
 Only the block delimited by :data:`AUTO_BEGIN` and :data:`AUTO_END` belongs
-to Hermes.  Call :func:`merge_auto_block` before updating an existing page so
-text written by people outside that block remains byte-for-byte unchanged.
+to PV Wiki automation. Call :func:`merge_auto_block` before updating an
+existing page so text written by people outside that block remains
+byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -20,8 +21,10 @@ from datetime import date, datetime
 from typing import Any
 
 
-AUTO_BEGIN = "<!-- HERMES-AUTO:BEGIN -->"
-AUTO_END = "<!-- HERMES-AUTO:END -->"
+AUTO_BEGIN = "<!-- PV-WIKI-AUTO:BEGIN -->"
+AUTO_END = "<!-- PV-WIKI-AUTO:END -->"
+LEGACY_AUTO_BEGIN = "<!-- HERMES-AUTO:BEGIN -->"
+LEGACY_AUTO_END = "<!-- HERMES-AUTO:END -->"
 
 _BLOCKED_HOST_SUFFIXES = (
     ".localhost",
@@ -634,7 +637,7 @@ def render_product_page(
     decision: Any | None,
     checked_at: Any | None = None,
 ) -> str:
-    """Render one complete Hermes-managed Markdown block.
+    """Render one complete PV Wiki-managed Markdown block.
 
     No current timestamp is generated implicitly; omitting ``checked_at``
     therefore produces byte-identical output for identical inputs.
@@ -776,7 +779,12 @@ def _canonical_managed_block(managed: str) -> str:
     else:
         raise ValueError("managed content must contain exactly one complete auto block")
 
-    if AUTO_BEGIN in body or AUTO_END in body:
+    if (
+        AUTO_BEGIN in body
+        or AUTO_END in body
+        or LEGACY_AUTO_BEGIN in body
+        or LEGACY_AUTO_END in body
+    ):
         raise ValueError("nested auto-block markers are not allowed")
     if body:
         return f"{AUTO_BEGIN}\n{body}\n{AUTO_END}"
@@ -784,7 +792,12 @@ def _canonical_managed_block(managed: str) -> str:
 
 
 def merge_auto_block(existing: str | None, managed: str) -> str:
-    """Replace only the Hermes block, preserving all human-authored bytes."""
+    """Replace only the automation block, preserving human-authored bytes.
+
+    Pages created by releases before the n8n worker migration used
+    ``HERMES-AUTO`` markers. A single well-formed legacy block is accepted and
+    replaced with the current ``PV-WIKI-AUTO`` block in-place.
+    """
 
     block = _canonical_managed_block(managed)
     if existing is None:
@@ -792,19 +805,37 @@ def merge_auto_block(existing: str | None, managed: str) -> str:
     if not isinstance(existing, str):
         raise TypeError("existing content must be a string or None")
 
-    begin_count = existing.count(AUTO_BEGIN)
-    end_count = existing.count(AUTO_END)
-    if begin_count == end_count == 0:
+    current_begin_count = existing.count(AUTO_BEGIN)
+    current_end_count = existing.count(AUTO_END)
+    legacy_begin_count = existing.count(LEGACY_AUTO_BEGIN)
+    legacy_end_count = existing.count(LEGACY_AUTO_END)
+    if (
+        current_begin_count
+        == current_end_count
+        == legacy_begin_count
+        == legacy_end_count
+        == 0
+    ):
         if not existing:
             return f"{block}\n"
         separator = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
         return f"{existing}{separator}{block}\n"
-    if begin_count != 1 or end_count != 1:
+    current_complete = (
+        current_begin_count == current_end_count == 1
+        and legacy_begin_count == legacy_end_count == 0
+    )
+    legacy_complete = (
+        legacy_begin_count == legacy_end_count == 1
+        and current_begin_count == current_end_count == 0
+    )
+    if not (current_complete or legacy_complete):
         raise ValueError("existing page has malformed or duplicate auto-block markers")
 
-    begin = existing.index(AUTO_BEGIN)
-    end = existing.index(AUTO_END)
-    if end < begin + len(AUTO_BEGIN):
+    begin_marker = AUTO_BEGIN if current_complete else LEGACY_AUTO_BEGIN
+    end_marker = AUTO_END if current_complete else LEGACY_AUTO_END
+    begin = existing.index(begin_marker)
+    end = existing.index(end_marker)
+    if end < begin + len(begin_marker):
         raise ValueError("existing page has auto-block markers in the wrong order")
-    end += len(AUTO_END)
+    end += len(end_marker)
     return f"{existing[:begin]}{block}{existing[end:]}"
