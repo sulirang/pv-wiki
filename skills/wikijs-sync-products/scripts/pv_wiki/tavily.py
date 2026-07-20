@@ -157,13 +157,13 @@ def build_queries(product: Mapping[str, Any]) -> list[str]:
         f"{exact_identity} specifications technical manual",
     ]
 
-    extra = ""
-    if name and name.casefold() not in {item.casefold() for item in identity}:
-        extra = _quote(name)
-    elif category and category.casefold() not in {item.casefold() for item in identity}:
-        extra = _quote(category)
+    review_context = ""
+    if category and category.casefold() not in {
+        item.casefold() for item in identity
+    }:
+        review_context = _quote(category)
     candidates.append(
-        f"{exact_identity} {extra} official product documentation support downloads".strip()
+        f"{exact_identity} {review_context} review user experience reliability".strip()
     )
 
     queries: list[str] = []
@@ -426,38 +426,56 @@ class TavilyClient:
         if path not in {"/search", "/extract"}:
             raise ValueError("unsupported Tavily endpoint")
 
-        last_error: Exception | None = None
+        rate_limit_round = 0
+        while True:
+            rate_limits: list[_RateLimitSignal] = []
+            last_error: TavilyNetworkError | TavilyResponseError | None = None
 
-        # Try each key; rotate on 429 rate-limit.
-        for _key_attempt in range(len(self._keys)):
-            api_key = self._current_key()
-            try:
-                return self._post_with_key(path, payload, api_key)
-            except _RateLimitSignal as exc:
-                # Mark current key as rate-limited, try to advance.
-                self._mark_rate_limited(api_key, exc.retry_after)
-                if not self._advance_key():
-                    # All keys rate-limited — sleep for the shortest cooldown
-                    # then retry the original key one more time.
-                    remaining = self._shortest_cooldown()
-                    if remaining > 0:
-                        self._sleep(_bounded_retry_delay(remaining))
-                    # Clear all cooldowns and retry from current key.
-                    self._rate_limited_until.clear()
-                last_error = exc.inner if exc.inner else None
-                continue
-            except TavilyHTTPError:
-                raise
-            except (TavilyNetworkError, TavilyResponseError) as exc:
-                last_error = exc
-                # For non-rate-limit errors, still try next key.
-                if self._advance_key():
-                    continue
-                raise
+            # Rotate immediately through usable keys. A round ends only when
+            # every configured key is cooling down after a 429 response.
+            for _key_attempt in range(len(self._keys)):
+                api_key = self._current_key()
+                try:
+                    return self._post_with_key(path, payload, api_key)
+                except _RateLimitSignal as exc:
+                    self._mark_rate_limited(api_key, exc.retry_after)
+                    rate_limits.append(exc)
+                    if self._advance_key():
+                        continue
+                    break
+                except TavilyHTTPError:
+                    raise
+                except (TavilyNetworkError, TavilyResponseError) as exc:
+                    # _post_with_key already exhausted its bounded retries.
+                    # Try another usable key, if one exists.
+                    last_error = exc
+                    if self._advance_key():
+                        continue
+                    raise
 
-        if last_error is not None:
-            raise last_error
-        raise TavilyNetworkError("All Tavily API keys exhausted after rotation")
+            if not rate_limits:
+                if last_error is not None:
+                    raise last_error
+                raise TavilyNetworkError("All Tavily API keys exhausted")
+            if rate_limit_round >= self.max_retries:
+                raise TavilyHTTPError(
+                    "Tavily API returned HTTP 429 after bounded retries"
+                )
+
+            fallback = self.backoff_base * (2**rate_limit_round)
+            delays = [
+                signal.retry_after
+                if signal.retry_after is not None
+                else fallback
+                for signal in rate_limits
+            ]
+            self._sleep(_bounded_retry_delay(min(delays)))
+
+            # Sleeping satisfies the retry delay for this bounded round. Clear
+            # cooldowns so a single-key client can retry and a multi-key client
+            # can start another rotation without terminating early.
+            self._rate_limited_until.clear()
+            rate_limit_round += 1
 
     def _post_with_key(
         self, path: str, payload: Mapping[str, Any], api_key: str
@@ -634,8 +652,8 @@ class TavilyClient:
             {
                 "urls": submitted,
                 "query": clean_query,
-                "chunks_per_source": 3,
-                "extract_depth": "basic",
+                "chunks_per_source": 5,
+                "extract_depth": "advanced",
                 "format": "markdown",
                 "include_images": False,
                 "include_usage": True,

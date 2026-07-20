@@ -61,6 +61,8 @@ class WikiSettings:
     token: str
     locale: str
     path_prefix: str
+    home_path: str
+    home_title: str
     timeout: float
     new_page_private: bool
     new_page_published: bool
@@ -71,6 +73,8 @@ class WikiSettings:
         token = os.getenv("WIKIJS_TOKEN", "").strip()
         locale = os.getenv("WIKIJS_LOCALE", "en").strip()
         prefix = os.getenv("WIKIJS_PATH_PREFIX", "products").strip().strip("/")
+        home_path = os.getenv("WIKIJS_HOME_PATH", "home").strip().strip("/")
+        home_title = os.getenv("WIKIJS_HOME_TITLE", "PV Wiki").strip()
         if not base_url or not token:
             raise ConfigError("WIKIJS_URL and WIKIJS_TOKEN are required")
         parsed = urlsplit(base_url)
@@ -80,11 +84,25 @@ class WikiSettings:
             raise ConfigError("WIKIJS_LOCALE is invalid")
         if not prefix or not re.fullmatch(r"[A-Za-z0-9/_-]+", prefix):
             raise ConfigError("WIKIJS_PATH_PREFIX contains unsafe characters")
+        if (
+            not home_path
+            or not re.fullmatch(r"[A-Za-z0-9/_-]+", home_path)
+            or "//" in home_path
+        ):
+            raise ConfigError("WIKIJS_HOME_PATH contains unsafe characters")
+        if (
+            not home_title
+            or len(home_title) > 200
+            or any(ord(character) < 32 for character in home_title)
+        ):
+            raise ConfigError("WIKIJS_HOME_TITLE is invalid")
         return cls(
             base_url=base_url,
             token=token,
             locale=locale,
             path_prefix=prefix,
+            home_path=home_path,
+            home_title=home_title,
             timeout=_float_env("PV_WIKI_HTTP_TIMEOUT", 30.0, 1.0, 120.0),
             new_page_private=_bool_env("WIKIJS_NEW_PAGE_PRIVATE", True),
             new_page_published=_bool_env("WIKIJS_NEW_PAGE_PUBLISHED", False),

@@ -33,12 +33,20 @@ def valid_decision() -> dict:
         "sources": [],
         "facts": [
             {
-                "name": "Power",
-                "value": 42,
-                "unit": "W",
+                "name": name,
+                "category": category,
+                "value": value,
+                "unit": unit,
                 "confidence": 0.95,
                 "evidence_urls": ["https://acme.example/PV-42.pdf"],
             }
+            for name, category, value, unit in (
+                ("Power", "Output", 42, "W"),
+                ("Input voltage", "Input", 48, "V"),
+                ("Efficiency", "Efficiency", 98.5, "%"),
+                ("Ingress protection", "General", "IP65", ""),
+                ("Weight", "General", 12, "kg"),
+            )
         ],
         "conflicts": [],
     }
@@ -108,10 +116,57 @@ class DecisionTests(unittest.TestCase):
                 expected_lease_token="1234567890abcdef",
             )
 
+    def test_community_sources_are_limited_to_cited_review_summary(self) -> None:
+        item = valid_decision()
+        item["sources"] = [
+            {
+                "url": "https://reviews.example.com/pv-42-a",
+                "title": "Owner review A",
+                "source_type": "community",
+            },
+            {
+                "url": "https://reviews.example.com/pv-42-b",
+                "title": "Owner review B",
+                "source_type": "community",
+            },
+        ]
+        item["review_summary"] = "Owners report straightforward commissioning."
+        item["review_evidence_urls"] = [
+            "https://reviews.example.com/pv-42-a",
+            "https://reviews.example.com/pv-42-b",
+        ]
+
+        result = validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+        )
+
+        self.assertEqual(item["review_summary"], result["review_summary"])
+
+        item["facts"][0]["evidence_urls"].append(
+            "https://reviews.example.com/pv-42-a"
+        )
+        with self.assertRaisesRegex(DecisionError, "community review"):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
     def test_rejects_low_confidence_or_conflicted_facts(self) -> None:
         item = valid_decision()
         item["facts"][0]["confidence"] = 0.4
         with self.assertRaisesRegex(DecisionError, "configured threshold"):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+        item = valid_decision()
+        item["facts"] = item["facts"][:4]
+        with self.assertRaisesRegex(DecisionError, "at least 5"):
             validate_decision(
                 item,
                 expected_product_id="P-42",

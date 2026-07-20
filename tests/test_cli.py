@@ -56,12 +56,20 @@ def decision(token: str, outcome: str = "publish") -> dict:
         ]
         value["facts"] = [
             {
-                "name": "Rated power",
-                "value": 42,
-                "unit": "W",
+                "name": name,
+                "category": category,
+                "value": fact_value,
+                "unit": unit,
                 "confidence": 0.95,
                 "evidence_urls": ["https://acme.example/pv-42.pdf"],
             }
+            for name, category, fact_value, unit in (
+                ("Rated power", "Output", 42, "W"),
+                ("Input voltage", "Input", 48, "V"),
+                ("Efficiency", "Efficiency", 98.5, "%"),
+                ("Ingress protection", "General", "IP65", ""),
+                ("Weight", "General", 12, "kg"),
+            )
         ]
     return value
 
@@ -190,6 +198,39 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, after["due"])
         self.assertFalse(after["wakeAgent"])
 
+    def test_publish_home_upserts_managed_landing_page(self) -> None:
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+                "WIKIJS_HOME_PATH": "home",
+                "WIKIJS_HOME_TITLE": "PV Wiki",
+            }
+        )
+        client = mock.Mock()
+        client.upsert_page.return_value = {
+            "action": "created",
+            "page": {"id": 7},
+        }
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            code, payload, error = self.run_cli("publish-home")
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(
+            {
+                "action": "created",
+                "id": 7,
+                "locale": "en",
+                "path": "home",
+            },
+            payload["home"],
+        )
+        self.assertEqual(1, payload["counts"]["due"])
+        arguments = client.upsert_page.call_args.args
+        self.assertEqual("home", arguments[0])
+        self.assertEqual("PV Wiki", arguments[2])
+        self.assertIn("| Total catalogue products | 1 |", arguments[4])
+
     def test_search_uses_leased_snapshot_and_bounded_client(self) -> None:
         token = self.claim()
         client = mock.Mock()
@@ -284,7 +325,9 @@ class CLITests(unittest.TestCase):
         self.assertTrue(payload["published"])
         self.assertEqual("products/p-42-c8d5a4d2d3", payload["wiki"]["path"])
         self.assertEqual("created", payload["wiki"]["action"])
-        self.assertIn("managed-by-hermes", client.upsert_page.call_args.args[5])
+        tags = client.upsert_page.call_args.args[5]
+        self.assertIn("managed-by-hermes", tags)
+        self.assertNotIn("family-pv", tags)
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
             self.assertEqual("synced", current.status)

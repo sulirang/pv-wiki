@@ -24,6 +24,11 @@ retry and a catalogue of roughly 1,500 products can be processed gradually.
 It does not deploy Wiki.js, copy full copyrighted datasheets, write to the
 product database, or silently publish low-confidence matches.
 
+Wiki.js owns and connects to its own database as part of the Wiki.js
+deployment. PV wiki never provisions that database and never asks Wiki.js to
+reuse the read-only product catalogue; it writes pages only through the
+configured Wiki.js GraphQL API.
+
 ## Layout
 
 ```text
@@ -46,6 +51,8 @@ tests/                     offline unit tests
    while weaker modes are rejected.
 3. Install the runtime with `python3 -m pip install -e .`.
 4. Run `pv-wiki doctor --live`, then `pv-wiki sync-db`.
+   Run `pv-wiki publish-home` once to create the Wiki.js landing page, and set
+   that configured path as the Wiki.js home page.
 5. Add this repository as a private Hermes tap, install the skill, and invoke
    it manually once. A private tap requires `GITHUB_TOKEN` in Hermes's `.env`.
 

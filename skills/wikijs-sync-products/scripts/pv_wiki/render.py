@@ -301,13 +301,14 @@ def _collect_sources(decision: Any) -> list[tuple[str, str, bool]]:
     return unique
 
 
-def _specifications(product: Any, decision: Any) -> list[tuple[str, Any]]:
-    merged: dict[str, Any] = {}
+def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
+    merged: dict[tuple[str, str], tuple[str, str, Any]] = {}
     for owner in (product, decision):
         value = _first(owner, ("specifications", "specs", "attributes", "facts"))
         if isinstance(value, Mapping):
             for key, item in value.items():
-                merged[_plain_text(key)] = item
+                name = _plain_text(key)
+                merged[("", name.casefold())] = ("", name, item)
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             for item in value:
                 if not isinstance(item, Mapping):
@@ -318,8 +319,22 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, Any]]:
                     unit = _first(item, ("unit", "units"))
                     if unit is not None:
                         item_value = f"{_plain_text(item_value)} {_plain_text(unit)}"
-                    merged[_plain_text(key)] = item_value
-    return sorted(merged.items(), key=lambda item: (item[0].casefold(), item[0]))
+                    name = _plain_text(key)
+                    category = _plain_text(_get(item, "category"))
+                    merged[(category.casefold(), name.casefold())] = (
+                        category,
+                        name,
+                        item_value,
+                    )
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            item[0].casefold(),
+            item[0],
+            item[1].casefold(),
+            item[1],
+        ),
+    )
 
 
 def _product_rows(product: Any) -> list[tuple[str, Any]]:
@@ -339,7 +354,6 @@ def _product_rows(product: Any) -> list[tuple[str, Any]]:
             ),
         ),
         ("产品名称", ("product_name", "name", "title")),
-        ("产品系列", ("family_code", "family")),
         ("类别", ("category", "product_type", "type")),
         ("计量单位", ("unit_of_measure", "uom", "unit")),
         ("数据库描述", ("description",)),
@@ -358,6 +372,74 @@ def _checked_at(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     return _plain_text(value)
+
+
+def render_home_page(
+    counts: Mapping[str, Any],
+    *,
+    due_now: int,
+    product_path_prefix: str,
+    title: str = "PV Wiki",
+) -> str:
+    """Render a deterministic managed block for the Wiki.js landing page."""
+
+    if not isinstance(counts, Mapping):
+        raise TypeError("counts must be a mapping")
+    normalized_counts: dict[str, int] = {}
+    for status in ("due", "leased", "backoff", "synced"):
+        value = counts.get(status, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"count for {status} must be a non-negative integer")
+        normalized_counts[status] = value
+    if isinstance(due_now, bool) or not isinstance(due_now, int) or due_now < 0:
+        raise ValueError("due_now must be a non-negative integer")
+
+    clean_title = _plain_text(title)
+    if not clean_title:
+        raise ValueError("title must be non-empty")
+    prefix = "/".join(
+        stable_slug(part) for part in product_path_prefix.strip("/").split("/")
+    )
+    total = sum(normalized_counts.values())
+
+    lines = [
+        AUTO_BEGIN,
+        f"# {_escape_markdown_text(clean_title)}",
+        "",
+        (
+            "A cited product knowledge base maintained from a read-only catalogue "
+            "and verified public sources."
+        ),
+        "",
+        "## Find a product",
+        "",
+        (
+            "Use the Wiki.js search box to find a model, manufacturer, or product "
+            f"ID. Managed product pages are stored beneath `{prefix}/`."
+        ),
+        "",
+        "## Catalogue status",
+        "",
+        "| Metric | Count |",
+        "| --- | ---: |",
+        f"| Total catalogue products | {total} |",
+        f"| Pages synchronized | {normalized_counts['synced']} |",
+        f"| Awaiting first processing | {normalized_counts['due']} |",
+        f"| Waiting for retry | {normalized_counts['backoff']} |",
+        f"| Currently leased | {normalized_counts['leased']} |",
+        f"| Due now | {due_now} |",
+        "",
+        "## About this wiki",
+        "",
+        (
+            "Product pages distinguish catalogue identity from externally verified "
+            "facts. Specifications are published only with cited evidence; "
+            "ambiguous matches remain queued for later review."
+        ),
+        "",
+        AUTO_END,
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def render_product_page(
@@ -380,9 +462,7 @@ def render_product_page(
         AUTO_BEGIN,
         f"# {_escape_markdown_text(title)}",
         "",
-        "> 此区块由 Hermes 自动维护；请在标记区块外添加人工内容。",
-        "",
-        "## 产品目录信息",
+        "## 产品信息",
         "",
         "| 字段 | 值 |",
         "| --- | --- |",
@@ -396,26 +476,39 @@ def render_product_page(
     else:  # pragma: no cover - title guarantees a useful row for normal inputs
         lines.append("| 产品 | 未提供 |")
 
+    summary = _get(decision, "summary")
+    if summary is not None and _plain_text(summary):
+        lines.extend(["", _escape_markdown_text(summary)])
+
+    review_summary = _get(decision, "review_summary")
+    if review_summary is not None and _plain_text(review_summary):
+        lines.extend(
+            [
+                "",
+                f"**市场与用户反馈：** {_escape_markdown_text(review_summary)}",
+            ]
+        )
+
     specifications = _specifications(product, decision)
     if specifications:
-        lines.extend(["", "## 规格参数", "", "| 参数 | 值 |", "| --- | --- |"])
         lines.extend(
-            f"| {escape_table_cell(key)} | {escape_table_cell(value)} |"
-            for key, value in specifications
+            [
+                "",
+                "## 规格参数",
+                "",
+                "| 类别 | 参数 | 值 |",
+                "| --- | --- | --- |",
+            ]
+        )
+        lines.extend(
+            (
+                f"| {escape_table_cell(category or '其他')} | "
+                f"{escape_table_cell(key)} | {escape_table_cell(value)} |"
+            )
+            for category, key, value in specifications
         )
 
     sources = _collect_sources(decision)
-    datasheets = [source for source in sources if source[2]]
-    related = [source for source in sources if not source[2]]
-    lines.extend(["", "## Datasheet", ""])
-    if datasheets:
-        lines.extend(f"- {markdown_link(label, url)}" for label, url, _ in datasheets)
-    else:
-        lines.append("- 未找到可验证的公开 datasheet。")
-
-    if related:
-        lines.extend(["", "## 相关资料", ""])
-        lines.extend(f"- {markdown_link(label, url)}" for label, url, _ in related)
 
     conflicts = [
         item
@@ -446,17 +539,11 @@ def render_product_page(
                 f"{_escape_markdown_text(values)}{suffix}"
             )
 
-    summary = _first(
-        decision,
-        ("summary", "reasoning", "assessment", "notes", "decision_notes"),
-    )
     confidence = _get(decision, "confidence")
     outcome = _get(decision, "outcome")
     checked = _checked_at(checked_at)
-    if summary is not None or confidence is not None or outcome is not None or checked:
-        lines.extend(["", "## 检索判定", ""])
-        if summary is not None:
-            lines.append(_escape_markdown_text(summary))
+    if confidence is not None or outcome is not None or checked:
+        lines.extend(["", "## 资料核验", ""])
         if outcome is not None:
             lines.append(f"- 判定：{_escape_markdown_text(outcome)}")
         if confidence is not None:
@@ -472,6 +559,14 @@ def render_product_page(
             lines.append(f"- 置信度：{_escape_markdown_text(rendered_confidence)}")
         if checked:
             lines.append(f"- 核验时间：{_escape_markdown_text(checked)}")
+
+    lines.extend(["", "## 参考文献", ""])
+    if sources:
+        for label, url, is_datasheet in sources:
+            suffix = "（官方数据表）" if is_datasheet else ""
+            lines.append(f"- {markdown_link(label, url)}{suffix}")
+    else:
+        lines.append("- 暂无可验证的公开参考资料。")
 
     lines.extend(["", AUTO_END])
     return "\n".join(lines) + "\n"

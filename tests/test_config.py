@@ -24,6 +24,8 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, values, clear=True):
             settings = WikiSettings.from_env()
             self.assertEqual("products", settings.path_prefix)
+            self.assertEqual("home", settings.home_path)
+            self.assertEqual("PV Wiki", settings.home_title)
             self.assertTrue(settings.new_page_private)
             self.assertFalse(settings.new_page_published)
 
@@ -39,6 +41,16 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(settings.new_page_published)
 
         values["WIKIJS_URL"] = "http://wiki.example.com/path"
+        with mock.patch.dict(os.environ, values, clear=True):
+            with self.assertRaises(ConfigError):
+                WikiSettings.from_env()
+
+        values.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_HOME_PATH": "../home",
+            }
+        )
         with mock.patch.dict(os.environ, values, clear=True):
             with self.assertRaises(ConfigError):
                 WikiSettings.from_env()

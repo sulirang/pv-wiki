@@ -27,7 +27,7 @@ from .config import (
 )
 from .db import DatabaseConfigurationError, ProductReader, validate_postgres_sslmode
 from .decision import DecisionError, validate_decision
-from .render import render_product_page, stable_path, stable_slug
+from .render import render_home_page, render_product_page, stable_path, stable_slug
 from .state import Lease, LeaseLostError, StateError, StateStore
 from .tavily import TavilyClient, TavilyError
 from .wikijs import WikiJSClient, WikiJSConflictError, WikiJSError
@@ -149,10 +149,9 @@ def _wiki_tags(product: dict[str, Any], decision: dict[str, Any]) -> list[str]:
     tags = {"product", "datasheet-found", "managed-by-hermes"}
     for item in decision["datasheets"] + decision["sources"]:
         tags.add(f"source-{item['source_type']}")
-    for prefix, key in (("brand", "brand_code"), ("family", "family_code")):
-        tag = _tag_slug(prefix, product.get(key))
-        if tag:
-            tags.add(tag)
+    brand_tag = _tag_slug("brand", product.get("brand_code"))
+    if brand_tag:
+        tags.add(brand_tag)
     return sorted(tags)
 
 
@@ -554,6 +553,50 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_publish_home(_args: argparse.Namespace) -> int:
+    settings = WikiSettings.from_env()
+    with _store() as store:
+        counts = store.status_counts()
+        due_now = len(store.list_due(limit=1_000_000))
+
+    managed = render_home_page(
+        counts,
+        due_now=due_now,
+        product_path_prefix=settings.path_prefix,
+        title=settings.home_title,
+    )
+    client = WikiJSClient(
+        settings.base_url,
+        settings.token,
+        timeout=settings.timeout,
+        new_page_private=settings.new_page_private,
+        new_page_published=settings.new_page_published,
+    )
+    result = client.upsert_page(
+        settings.home_path,
+        settings.locale,
+        settings.home_title,
+        "Cited product knowledge base and catalogue synchronization status.",
+        managed,
+        ["homepage", "managed-by-hermes", "product-catalogue"],
+    )
+    page = result.get("page") if isinstance(result.get("page"), dict) else {}
+    _emit(
+        {
+            "ok": True,
+            "home": {
+                "action": result.get("action"),
+                "id": page.get("id"),
+                "path": settings.home_path,
+                "locale": settings.locale,
+            },
+            "counts": counts,
+            "due_now": due_now,
+        }
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pv-wiki",
@@ -601,6 +644,12 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show queue counts and recent product attempts")
     status.add_argument("--product-id")
     status.set_defaults(func=_cmd_status)
+
+    publish_home = subparsers.add_parser(
+        "publish-home",
+        help="create or update the managed Wiki.js landing page",
+    )
+    publish_home.set_defaults(func=_cmd_publish_home)
     return parser
 
 

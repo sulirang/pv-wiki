@@ -49,6 +49,11 @@ of the recorded Search candidates, and publish citations must be members of the
 completed Extract set. A process crash conservatively consumes that lease's
 web budget; a later lease can retry after backoff.
 
+Extract uses Tavily's advanced depth with up to five relevance-ranked chunks
+per source so PDF tables and other structured specifications are retained more
+reliably. This costs more than basic extraction; keep the five-URL cap and
+prefer one exact official datasheet over several mirrors.
+
 - no datasheet: retry after approximately 30, then 90, then 180 days;
 - ambiguous or insufficient identity: retry after 30 days;
 - transient error: retry after approximately 1, then 6, then 24 hours;

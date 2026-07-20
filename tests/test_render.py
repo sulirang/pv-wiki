@@ -92,10 +92,36 @@ class UrlAndEscapingTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_home_page_is_deterministic_and_contains_catalogue_status(self) -> None:
+        counts = {"due": 10, "leased": 1, "backoff": 2, "synced": 7}
+
+        rendered = render.render_home_page(
+            counts,
+            due_now=3,
+            product_path_prefix="products",
+            title="PV Wiki",
+        )
+
+        self.assertTrue(rendered.startswith(render.AUTO_BEGIN + "\n"))
+        self.assertTrue(rendered.endswith(render.AUTO_END + "\n"))
+        self.assertIn("| Total catalogue products | 20 |", rendered)
+        self.assertIn("| Pages synchronized | 7 |", rendered)
+        self.assertIn("| Due now | 3 |", rendered)
+        self.assertEqual(
+            rendered,
+            render.render_home_page(
+                dict(reversed(list(counts.items()))),
+                due_now=3,
+                product_path_prefix="products",
+                title="PV Wiki",
+            ),
+        )
+
     def test_render_is_deterministic_and_sorts_unordered_content(self) -> None:
         product = {
             "product_id": "42",
             "brand_code": "ACME",
+            "family_code": "SO003",
             "product_name": "PV|42 <module>",
             "unit_of_measure": "piece",
         }
@@ -124,6 +150,12 @@ class RenderTests(unittest.TestCase):
         self.assertTrue(left.endswith(render.AUTO_END + "\n"))
         self.assertIn(r"PV\|42 &lt;module&gt;", left)
         self.assertIn(r"Voltage\|input", left)
+        self.assertNotIn("Hermes 自动维护", left)
+        self.assertNotIn("SO003", left)
+        self.assertIn("## 产品信息", left)
+        self.assertIn("## 参考文献", left)
+        self.assertNotIn("## Datasheet", left)
+        self.assertNotIn("## 相关资料", left)
         self.assertLess(left.index("a.pdf"), left.index("b.pdf"))
         self.assertIn("2026-07-14T12:00:00+00:00", left)
 
@@ -140,7 +172,8 @@ class RenderTests(unittest.TestCase):
             {
                 "outcome": "publish",
                 "confidence": 0.93,
-                "summary": "Official source matched.",
+                "summary": "Acme PV-42 is a grid-connected inverter for commercial rooftops.",
+                "review_summary": "Installers praise its compact enclosure and clear commissioning workflow.",
                 "datasheets": [
                     {
                         "title": "Official datasheet",
@@ -152,11 +185,24 @@ class RenderTests(unittest.TestCase):
                 "facts": [
                     {
                         "name": "Input voltage",
+                        "category": "直流输入",
                         "value": 48,
                         "unit": "V",
                         "confidence": 0.95,
                         "evidence_urls": ["https://example.com/manual.html"],
                     }
+                ],
+                "sources": [
+                    {
+                        "title": "Installer review A",
+                        "url": "https://reviews.example.com/pv-42-a",
+                        "source_type": "community",
+                    },
+                    {
+                        "title": "Installer review B",
+                        "url": "https://reviews.example.com/pv-42-b",
+                        "source_type": "community",
+                    },
                 ],
                 "conflicts": [
                     {
@@ -168,7 +214,9 @@ class RenderTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("| Input voltage | 48 V |", rendered)
+        self.assertIn("| 直流输入 | Input voltage | 48 V |", rendered)
+        self.assertIn("**市场与用户反馈：**", rendered)
+        self.assertIn("（官方数据表）", rendered)
         self.assertIn("[Input voltage（证据）](https://example.com/manual.html)", rendered)
         self.assertIn("- 判定：publish", rendered)
         self.assertIn("## 未解决的来源冲突", rendered)

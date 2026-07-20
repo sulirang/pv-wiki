@@ -57,7 +57,7 @@ ORDER BY COALESCE(updated_at, created_at), product_id
 """.strip()
 
 _READ_ONLY_TRANSACTION = "SET TRANSACTION READ ONLY"
-_ALLOWED_SSLMODES = frozenset({"disable", "allow", "prefer", "require", "verify-ca", "verify-full"})
+_ALLOWED_SSLMODES = frozenset({"require", "verify-ca", "verify-full"})
 
 
 class DatabaseConfigurationError(RuntimeError):
@@ -79,13 +79,13 @@ def validate_postgres_sslmode() -> str:
     raw = os.getenv("PGSSLMODE")
     if raw is None or not raw.strip():
         raise DatabaseConfigurationError(
-            "PGSSLMODE is required (disable, prefer, require, verify-ca, or verify-full)"
+            "PGSSLMODE is required and must be require, verify-ca, or verify-full"
         )
     normalized = raw.strip().casefold()
     if normalized not in _ALLOWED_SSLMODES:
         raise DatabaseConfigurationError(
-            "PGSSLMODE must be disable, prefer, require, verify-ca, or verify-full; "
-            "unknown modes are refused"
+            "PGSSLMODE must be require, verify-ca, or verify-full; "
+            "weaker and unknown modes are refused"
         )
     return normalized
 

@@ -1,33 +1,33 @@
 <!-- HERMES-AUTO:BEGIN -->
 # {{ title }}
 
-> Automatically maintained from the product catalogue and cited public sources.
+## 产品信息
 
-## Catalogue identity
-
-| Field | Value |
+| 字段 | 值 |
 | --- | --- |
-| Product ID | `{{ product_id }}` |
-| Manufacturer | {{ manufacturer }} |
-| Model | {{ model }} |
-| Brand code | {{ brand_code }} |
-| Family code | {{ family_code }} |
+| 产品 ID | `{{ product_id }}` |
+| 品牌/制造商 | {{ manufacturer }} |
+| 型号/料号 | {{ model }} |
+| 产品名称 | {{ product_name }} |
+| 计量单位 | {{ unit_of_measure }} |
 
-## Datasheets
+{{ product_summary }}
 
-{{ datasheet_links }}
+{{ review_summary }}
 
-## Verified specifications
+## 规格参数
 
 {{ facts_table }}
 
-## Sources and conflicts
+## 未解决的来源冲突
 
-{{ source_list }}
+{{ conflicts }}
 
-Last checked: {{ checked_at }}
+## 资料核验
+
+{{ verification }}
+
+## 参考文献
+
+{{ references }}
 <!-- HERMES-AUTO:END -->
-
-## Human notes
-
-Content below this heading is preserved across automated updates.

@@ -26,6 +26,8 @@ _TOP_LEVEL = frozenset(
         "manufacturer",
         "model",
         "summary",
+        "review_summary",
+        "review_evidence_urls",
         "decision_notes",
         "datasheets",
         "sources",
@@ -168,11 +170,54 @@ def validate_decision(
         if undeclared:
             raise DecisionError("decision cites URLs not extracted for this lease")
 
+    summary = _text(raw.get("summary"), "summary", limit=2000)
+    review_summary = _text(
+        raw.get("review_summary"), "review_summary", limit=1500
+    )
+    review_evidence_raw = raw.get("review_evidence_urls", [])
+    if not isinstance(review_evidence_raw, list) or len(review_evidence_raw) > 5:
+        raise DecisionError("review_evidence_urls must be an array of at most 5 URLs")
+    review_evidence_urls = [
+        validate_public_url(url, "review_evidence_urls")
+        for url in review_evidence_raw
+    ]
+    if review_summary and len(set(review_evidence_urls)) < 2:
+        raise DecisionError(
+            "review_summary requires at least two review evidence URLs"
+        )
+    if review_evidence_urls and not review_summary:
+        raise DecisionError("review_evidence_urls require review_summary")
+    if not set(review_evidence_urls) <= declared_urls:
+        raise DecisionError(
+            "review_evidence_urls must reference declared sources"
+        )
+
+    source_types_by_url = {
+        item["url"]: item["source_type"] for item in datasheets + sources
+    }
+    community_urls = {
+        url for url, source_type in source_types_by_url.items()
+        if source_type == "community"
+    }
+    if any(item["source_type"] == "community" for item in datasheets):
+        raise DecisionError("community sources cannot be datasheets")
+    if not community_urls <= set(review_evidence_urls):
+        raise DecisionError(
+            "community sources may be cited only as review evidence"
+        )
+
     facts: list[dict[str, Any]] = []
     for index, item in enumerate(_require_list(raw, "facts", 100)):
         if not isinstance(item, Mapping):
             raise DecisionError(f"facts[{index}] must be an object")
-        unknown_item = set(item) - {"name", "value", "unit", "confidence", "evidence_urls"}
+        unknown_item = set(item) - {
+            "name",
+            "category",
+            "value",
+            "unit",
+            "confidence",
+            "evidence_urls",
+        }
         if unknown_item:
             raise DecisionError(f"facts[{index}] has unknown fields")
         value = item.get("value")
@@ -196,6 +241,10 @@ def validate_decision(
             raise DecisionError(
                 f"facts[{index}].evidence_urls must reference declared sources"
             )
+        if set(evidence) & community_urls:
+            raise DecisionError(
+                f"facts[{index}] cannot use community review evidence"
+            )
         fact = {
             "name": _text(item.get("name"), f"facts[{index}].name", required=True, limit=200),
             "value": value,
@@ -204,6 +253,10 @@ def validate_decision(
         }
         if "unit" in item:
             fact["unit"] = _text(item.get("unit"), f"facts[{index}].unit", limit=80)
+        if "category" in item:
+            fact["category"] = _text(
+                item.get("category"), f"facts[{index}].category", limit=100
+            )
         facts.append(fact)
 
     conflicts = _require_list(raw, "conflicts", 100)
@@ -244,12 +297,15 @@ def validate_decision(
     if outcome == "publish":
         if confidence < minimum_confidence:
             raise DecisionError("publish confidence is below the configured threshold")
+        if not summary:
+            raise DecisionError("publish requires a user-facing product summary")
+        if len(facts) < 5:
+            raise DecisionError(
+                "publish requires at least 5 cited specification facts"
+            )
         primary = [item for item in datasheets if item["is_primary"]]
         if not primary:
             raise DecisionError("publish requires a primary datasheet")
-        all_sources = datasheets + sources
-        if any(item["source_type"] == "community" for item in all_sources):
-            raise DecisionError("community sources cannot be auto-published")
         if not any(item["source_type"] in TRUSTED_TYPES for item in primary):
             mirror_domains = {
                 ".".join((urlsplit(item["url"]).hostname or "").split(".")[-2:])
@@ -274,7 +330,9 @@ def validate_decision(
         "confidence": confidence,
         "manufacturer": _text(raw.get("manufacturer"), "manufacturer", limit=300),
         "model": _text(raw.get("model"), "model", limit=300),
-        "summary": _text(raw.get("summary"), "summary", limit=2000),
+        "summary": summary,
+        "review_summary": review_summary,
+        "review_evidence_urls": review_evidence_urls,
         "decision_notes": _text(
             raw.get("decision_notes"), "decision_notes", required=True, limit=1000
         ),

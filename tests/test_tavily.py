@@ -65,6 +65,7 @@ class BuildQueriesTests(unittest.TestCase):
         self.assertTrue(all('"Acme"' in query for query in queries))
         self.assertTrue(all('"PV-42"' in query for query in queries))
         self.assertIn("datasheet PDF", queries[0])
+        self.assertIn("review user experience", queries[2])
 
     def test_build_queries_requires_meaningful_identity(self) -> None:
         with self.assertRaises(ValueError):
@@ -204,6 +205,64 @@ class TavilyClientTests(unittest.TestCase):
 
         self.assertEqual([0.25, 0.5], sleeps)
 
+    def test_429_rotates_to_next_key_without_sleeping(self) -> None:
+        authorizations: list[str | None] = []
+        sleeps: list[float] = []
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            authorizations.append(request.get_header("Authorization"))
+            if len(authorizations) == 1:
+                raise urllib.error.HTTPError(
+                    "https://api.tavily.com/search",
+                    429,
+                    "Too Many Requests",
+                    Message(),
+                    io.BytesIO(b"{}"),
+                )
+            return FakeResponse({"results": [], "usage": {"credits": 0}})
+
+        client = tavily.TavilyClient(
+            api_key=["tvly-first", "tvly-second"],
+            max_retries=1,
+            sleep=sleeps.append,
+            opener=fake_urlopen,
+        )
+        client.search_product({"model": "PV-42"})
+
+        self.assertEqual("Bearer tvly-first", authorizations[0])
+        self.assertTrue(
+            all(value == "Bearer tvly-second" for value in authorizations[1:])
+        )
+        self.assertEqual([], sleeps)
+
+    def test_all_rate_limited_keys_use_bounded_retry_round(self) -> None:
+        calls = 0
+        sleeps: list[float] = []
+
+        def fake_urlopen(_request: object, *, timeout: float) -> FakeResponse:
+            nonlocal calls
+            calls += 1
+            if calls <= 2:
+                raise urllib.error.HTTPError(
+                    "https://api.tavily.com/search",
+                    429,
+                    "Too Many Requests",
+                    Message(),
+                    io.BytesIO(b"{}"),
+                )
+            return FakeResponse({"results": [], "usage": {"credits": 0}})
+
+        client = tavily.TavilyClient(
+            api_key=["tvly-first", "tvly-second"],
+            max_retries=1,
+            backoff_base=0.25,
+            sleep=sleeps.append,
+            opener=fake_urlopen,
+        )
+        client.search_product({"model": "PV-42"})
+
+        self.assertEqual([0.25], sleeps)
+
     def test_extract_urls_validates_caps_and_uses_tavily_only(self) -> None:
         seen: list[tuple[object, dict]] = []
 
@@ -237,7 +296,8 @@ class TavilyClientTests(unittest.TestCase):
         request, payload = seen[0]
         self.assertEqual("https://api.tavily.com/extract", request.full_url)
         self.assertEqual(["https://example.com/pv-42"], payload["urls"])
-        self.assertEqual("basic", payload["extract_depth"])
+        self.assertEqual("advanced", payload["extract_depth"])
+        self.assertEqual(5, payload["chunks_per_source"])
         self.assertIs(payload["include_usage"], True)
         self.assertEqual("# PV-42\nSpecifications", bundle["results"][0]["raw_content"])
         json.dumps(bundle)
