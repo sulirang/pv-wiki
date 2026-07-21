@@ -185,10 +185,12 @@ domain mapping for that exact catalogue `brand_code` in
 `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`. For certificate-verifying PostgreSQL
 modes, mount the catalogue public/private CA from `CATALOGUE_CA_PATH`
 read-only as documented in the deployment guide.
-Only bounded extracts containing the exact full model and no detected sibling
-model/revision are eligible for unattended publication. Each specification
-must include a short exact extract span containing the model, source field
-label, and value. Route multi-model series tables to supervised handling.
+Only bounded extracts containing the exact full model are eligible evidence;
+the document may also cover sibling models in the same series. Each
+specification must include a short exact target-model-only extract span
+containing the model, source field label, and value, with no sibling model or
+revision inside that span. Route ambiguous multi-model table rows to supervised
+handling.
 
 Run `pv-wiki doctor` before any live probes, then `pv-wiki doctor --live`. The
 doctor validates AI configuration but intentionally spends no AI or Tavily

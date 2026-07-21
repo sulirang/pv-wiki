@@ -66,8 +66,8 @@ The model is an untrusted proposer. It receives only reader-facing product
 fields plus successful, bounded Tavily extracts; search snippets and failed
 extract errors are withheld. The runtime strips/overwrites model attempts to
 set `schema_version`, `product_id`, or `lease_token`, requires the proposed
-model to match the catalogue name, rejects bounded extracts with detected
-sibling model/revision identifiers, requires a short exact model/label/value
+model to match the catalogue name, allows series documents containing sibling
+models into analysis, requires a short exact target-model-only model/label/value
 span for every unique fact, and accepts trusted source types only for
 the exact `brand_code` mapping in the operator-approved
 `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`. It then applies the local decision
@@ -107,9 +107,11 @@ audited.
 Each attempt persistently budgets one Search batch and one Extract batch.
 Extract URLs must come from that lease's search candidates. Only URLs that
 Tavily successfully extracted with non-empty bounded content, an exact full
-model match, and no detected sibling model/revision can become evidence.
-Every decision citation must be in that successful set. Multi-model series
-tables fail closed for supervised handling rather than guessing a column.
+model match can become evidence. Every decision citation must be in that
+successful set. A series document may contain sibling models, but every
+published fact still needs an exact target-model-only span. Ambiguous
+multi-model table rows fail closed for supervised handling rather than guessing
+a column.
 The low-level `publish` command therefore requires `--evidence-file` for a
 publish outcome. The fixed n8n `run-one` operation passes the bounded evidence
 in memory and does not persist source bodies.

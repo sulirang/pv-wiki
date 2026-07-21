@@ -57,8 +57,8 @@ metadata; it does not replace any of the three application databases.
 - Accepts trusted source status only from the configured domain map for the
   catalogue brand, and requires the complete catalogue product name in the
   extract as well as an exact proposed-model match.
-- Rejects bounded extracts that also contain a sibling model/revision; those
-  series datasheets require supervised handling.
+- Allows multi-model series datasheets into analysis, while requiring every
+  published fact to use a target-model-only span with no sibling/revision.
 - Keeps database IDs, family codes, lease tokens, and secrets out of the model
   prompt.
 - Validates exact source URLs, source trust, confidence, conflicts, public

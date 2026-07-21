@@ -104,6 +104,30 @@ class DecisionTests(unittest.TestCase):
             )
         )
         self.assertTrue(
+            text_contains_competing_identity(
+                "SUN2000-8KTL-M1",
+                "SUN2000-8KTL-M1 and SUN2000-6KTL",
+            )
+        )
+        self.assertTrue(
+            text_contains_competing_identity(
+                "SUN2000-8KTL-M1",
+                "SUN2000-8KTL-M1 output powers: 6KTL 6000 W",
+            )
+        )
+        self.assertTrue(
+            text_contains_competing_identity(
+                "SUN2000-8KTL-M1",
+                "SUN2000-8KTL-M1 and SUN2000-8KTL-L1",
+            )
+        )
+        self.assertTrue(
+            text_contains_competing_identity(
+                "ACME-PRO-100",
+                "ACME-PRO-100 and ACME-MAX-100",
+            )
+        )
+        self.assertTrue(
             text_contains_competing_identity("PV-42", "PV-42 and PV-43")
         )
         for body in (
@@ -166,6 +190,26 @@ class DecisionTests(unittest.TestCase):
                 "PV-42 Rev B specifications",
             )
         )
+        self.assertFalse(
+            text_contains_competing_identity(
+                "SUN2000-8KTL-M1",
+                "SUN2000-8KTL-M1 Maximum efficiency SUN2000 98.6 percent",
+            )
+        )
+        self.assertFalse(
+            text_contains_competing_identity(
+                "Samsung Galaxy S24",
+                "Samsung Galaxy S24 Weight 168 g Samsung Electronics",
+            )
+        )
+        for area_unit in ("m2", "m²"):
+            with self.subTest(area_unit=area_unit):
+                self.assertFalse(
+                    text_contains_competing_identity(
+                        "SUN2000-8KTL-M1",
+                        f"SUN2000-8KTL-M1 Installation footprint 0.5 {area_unit}",
+                    )
+                )
         for body in (
             "PV-42 AC output specifications",
             "PV-42 DC input voltage",
@@ -240,6 +284,109 @@ class DecisionTests(unittest.TestCase):
         )
 
         self.assertEqual("publish", result["outcome"])
+
+    def test_series_datasheet_can_publish_target_specific_fact_spans(self) -> None:
+        item = valid_decision()
+        url = "https://solar.huawei.com/sun2000-m1-datasheet.pdf"
+        target = "SUN2000-8KTL-M1"
+        item.update(
+            {
+                "product_id": "SUN8",
+                "manufacturer": "Huawei",
+                "model": target,
+                "datasheets": [
+                    {
+                        "url": url,
+                        "title": "SUN2000-3-10KTL-M1 datasheet",
+                        "source_type": "manufacturer",
+                        "is_primary": True,
+                    }
+                ],
+            }
+        )
+        specifications = (
+            ("Rated output power", "Output", 8000, "W"),
+            ("Maximum apparent power", "Output", 8800, "VA"),
+            ("Maximum efficiency", "Efficiency", 98.6, "%"),
+            ("Protection degree", "General", "IP65", ""),
+            ("Weight", "General", 17, "kg"),
+        )
+        target_rows = []
+        for fact, (name, category, value, unit) in zip(
+            item["facts"], specifications, strict=True
+        ):
+            quote = f"{target} {name} {value} {unit}".strip()
+            fact.update(
+                {
+                    "name": name,
+                    "category": category,
+                    "value": value,
+                    "unit": unit,
+                    "evidence_urls": [url],
+                    "evidence_quotes": [{"url": url, "quote": quote}],
+                }
+            )
+            target_rows.append(quote)
+        body = "\n".join(
+            [
+                "Models: SUN2000-5KTL-M1 SUN2000-6KTL-M1 "
+                "SUN2000-8KTL-M1 SUN2000-10KTL-M1",
+                *target_rows,
+            ]
+        )
+
+        result = _validate_decision(
+            item,
+            expected_product_id="SUN8",
+            expected_lease_token="1234567890abcdef",
+            allowed_evidence_urls={url},
+            trusted_source_domains={"solar.huawei.com"},
+            expected_product_name=target,
+            evidence_text_by_url={url: body},
+        )
+
+        self.assertEqual("publish", result["outcome"])
+
+        ambiguous_row = (
+            "SUN2000-8KTL-M1 6KTL Rated output power 8000 W 6000 W"
+        )
+        item["facts"][0].update(
+            {
+                "value": 6000,
+                "evidence_quotes": [{"url": url, "quote": ambiguous_row}],
+            }
+        )
+        with self.assertRaisesRegex(DecisionError, "exact supporting"):
+            _validate_decision(
+                item,
+                expected_product_id="SUN8",
+                expected_lease_token="1234567890abcdef",
+                allowed_evidence_urls={url},
+                trusted_source_domains={"solar.huawei.com"},
+                expected_product_name=target,
+                evidence_text_by_url={url: f"{body}\n{ambiguous_row}"},
+            )
+
+        variant_row = (
+            "SUN2000-8KTL-M1 SUN2000-8KTL-L1 "
+            "Rated output power 8000 W 7000 W"
+        )
+        item["facts"][0].update(
+            {
+                "value": 7000,
+                "evidence_quotes": [{"url": url, "quote": variant_row}],
+            }
+        )
+        with self.assertRaisesRegex(DecisionError, "exact supporting"):
+            _validate_decision(
+                item,
+                expected_product_id="SUN8",
+                expected_lease_token="1234567890abcdef",
+                allowed_evidence_urls={url},
+                trusted_source_domains={"solar.huawei.com"},
+                expected_product_name=target,
+                evidence_text_by_url={url: f"{body}\n{variant_row}"},
+            )
 
     def test_rejects_lease_mismatch_and_low_confidence(self) -> None:
         with self.assertRaisesRegex(DecisionError, "lease_token"):
@@ -546,7 +693,20 @@ class DecisionTests(unittest.TestCase):
                 ],
             }
         )
-        with self.assertRaisesRegex(DecisionError, "matching model"):
+        with self.assertRaisesRegex(DecisionError, "exact supporting"):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                evidence_text_by_url={
+                    "https://acme.example/PV-42.pdf": body
+                },
+            )
+
+        item["facts"][0]["evidence_quotes"][0]["quote"] = (
+            "PV-42 Rated power 4.3 kW"
+        )
+        with self.assertRaisesRegex(DecisionError, "exact supporting"):
             validate_decision(
                 item,
                 expected_product_id="P-42",
@@ -585,7 +745,7 @@ class DecisionTests(unittest.TestCase):
                 wrong_rows.append(quote)
             with self.subTest(sibling=sibling):
                 with self.assertRaisesRegex(
-                    DecisionError, "sibling model or revision"
+                    DecisionError, "exact supporting"
                 ):
                     validate_decision(
                         item,
@@ -608,7 +768,7 @@ class DecisionTests(unittest.TestCase):
             )
             with self.subTest(revision=revision):
                 with self.assertRaisesRegex(
-                    DecisionError, "sibling model or revision"
+                    DecisionError, "exact supporting"
                 ):
                     validate_decision(
                         item,

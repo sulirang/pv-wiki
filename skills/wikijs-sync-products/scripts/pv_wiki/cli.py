@@ -33,7 +33,6 @@ from .db import DatabaseConfigurationError, ProductReader, validate_postgres_ssl
 from .decision import (
     DecisionError,
     canonical_product_category,
-    text_contains_competing_identity,
     text_contains_exact_identity,
     validate_decision,
 )
@@ -522,10 +521,6 @@ def _run_extract(
             and isinstance(item.get("raw_content"), str)
             and item["raw_content"].strip()
             and text_contains_exact_identity(
-                expected_identity,
-                item["raw_content"],
-            )
-            and not text_contains_competing_identity(
                 expected_identity,
                 item["raw_content"],
             )

@@ -33,9 +33,8 @@ matches the operator-approved domain mapping for that exact catalogue
 normalized catalogue `product_name` to occur in every accepted extract and
 requires the proposed model to match that name. Every specification must cite
 a trusted-domain source; explicitly enabled mirror fallback requires two
-independent mirror domains for every fact. Bounded extracts containing a
-detected sibling model or revision are not eligible for unattended
-publication. The model cannot grant trust or product identity.
+independent mirror domains for every fact. A bounded extract may cover sibling
+models in the same series, but the model cannot grant trust or product identity.
 
 ## Evidence
 
@@ -43,10 +42,12 @@ Every fact is a compact object with `name`, `value`, optional `unit`,
 optional datasheet section `category`, `confidence`, `evidence_urls`, and
 `evidence_quotes`. Keep `name` equal to the exact source field label. Each
 short quote must be an exact span from the cited bounded extract and contain
-the full model, field label, and selected value; translated labels belong in
-surrounding prose, not the verified fact name.
-Extract the complete row for the exact model column; do not infer a missing
-value from a nearby model. Capture detailed official specifications across
+the full target model, field label, and selected value, without a sibling
+model or revision in that span; translated labels belong in surrounding prose,
+not the verified fact name. Extract the complete target-specific row or cell
+context; do not infer a missing value from a nearby model column. If Tavily's
+flattened text cannot preserve an unambiguous target-model span, return
+`ambiguous`. Capture detailed official specifications across
 efficiency, input, output, storage, protection, communication, and physical or
 environmental sections when present. Publication requires at least five cited
 specification facts. If sources conflict, add a `conflicts` entry and omit the

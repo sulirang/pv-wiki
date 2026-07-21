@@ -440,13 +440,16 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             self.assertEqual([], store.allowed_evidence_urls(token))
 
-    def test_extract_rejects_attached_sibling_model_in_same_body(self) -> None:
+    def test_extract_allows_series_datasheet_with_target_and_siblings(self) -> None:
+        target = "SUN2000-8KTL-M1"
+        with state.StateStore(self.state_path) as store:
+            store.upsert_product({**product(), "product_name": target})
         token = self.claim()
-        url = "https://acme.example/pv-42a.pdf"
+        url = "https://solar.huawei.com/sun2000-m1-datasheet.pdf"
         self.prepare_search(token, url)
         request = self.write_json(
-            "extract-sibling.json",
-            {"urls": [url], "query": "PV-42 specifications"},
+            "extract-series.json",
+            {"urls": [url], "query": f"{target} specifications"},
         )
         client = mock.Mock()
         client.extract_urls.return_value = {
@@ -454,8 +457,9 @@ class CLITests(unittest.TestCase):
                 {
                     "url": url,
                     "raw_content": (
-                        "PV-42 PV-42A Rated power 420 W\n"
-                        "PV-42 PV-42A Input voltage 480 V"
+                        "SUN2000-5KTL-M1 SUN2000-6KTL-M1 "
+                        "SUN2000-8KTL-M1 SUN2000-10KTL-M1\n"
+                        "Series datasheet specifications"
                     ),
                 }
             ],
@@ -473,9 +477,9 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         with state.StateStore(self.state_path) as store:
-            self.assertEqual([], store.allowed_evidence_urls(token))
+            self.assertEqual([url], store.allowed_evidence_urls(token))
 
-    def test_extract_rejects_prefixed_sibling_model_in_same_body(self) -> None:
+    def test_extract_allows_candidate_with_prefixed_sibling_in_same_body(self) -> None:
         token = self.claim()
         url = "https://acme.example/hc-pv-42.pdf"
         self.prepare_search(token, url)
@@ -508,7 +512,7 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         with state.StateStore(self.state_path) as store:
-            self.assertEqual([], store.allowed_evidence_urls(token))
+            self.assertEqual([url], store.allowed_evidence_urls(token))
 
     def test_official_decision_upserts_wiki_and_marks_synced(self) -> None:
         token = self.claim()
@@ -815,8 +819,9 @@ class CLITests(unittest.TestCase):
             current = store.get_product("P-42")
             self.assertEqual("insufficient_identity", current.last_outcome)
 
-    def test_run_one_rejects_extract_with_split_sibling_suffix(self) -> None:
-        url = "https://acme.example/pv-42-a.pdf"
+    def test_run_one_passes_series_datasheet_to_ai(self) -> None:
+        self.configure_worker_environment()
+        url = "https://acme.example/pv-series.pdf"
         search_client = mock.Mock()
         search_client.search_product.return_value = {
             "queries": ["PV-42 datasheet"],
@@ -828,32 +833,49 @@ class CLITests(unittest.TestCase):
             "results": [
                 {
                     "url": url,
-                    "raw_content": "PV-42 A specifications only",
+                    "raw_content": (
+                        "PV-41 PV-42 PV-43 series datasheet specifications"
+                    ),
                 }
             ],
             "failed_results": [],
             "usage": {"credits": 1},
         }
+        ai_client = mock.Mock()
+        ai_client.decide.return_value = decision("forged-token", "ambiguous")
         with (
             mock.patch.object(
                 cli,
                 "TavilyClient",
                 side_effect=[search_client, extract_client],
             ),
-            mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+                return_value=ai_client,
+            ) as ai_factory,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
         ):
             code, payload, error = self.run_cli("run-one")
 
         self.assertEqual(0, code, error)
-        self.assertEqual("insufficient_identity", payload["outcome"])
-        ai_client.assert_not_called()
+        self.assertEqual("ambiguous", payload["outcome"])
+        ai_factory.assert_called_once()
+        ai_client.decide.assert_called_once()
+        self.assertEqual(
+            [url],
+            [
+                item["url"]
+                for item in ai_client.decide.call_args.kwargs["extract"]["results"]
+            ],
+        )
         wiki_client.assert_not_called()
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
-            self.assertEqual("insufficient_identity", current.last_outcome)
+            self.assertEqual("ambiguous", current.last_outcome)
 
-    def test_run_one_rejects_extract_with_split_sibling_prefix(self) -> None:
+    def test_run_one_passes_prefixed_sibling_candidate_to_ai(self) -> None:
+        self.configure_worker_environment()
         url = "https://acme.example/hc-pv-42.pdf"
         search_client = mock.Mock()
         search_client.search_product.return_value = {
@@ -872,24 +894,31 @@ class CLITests(unittest.TestCase):
             "failed_results": [],
             "usage": {"credits": 1},
         }
+        ai_client = mock.Mock()
+        ai_client.decide.return_value = decision("forged-token", "ambiguous")
         with (
             mock.patch.object(
                 cli,
                 "TavilyClient",
                 side_effect=[search_client, extract_client],
             ),
-            mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+                return_value=ai_client,
+            ) as ai_factory,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
         ):
             code, payload, error = self.run_cli("run-one")
 
         self.assertEqual(0, code, error)
-        self.assertEqual("insufficient_identity", payload["outcome"])
-        ai_client.assert_not_called()
+        self.assertEqual("ambiguous", payload["outcome"])
+        ai_factory.assert_called_once()
+        ai_client.decide.assert_called_once()
         wiki_client.assert_not_called()
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
-            self.assertEqual("insufficient_identity", current.last_outcome)
+            self.assertEqual("ambiguous", current.last_outcome)
 
     def test_run_one_ai_failure_records_short_transient_backoff(self) -> None:
         self.configure_worker_environment()

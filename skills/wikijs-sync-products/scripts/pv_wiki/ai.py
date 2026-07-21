@@ -552,8 +552,8 @@ def build_decision_messages(
                     {
                         "url": "successful extracted URL",
                         "quote": (
-                            "short exact span containing full model, "
-                            "field label, and value"
+                            "short exact target-model-only span containing "
+                            "full model, field label, and value"
                         ),
                     }
                 ],
@@ -570,9 +570,13 @@ def build_decision_messages(
             "regulator, or authorized source and at least five cited facts.",
             "product_category must be a reader-facing category, never an internal code.",
             "Keep conflicting claims out of facts and list them in conflicts.",
+            "A source document may cover multiple sibling models; do not reject "
+            "the document for that alone.",
             "For every fact, copy its name from the source field label and add "
-            "a short exact evidence quote containing the full model, that "
-            "label, and value.",
+            "a short exact contiguous evidence quote containing the full target "
+            "model, that label, and value, with no sibling model or revision.",
+            "If a multi-model table does not provide an unambiguous target-model "
+            "span for every fact, return ambiguous; never guess a nearby column.",
             "Community sources may support review_summary only, never specifications.",
             "review_summary requires at least two review_evidence_urls.",
             "Use empty strings and empty arrays for unavailable optional material.",

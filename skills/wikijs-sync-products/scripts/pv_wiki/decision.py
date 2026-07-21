@@ -137,13 +137,33 @@ def text_contains_exact_identity(expected: str, body: str) -> bool:
     return re.search(pattern, body_text, flags=re.UNICODE) is not None
 
 
+def _mixed_model_token_pattern(token: str) -> str | None:
+    """Vary digit runs while preserving a mixed model token's letter skeleton."""
+
+    runs = re.findall(r"\d+|[^\W\d_]+", token, flags=re.UNICODE)
+    if not any(run.isdecimal() for run in runs) or not any(
+        not run.isdecimal() for run in runs
+    ):
+        return None
+    return "".join(r"\d+" if run.isdecimal() else re.escape(run) for run in runs)
+
+
 def _variable_model_token_pattern(token: str) -> str:
     if token.isdecimal():
         # Consume a directly attached alphabetic revision as part of the
         # candidate (for example, PV-42A must not collapse to PV-42).
         return r"\d+[^\W_]*"
-    if any(character.isdecimal() for character in token):
-        return r"[^\W_]*\d[^\W_]*"
+    mixed_pattern = _mixed_model_token_pattern(token)
+    if mixed_pattern is not None:
+        # A complete candidate has enough surrounding model context to allow
+        # both digit and letter revisions to vary. Require at least one of
+        # each so decimal specification values cannot impersonate a token.
+        return (
+            r"(?:"
+            r"[^\W\d_]+[^\W_]*\d[^\W_]*"
+            r"|\d+[^\W_]*[^\W\d_][^\W_]*"
+            r")"
+        )
     return r"[^\W\d_]+"
 
 
@@ -209,6 +229,29 @@ def _contains_compact_affix(expected: str, body: str) -> bool:
     )
 
 
+def _contains_abbreviated_sibling(tokens: list[str], body_text: str) -> bool:
+    """Detect shortened sibling tokens such as bare ``6KTL`` beside ``8KTL``."""
+
+    for token in tokens:
+        variable_pattern = _mixed_model_token_pattern(token)
+        if variable_pattern is None:
+            continue
+        letter_skeleton = "".join(
+            run
+            for run in re.findall(r"\d+|[^\W\d_]+", token, flags=re.UNICODE)
+            if not run.isdecimal()
+        )
+        if len(letter_skeleton) < 2:
+            continue
+        pattern = r"(?<![^\W_])" + variable_pattern + r"(?![^\W_])"
+        if any(
+            identity_key(match.group()) != identity_key(token)
+            for match in re.finditer(pattern, body_text, flags=re.UNICODE)
+        ):
+            return True
+    return False
+
+
 def text_contains_competing_identity(expected: str, body: str) -> bool:
     """Detect sibling model/revision identifiers sharing the expected stem."""
 
@@ -254,7 +297,10 @@ def text_contains_competing_identity(expected: str, body: str) -> bool:
         for match in re.finditer(pattern, body_text, flags=re.UNICODE)
     ):
         return True
-    return _contains_compact_affix(expected, body)
+    return _contains_abbreviated_sibling(tokens, body_text) or _contains_compact_affix(
+        expected,
+        body,
+    )
 
 
 def _hostname_matches_domain(hostname: str, domain: str) -> bool:
@@ -450,19 +496,13 @@ def validate_decision(
                 raise DecisionError(
                     "evidence_text_by_url values must be bounded non-empty strings"
                 )
-            if outcome == "publish" and (
-                not text_contains_exact_identity(
-                    expected_product_name or "",
-                    body,
-                )
-                or text_contains_competing_identity(
-                    expected_product_name or "",
-                    body,
-                )
+            if outcome == "publish" and not text_contains_exact_identity(
+                expected_product_name or "",
+                body,
             ):
                 raise DecisionError(
-                    "publish evidence must contain the matching model identity "
-                    "and no detected sibling model or revision"
+                    "publish evidence must contain the complete catalogue "
+                    "model identity"
                 )
             normalized_evidence_text[url] = identity_key(body)
 

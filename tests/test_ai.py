@@ -192,6 +192,14 @@ class PromptTests(unittest.TestCase):
             "reader-facing category",
             " ".join(prompt["source_policy"]),
         )
+        self.assertIn(
+            "multiple sibling models",
+            " ".join(prompt["source_policy"]),
+        )
+        self.assertIn(
+            "return ambiguous",
+            " ".join(prompt["source_policy"]),
+        )
         self.assertEqual(
             "https://maker.example/pv-42.pdf",
             prompt["tavily"]["extract"]["results"][0]["url"],
