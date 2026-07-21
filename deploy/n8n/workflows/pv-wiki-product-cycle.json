@@ -4,28 +4,27 @@
     {
       "parameters": {},
       "id": "59e201e8-924a-4d94-ae64-bf28a5c066f0",
-      "name": "Manual Trigger",
+      "name": "Manual / New Key Start",
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [-560, 120]
+      "position": [-800, 160]
     },
     {
       "parameters": {
         "rule": {
           "interval": [
             {
-              "field": "hours",
-              "hoursInterval": 4,
-              "triggerAtMinute": 5
+              "field": "cronExpression",
+              "expression": "5 8 1 * *"
             }
           ]
         }
       },
       "id": "880c75ed-3b3f-4bc2-96e2-06ea85af3830",
-      "name": "Every 4 Hours",
+      "name": "Monthly Credits Refresh",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [-560, -80]
+      "position": [-800, -40]
     },
     {
       "parameters": {
@@ -44,7 +43,7 @@
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 60000,
-      "position": [-260, 20]
+      "position": [-520, 60]
     },
     {
       "parameters": {
@@ -60,18 +59,57 @@
       "name": "Run One Product",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [40, 20]
+      "position": [-220, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "62b0ed69-d64d-4fc0-a64a-28a556d55f85",
+              "leftValue": "={{ $json.processed }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c4dfd873-9ae1-4fd3-adcf-0a7fb68f3bd5",
+      "name": "Continue While Processed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [80, 60]
     }
   ],
   "connections": {
-    "Manual Trigger": {
+    "Manual / New Key Start": {
       "main": [[{"node": "Sync Catalogue", "type": "main", "index": 0}]]
     },
-    "Every 4 Hours": {
+    "Monthly Credits Refresh": {
       "main": [[{"node": "Sync Catalogue", "type": "main", "index": 0}]]
     },
     "Sync Catalogue": {
       "main": [[{"node": "Run One Product", "type": "main", "index": 0}]]
+    },
+    "Run One Product": {
+      "main": [[{"node": "Continue While Processed", "type": "main", "index": 0}]]
+    },
+    "Continue While Processed": {
+      "main": [
+        [{"node": "Run One Product", "type": "main", "index": 0}],
+        []
+      ]
     }
   },
   "pinData": {},

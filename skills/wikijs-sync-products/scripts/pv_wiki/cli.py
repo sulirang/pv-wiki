@@ -39,8 +39,14 @@ from .decision import (
 )
 from .render import render_home_page, render_product_page, stable_path, stable_slug
 from .server import WorkerConfigError, WorkerSettings, serve
-from .state import Lease, LeaseLostError, StateError, StateStore
-from .tavily import TavilyClient, TavilyError
+from .state import (
+    Lease,
+    LeaseLostError,
+    StateError,
+    StateStore,
+    next_month_start,
+)
+from .tavily import TavilyClient, TavilyError, TavilyQuotaExhaustedError
 from .wikijs import WikiJSClient, WikiJSConflictError, WikiJSError
 
 
@@ -373,6 +379,7 @@ def sync_catalogue() -> dict[str, Any]:
     products = ProductReader().fetch_products(batch_size=500)
     with _store() as store:
         results = store.upsert_products(products)
+        quota_resumed = store.resume_tavily_quota_waits()
         counts = store.status_counts()
     return {
         "ok": True,
@@ -380,6 +387,7 @@ def sync_catalogue() -> dict[str, Any]:
         "created": sum(item.created for item in results),
         "changed": sum(item.changed and not item.created for item in results),
         "rescheduled": sum(item.rescheduled for item in results),
+        "quota_resumed": quota_resumed,
         "queue": counts,
     }
 
@@ -447,7 +455,11 @@ def _run_search(
         try:
             store.record_outcome(
                 lease,
-                "tavily_error",
+                (
+                    "tavily_quota_exhausted"
+                    if isinstance(exc, TavilyQuotaExhaustedError)
+                    else "tavily_error"
+                ),
                 error=_safe_error(exc),
             )
         except StateError:
@@ -527,7 +539,11 @@ def _run_extract(
         try:
             store.record_outcome(
                 lease,
-                "tavily_error",
+                (
+                    "tavily_quota_exhausted"
+                    if isinstance(exc, TavilyQuotaExhaustedError)
+                    else "tavily_error"
+                ),
                 error=_safe_error(exc),
             )
         except StateError:
@@ -982,6 +998,15 @@ def run_one(
                     },
                 },
             )
+        except TavilyQuotaExhaustedError:
+            return {
+                "ok": True,
+                "processed": False,
+                "published": False,
+                "reason": "tavily_quota_exhausted",
+                "resume_at": next_month_start().isoformat(),
+            }
+
         except LeaseLostError as exc:
             _record_active_failure(store, lease, "error", exc)
             raise

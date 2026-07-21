@@ -55,6 +55,10 @@ class TavilyHTTPError(TavilyError):
     """Raised for a non-retryable or exhausted Tavily HTTP response."""
 
 
+class TavilyQuotaExhaustedError(TavilyError):
+    """Raised after every configured key has exhausted its monthly credits."""
+
+
 class TavilyNetworkError(TavilyError):
     """Raised when Tavily cannot be reached after retries."""
 
@@ -309,6 +313,14 @@ class _RateLimitSignal(Exception):
         super().__init__("rate limited")
 
 
+class _QuotaExhaustedSignal(Exception):
+    """Internal signal: current key cannot spend more credits this month."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+        super().__init__("monthly quota exhausted")
+
+
 class TavilyClient:
     """Tavily REST client with bounded retries, multi-key rotation, and no secret persistence."""
 
@@ -339,6 +351,9 @@ class TavilyClient:
         self._key_index: int = 0
         # Per-key rate-limit cooldown: key_str -> epoch_seconds when usable again.
         self._rate_limited_until: dict[str, float] = {}
+        # Never persisted or logged: quota-exhausted keys are skipped for the
+        # remaining lifetime of this client.
+        self._quota_exhausted_keys: set[str] = set()
         self.timeout = float(timeout)
         self.max_retries = int(max_retries)
         self.backoff_base = float(backoff_base)
@@ -405,6 +420,8 @@ class TavilyClient:
         for offset in range(1, num + 1):
             idx = (self._key_index + offset) % num
             key = self._keys[idx]
+            if key in self._quota_exhausted_keys:
+                continue
             cooldown = self._rate_limited_until.get(key, 0.0)
             if cooldown <= now_ts:
                 self._key_index = idx
@@ -436,8 +453,18 @@ class TavilyClient:
             # every configured key is cooling down after a 429 response.
             for _key_attempt in range(len(self._keys)):
                 api_key = self._current_key()
+                if api_key in self._quota_exhausted_keys:
+                    if self._advance_key():
+                        api_key = self._current_key()
+                    else:
+                        break
                 try:
                     return self._post_with_key(path, payload, api_key)
+                except _QuotaExhaustedSignal:
+                    self._quota_exhausted_keys.add(api_key)
+                    if self._advance_key():
+                        continue
+                    break
                 except _RateLimitSignal as exc:
                     self._mark_rate_limited(api_key, exc.retry_after)
                     rate_limits.append(exc)
@@ -453,6 +480,10 @@ class TavilyClient:
                     if self._advance_key():
                         continue
                     raise
+            if len(self._quota_exhausted_keys) == len(self._keys):
+                raise TavilyQuotaExhaustedError(
+                    "All configured Tavily API keys have exhausted their monthly quota"
+                )
 
             if not rate_limits:
                 if last_error is not None:
@@ -510,6 +541,12 @@ class TavilyClient:
                             f"Tavily response exceeds {MAX_RESPONSE_BYTES} bytes"
                         )
             except urllib.error.HTTPError as exc:
+                if exc.code in {432, 433}:
+                    # 432 is plan-limit exhaustion and 433 is pay-as-you-go
+                    # exhaustion. Both are monthly-credit terminal states for
+                    # this key, unlike the transient 429 request-rate limit.
+                    raise _QuotaExhaustedSignal(exc.code) from None
+
                 if exc.code == 429:
                     # Rate limited — signal key rotation instead of retrying.
                     retry_after = _retry_after_seconds(exc)

@@ -82,7 +82,9 @@ The production bundle is in [`deploy/n8n`](deploy/n8n/README.md). It includes:
 - an internal-only authenticated worker;
 - an optional Caddy HTTPS overlay;
 - two secret-free, inactive workflow templates:
-  - `PV Wiki - Product Cycle` every four hours;
+  - `PV Wiki - Product Cycle` starts after the monthly Tavily credit refresh
+    and serially processes products until the queue is empty or every
+    configured key has exhausted its credits;
   - `PV Wiki - Homepage Refresh` daily at 02:35 Asia/Shanghai.
 
 The installation flow is deliberately review-gated:
@@ -108,7 +110,10 @@ The worker exposes only:
 - `POST /publish-home`
 
 All POST operations require the separate `PV_WIKI_WORKER_TOKEN`; concurrent
-operations are rejected.
+operations are rejected. Tavily HTTP 432/433 responses rotate to the next key.
+The product workflow stops cleanly only when no product is due or all configured
+keys are out of monthly credits; HTTP 429 remains a transient request-rate
+limit.
 
 ## Local CLI
 

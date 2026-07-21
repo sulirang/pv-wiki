@@ -225,6 +225,44 @@ class StateStoreTests(unittest.TestCase):
         ai_result = self.store.record_outcome(ai_lease, "ai_error", now=T0)
         self.assertEqual(T0 + timedelta(hours=1), ai_result.next_run_at)
 
+    def test_tavily_quota_exhaustion_waits_for_next_month_without_failure(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("worker-quota", now=T0)
+
+        result = self.store.record_outcome(
+            lease,
+            "tavily_quota_exhausted",
+            error="monthly quota exhausted",
+            now=T0,
+        )
+
+        self.assertEqual("backoff", result.status)
+        self.assertEqual(0, result.consecutive_failures)
+        self.assertEqual(
+            datetime(2026, 2, 1, tzinfo=timezone.utc),
+            result.next_attempt_at,
+        )
+        self.assertFalse(
+            self.store.is_due(
+                "P-1",
+                now=datetime(2026, 1, 31, 23, 59, tzinfo=timezone.utc),
+            )
+        )
+        self.assertTrue(
+            self.store.is_due(
+                "P-1",
+                now=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            )
+        )
+
+        resumed_at = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        self.assertEqual(1, self.store.resume_tavily_quota_waits(now=resumed_at))
+        self.assertEqual(0, self.store.resume_tavily_quota_waits(now=resumed_at))
+        current = self.store.get_product("P-1")
+        self.assertEqual("due", current.status)
+        self.assertEqual(0, current.consecutive_failures)
+        self.assertTrue(self.store.is_due("P-1", now=resumed_at))
+
     def test_search_and_extract_audit_bind_completed_evidence(self):
         self.store.upsert_product(product(), now=T0)
         lease = self.store.lease_next("worker-a", lease_seconds=3600, now=T0)

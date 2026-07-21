@@ -74,12 +74,13 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    Attach it to `Sync Catalogue`, `Run One Product`, and `Refresh Homepage`.
    The workflow files intentionally contain no credential ID or secret.
 
-8. Manually run `PV Wiki - Product Cycle` once using the final Wiki.js path
-   prefix but private/unpublished visibility. Inspect the exact model match,
-   citations, specifications, preserved human text, and worker audit. Use a
-   separate state volume if a truly separate staging prefix is required, so a
-   staging publication cannot suppress the production product for a year.
-   Then manually run the homepage workflow.
+8. Before enabling the loop, run one supervised acceptance cycle directly with
+   `docker compose --env-file .env -f compose.yaml exec pv-wiki-worker pv-wiki
+   run-one --worker-id manual-acceptance`. Keep the final Wiki.js path prefix
+   private/unpublished and inspect the exact model match, citations,
+   specifications, preserved human text, and worker audit. Use a separate state
+   volume if a truly separate staging prefix is required. Then manually run the
+   homepage workflow.
 9. Point `N8N_DOMAIN` DNS at the VPS. If an HTTPS reverse proxy already exists,
    remove the bootstrap overlay and proxy to `127.0.0.1:N8N_PORT` only after
    the owner account exists. Recreate n8n without the bootstrap environment:
@@ -100,9 +101,11 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    After TLS is available, confirm
    `https://<N8N_DOMAIN>/healthz/readiness` before publishing schedules.
 
-10. Only after review, publish the two workflows. The product cycle runs every
-    four hours at minute 05 and processes one due product; the homepage refresh
-    runs daily at 02:35 Asia/Shanghai.
+10. Only after review, publish the two workflows. The product cycle starts at
+    08:05 Asia/Shanghai on the first day of every month (00:05 UTC), then loops
+    serially until no product is due or all configured Tavily keys return
+    plan/pay-as-you-go exhaustion. The homepage refresh runs daily at 02:35
+    Asia/Shanghai.
 11. Run the security audit, configure an n8n Error Workflow with the
     operator's chosen notification channel, and record the deployed image tags
     and workflow IDs:
@@ -154,8 +157,22 @@ unrelated hosts; inspect only the user-authorized VPS and supplied URL.
 
 `Sync Catalogue` and `Refresh Homepage` have bounded retries because they are
 idempotent. `Run One Product` deliberately has no HTTP retry: if a long request
-times out, retrying it could claim a second product. Product-level backoff is
-stored by the worker and the next n8n pulse resumes it.
+times out, retrying it could claim a second product. A successful product result
+loops back to `Run One Product`; `no_due_product` and
+`tavily_quota_exhausted` stop the execution. Tavily 429 responses retain
+bounded request-rate retries, while 432/433 rotate keys and stop only after all
+configured keys are exhausted.
+
+After adding or replacing a Tavily key, update `TAVILY_API_KEYS`, recreate the
+worker so it receives the new environment, and manually run
+`PV Wiki - Product Cycle`:
+
+```bash
+docker compose --env-file .env -f compose.yaml up -d --no-deps --force-recreate pv-wiki-worker
+```
+
+The next automatic restart is the first day of the next month. Product-level
+backoff remains stored by the worker.
 
 ## Backups and removal
 

@@ -263,6 +263,66 @@ class TavilyClientTests(unittest.TestCase):
 
         self.assertEqual([0.25], sleeps)
 
+    def test_monthly_quota_rotates_keys_without_sleeping(self) -> None:
+        authorizations: list[str | None] = []
+        sleeps: list[float] = []
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            authorization = request.get_header("Authorization")
+            authorizations.append(authorization)
+            if authorization == "Bearer tvly-first":
+                raise urllib.error.HTTPError(
+                    "https://api.tavily.com/search",
+                    432,
+                    "Plan Limit Exceeded",
+                    Message(),
+                    io.BytesIO(b"{}"),
+                )
+            return FakeResponse({"results": [], "usage": {"credits": 0}})
+
+        client = tavily.TavilyClient(
+            api_key=["tvly-first", "tvly-second"],
+            sleep=sleeps.append,
+            opener=fake_urlopen,
+        )
+        client.search_product({"model": "PV-42"})
+
+        self.assertEqual("Bearer tvly-first", authorizations[0])
+        self.assertTrue(
+            all(value == "Bearer tvly-second" for value in authorizations[1:])
+        )
+        self.assertEqual([], sleeps)
+
+    def test_all_monthly_quotas_exhausted_is_a_distinct_error(self) -> None:
+        authorizations: list[str | None] = []
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            authorization = request.get_header("Authorization")
+            authorizations.append(authorization)
+            status = 432 if authorization == "Bearer tvly-first" else 433
+            raise urllib.error.HTTPError(
+                "https://api.tavily.com/search",
+                status,
+                "Credit Limit Exceeded",
+                Message(),
+                io.BytesIO(b"{}"),
+            )
+
+        client = tavily.TavilyClient(
+            api_key=["tvly-first", "tvly-second"],
+            opener=fake_urlopen,
+        )
+        with self.assertRaisesRegex(
+            tavily.TavilyQuotaExhaustedError,
+            "monthly quota",
+        ):
+            client.search_product({"model": "PV-42"})
+
+        self.assertEqual(
+            ["Bearer tvly-first", "Bearer tvly-second"],
+            authorizations,
+        )
+
     def test_extract_urls_validates_caps_and_uses_tavily_only(self) -> None:
         seen: list[tuple[object, dict]] = []
 

@@ -105,6 +105,7 @@ class WorkflowTemplateTests(unittest.TestCase):
             "n8n-nodes-base.manualTrigger",
             "n8n-nodes-base.scheduleTrigger",
             "n8n-nodes-base.httpRequest",
+            "n8n-nodes-base.if",
         }
         paths = sorted((DEPLOY / "workflows").glob("*.json"))
         self.assertEqual(2, len(paths))
@@ -159,6 +160,27 @@ class WorkflowTemplateTests(unittest.TestCase):
                 encoding="utf-8"
             )
         )
+        monthly = next(
+            node
+            for node in product["nodes"]
+            if node["name"] == "Monthly Credits Refresh"
+        )
+        monthly_interval = monthly["parameters"]["rule"]["interval"][0]
+        self.assertEqual("cronExpression", monthly_interval["field"])
+        self.assertEqual("5 8 1 * *", monthly_interval["expression"])
+
+        continue_node = next(
+            node
+            for node in product["nodes"]
+            if node["name"] == "Continue While Processed"
+        )
+        condition = continue_node["parameters"]["conditions"]["conditions"][0]
+        self.assertEqual("={{ $json.processed }}", condition["leftValue"])
+        self.assertEqual("true", condition["operator"]["operation"])
+        loop_outputs = product["connections"]["Continue While Processed"]["main"]
+        self.assertEqual("Run One Product", loop_outputs[0][0]["node"])
+        self.assertEqual([], loop_outputs[1])
+
         run_one = next(
             node for node in product["nodes"] if node["name"] == "Run One Product"
         )

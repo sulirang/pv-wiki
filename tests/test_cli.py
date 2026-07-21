@@ -232,6 +232,29 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, after["due"])
         self.assertFalse(after["workAvailable"])
 
+    def test_sync_catalogue_resumes_quota_paused_product(self) -> None:
+        paused_at = datetime.now(timezone.utc)
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("quota-worker", now=paused_at)
+            store.record_outcome(
+                lease,
+                "tavily_quota_exhausted",
+                error="monthly quota exhausted",
+                now=paused_at,
+            )
+
+        reader = mock.Mock()
+        reader.fetch_products.return_value = [product()]
+        with mock.patch.object(cli, "ProductReader", return_value=reader):
+            payload = cli.sync_catalogue()
+
+        self.assertEqual(1, payload["quota_resumed"])
+        self.assertEqual(1, payload["queue"]["due"])
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertEqual(0, current.consecutive_failures)
+
     def test_publish_home_upserts_managed_landing_page(self) -> None:
         with state.StateStore(self.state_path) as store:
             lease = store.lease_next("homepage-test")
@@ -579,6 +602,35 @@ class CLITests(unittest.TestCase):
         tavily_client.assert_not_called()
         ai_client.assert_not_called()
         wiki_client.assert_not_called()
+
+    def test_run_one_stops_cleanly_when_all_tavily_quotas_are_exhausted(self) -> None:
+        search_client = mock.Mock()
+        search_client.search_product.side_effect = (
+            cli.TavilyQuotaExhaustedError("monthly quota exhausted")
+        )
+
+        with (
+            mock.patch.object(cli, "TavilyClient", return_value=search_client),
+            mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
+            mock.patch.object(cli, "WikiJSClient") as wiki_client,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertFalse(payload["published"])
+        self.assertEqual("tavily_quota_exhausted", payload["reason"])
+        resume_at = datetime.fromisoformat(payload["resume_at"])
+        self.assertEqual(1, resume_at.day)
+        self.assertEqual((0, 0, 0), (resume_at.hour, resume_at.minute, resume_at.second))
+        ai_client.assert_not_called()
+        wiki_client.assert_not_called()
+
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("tavily_quota_exhausted", current.last_outcome)
+            self.assertEqual(0, current.consecutive_failures)
+            self.assertEqual(resume_at, current.next_run_at)
 
     def test_run_one_happy_path_uses_configured_ai_and_publishes(self) -> None:
         self.configure_worker_environment()

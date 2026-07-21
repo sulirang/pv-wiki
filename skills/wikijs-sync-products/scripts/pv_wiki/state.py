@@ -250,6 +250,15 @@ def _utc(value: datetime | None = None) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def next_month_start(value: datetime | None = None) -> datetime:
+    """Return the first instant of the next UTC calendar month."""
+
+    current = _utc(value)
+    if current.month == 12:
+        return datetime(current.year + 1, 1, 1, tzinfo=timezone.utc)
+    return datetime(current.year, current.month + 1, 1, tzinfo=timezone.utc)
+
+
 def _time_text(value: datetime) -> str:
     # A fixed-width UTC representation sorts chronologically as SQLite TEXT.
     return _utc(value).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -730,6 +739,23 @@ class StateStore:
                 "SELECT * FROM products WHERE product_id = ?", (str(product_id),)
             ).fetchone()
         return self._product_state(row) if row is not None else None
+
+    def resume_tavily_quota_waits(self, *, now: datetime | None = None) -> int:
+        """Make quota-paused products due after a monthly reset or key change."""
+
+        now_text = _time_text(_utc(now))
+        with self._write_transaction() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE products
+                SET status = 'due', next_run_at = ?, updated_at = ?
+                WHERE status = 'backoff'
+                  AND last_outcome = 'tavily_quota_exhausted'
+                  AND lease_token IS NULL
+                """,
+                (now_text, now_text),
+            )
+        return max(cursor.rowcount, 0)
 
     def list_due(
         self,
@@ -1358,6 +1384,12 @@ class StateStore:
                 next_run = timestamp + timedelta(days=SYNC_REFRESH_DAYS)
                 last_error = None
                 last_success = now_text
+            elif stored_outcome == "tavily_quota_exhausted":
+                failures = int(row["consecutive_failures"])
+                status = "backoff"
+                next_run = next_month_start(timestamp)
+                last_error = error
+                last_success = row["last_success_at"]
             else:
                 failures = int(row["consecutive_failures"]) + 1
                 status = "backoff"

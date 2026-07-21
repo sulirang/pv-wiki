@@ -216,16 +216,25 @@ acceptance is complete.
 The product workflow calls fixed internal endpoints:
 
 ```text
-Schedule/Manual Trigger
+Monthly/Manual Trigger
   → POST /sync-catalogue
   → POST /run-one
+  → IF processed=true, loop to POST /run-one
 ```
 
-The homepage workflow calls `POST /publish-home` daily at 02:35
-Asia/Shanghai, offset from the product trigger. Only idempotent catalogue/home
-calls use bounded HTTP retries; `Run One Product` relies on worker queue
-backoff and the next n8n pulse. There is no shell node and no arbitrary
-request body.
+The monthly product trigger runs at 08:05 Asia/Shanghai (00:05 UTC) on day 1,
+shortly after Tavily's first-day credit reset. The homepage workflow calls
+`POST /publish-home` daily at 02:35 Asia/Shanghai. Only idempotent
+catalogue/home calls use bounded HTTP retries; `Run One Product` relies on
+worker queue backoff and loops only when the response says
+`processed=true`. A no-due result or exhaustion of every configured Tavily
+key ends the loop. There is no shell node and no arbitrary request body.
+
+When the user adds or replaces a Tavily key, update `TAVILY_API_KEYS`, recreate
+the worker so it receives the new environment, and manually start the product
+workflow. Its initial catalogue sync wakes quota-paused products. HTTP 429 is a
+transient request-rate limit; Tavily plan/pay-as-you-go exhaustion uses HTTP
+432/433 and rotates to the next key.
 
 ## 6. Acceptance
 
@@ -236,9 +245,11 @@ Run these checks in order:
 3. `pv-wiki doctor --live` confirms the selected PostgreSQL mode, a read-only
    catalogue transaction, and Wiki.js access. Record any unencrypted-transport
    warning.
-4. Run the product workflow manually for one private/unpublished product at
-   the final prefix. If a different staging prefix is mandatory, use separate
-   worker state and plan an explicit migration.
+4. Run exactly one private/unpublished product directly with
+   `pv-wiki run-one --worker-id manual-acceptance` at the final prefix. Do not
+   start the looping n8n workflow until this check passes. If a different
+   staging prefix is mandatory, use separate worker state and plan an explicit
+   migration.
 5. Confirm exact full model/suffix matching, official datasheet references,
    at least five cited specification facts, no internal family code on the
    page, and no invented review claims.

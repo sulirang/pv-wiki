@@ -2,11 +2,14 @@
 
 ## Runtime ownership
 
-n8n is the only recurring scheduler. `PV Wiki - Product Cycle` runs every four
-hours at minute 05 and calls the internal worker once; `PV Wiki - Homepage
-Refresh` runs daily at 02:35 Asia/Shanghai. The worker processes at most one
-leased product per call.
-Hermes is not part of the steady-state runtime.
+n8n is the only recurring scheduler. `PV Wiki - Product Cycle` starts at
+08:05 Asia/Shanghai (00:05 UTC) on the first day of every month, shortly after
+Tavily's documented first-day credit reset. It calls the worker serially until
+no product is due or every configured Tavily key has exhausted its monthly
+plan/pay-as-you-go allowance. `PV Wiki - Homepage Refresh` runs daily at 02:35
+Asia/Shanghai. The worker still processes at most one leased product per call,
+so every product attempt remains bounded and resumable. Hermes is not part of
+the steady-state runtime.
 
 The worker exposes fixed authenticated HTTP operations and no shell. Keep it
 on the n8n Docker network without a published host port. n8n Execute Command
@@ -16,10 +19,19 @@ mounted.
 ## Cadence and cost
 
 One product cycle uses at most three basic Tavily searches and five advanced
-extract URLs. At the default cadence the system can process at most six
-products per day. A 1,500-product first pass therefore takes roughly eight
-months; this is deliberate. Set provider-side Tavily and AI monthly alerts
-before activating the workflow.
+extract URLs. The default workflow immediately starts the next due product
+after a completed cycle, consuming the available monthly Tavily credits as
+quickly as the serial Search → Extract → AI → Wiki.js path permits. It stops
+without an n8n error when the queue is empty or all keys are out of credits.
+Set provider-side Tavily and AI monthly alerts before activating the workflow.
+
+Tavily HTTP 429 is a short request-rate limit and retains bounded Retry-After
+handling. HTTP 432 (plan limit) and 433 (pay-as-you-go limit) permanently skip
+that key for the current worker call; another configured key is tried
+immediately. When every key is exhausted, the active product is scheduled for
+the first instant of the next UTC month without increasing its failure count,
+and the n8n loop ends. The next monthly catalogue sync, or a manual sync after
+installing a new key, wakes quota-paused products before processing resumes.
 
 Do not enable Tavily Research or automatically increase URL/token limits.
 Escalate a genuinely important source conflict through a supervised run.
@@ -104,6 +116,8 @@ in memory and does not persist source bodies.
 
 Retry behavior:
 
+- all Tavily keys out of monthly credits: first instant of the next UTC month,
+  without increasing the product failure count;
 - no datasheet, ambiguity, or insufficient identity: about 30, 90, then 180
   days;
 - Tavily, AI, Wiki.js, validation, or other transient error: about 1, 6, then
@@ -143,7 +157,8 @@ Run `docker compose --env-file .env -f compose.yaml exec -T n8n n8n audit`
 after installation and upgrades (or the discovered instance's equivalent).
 Review risky nodes, unused credentials, unprotected webhooks, filesystem
 findings, and version findings. The bundled workflows should contain only
-Manual/Schedule Trigger and HTTP Request nodes.
+Manual/Schedule Trigger, HTTP Request, and the boolean IF node that controls the
+serial product loop.
 
 Keep execution pruning enabled. The deployment default retains about 14 days
 (`336` hours); adjust this to the organization's audit/retention policy without
