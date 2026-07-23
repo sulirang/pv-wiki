@@ -9,17 +9,173 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from .config import is_shared_source_hostname
 from .render import validate_public_http_url
 
 
 OUTCOMES = frozenset(
-    {"publish", "no_datasheet", "ambiguous", "insufficient_identity"}
+    {
+        "publish",
+        "no_datasheet",
+        "ambiguous",
+        "insufficient_identity",
+        "out_of_scope",
+    }
 )
 SOURCE_TYPES = frozenset(
     {"manufacturer", "regulatory", "authorized", "mirror", "community"}
 )
 TRUSTED_TYPES = frozenset({"manufacturer", "regulatory", "authorized"})
+_GENERIC_MANUFACTURER_TOKENS = frozenset(
+    {
+        "ag",
+        "advanced",
+        "bv",
+        "clean",
+        "co",
+        "company",
+        "corp",
+        "corporation",
+        "electric",
+        "electronics",
+        "energy",
+        "general",
+        "gmbh",
+        "global",
+        "green",
+        "group",
+        "inc",
+        "industrial",
+        "industries",
+        "international",
+        "limited",
+        "llc",
+        "ltd",
+        "manufacturing",
+        "marketplace",
+        "new",
+        "official",
+        "oy",
+        "power",
+        "products",
+        "renewable",
+        "sa",
+        "services",
+        "smart",
+        "solar",
+        "solutions",
+        "spa",
+        "srl",
+        "systems",
+        "technologies",
+        "technology",
+        "the",
+        "via",
+        "world",
+    }
+)
+_COMMON_COUNTRY_SECOND_LEVELS = frozenset(
+    {"ac", "co", "com", "edu", "gov", "net", "org"}
+)
+_LEGAL_ENTITY_TOKENS = frozenset(
+    {
+        "ag",
+        "bv",
+        "co",
+        "company",
+        "corp",
+        "corporation",
+        "gmbh",
+        "group",
+        "inc",
+        "limited",
+        "llc",
+        "ltd",
+        "oy",
+        "sa",
+        "spa",
+        "srl",
+    }
+)
 _KNOWN_VARIANT_PREFIXES = ("hc",)
+_OUT_OF_SCOPE_ENGLISH_TYPE_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"fasteners?|screws?|bolts?|nuts?|washers?|rivets?|"
+    r"anchors?|nails?|cotter\s+pins?|retaining\s+rings?|"
+    r"hose\s+clamps?|cable\s+ties?|zip\s+ties?|"
+    r"o[\s-]?rings?|gaskets?|consumables?"
+    r")(?!\w)",
+    flags=re.IGNORECASE,
+)
+_OUT_OF_SCOPE_CJK_TYPE_TERMS = (
+    "螺丝",
+    "螺钉",
+    "螺栓",
+    "螺母",
+    "垫圈",
+    "紧固件",
+    "铆钉",
+    "卡箍",
+    "开口销",
+    "挡圈",
+    "扎带",
+    "密封圈",
+    "垫片",
+    "耗材",
+)
+_IN_SCOPE_ENGLISH_TYPE_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"solar|photovoltaic|pv\s+module|solar\s+module|solar\s+panel|"
+    r"inverters?|batter(?:y|ies)|energy\s+storage|heat\s+pumps?|"
+    r"compressors?|chargers?|converters?|power\s+suppl(?:y|ies)"
+    r")(?!\w)",
+    flags=re.IGNORECASE,
+)
+_IN_SCOPE_CJK_TYPE_TERMS = (
+    "光伏",
+    "太阳能组件",
+    "太阳能板",
+    "逆变器",
+    "电池",
+    "储能",
+    "热泵",
+    "压缩机",
+    "充电器",
+    "变流器",
+    "电源",
+)
+_OUT_OF_SCOPE_NEGATION_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"not|isn['’]?t|aren['’]?t"
+    r")(?!\w)",
+    flags=re.IGNORECASE,
+)
+_OUT_OF_SCOPE_ACCESSORY_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"includes?|contains?|uses?|with|supplied\s+with|mounting"
+    r")(?!\w)",
+    flags=re.IGNORECASE,
+)
+_OUT_OF_SCOPE_RELATION_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"product\s*type|item\s*type|category|type|description"
+    r")\s*[:=\-]\s*.{0,80}(?:"
+    r"fasteners?|screws?|bolts?|nuts?|washers?|rivets?|"
+    r"anchors?|nails?|cotter\s+pins?|retaining\s+rings?|"
+    r"hose\s+clamps?|cable\s+ties?|zip\s+ties?|"
+    r"o[\s-]?rings?|gaskets?|consumables?"
+    r")(?!\w)",
+    flags=re.IGNORECASE,
+)
+_OUT_OF_SCOPE_IS_A_RELATION_RE = re.compile(
+    r"(?<!\w)(?:is|are)\s+(?:an?\s+)?(?:"
+    r"fasteners?|screws?|bolts?|nuts?|washers?|rivets?|"
+    r"anchors?|nails?|cotter\s+pins?|retaining\s+rings?|"
+    r"hose\s+clamps?|cable\s+ties?|zip\s+ties?|"
+    r"o[\s-]?rings?|gaskets?|consumables?"
+    r")(?!\w)",
+    flags=re.IGNORECASE,
+)
 _EXPLICIT_REVISION_SUFFIX_PATTERN = (
     r"(?:"
     r"(?:[^\w\r\n]|_)+"
@@ -62,6 +218,8 @@ _TOP_LEVEL = frozenset(
         "summary",
         "review_summary",
         "review_evidence_urls",
+        "classification_evidence_urls",
+        "classification_evidence_quotes",
         "decision_notes",
         "datasheets",
         "sources",
@@ -73,6 +231,10 @@ _TOP_LEVEL = frozenset(
 
 class DecisionError(ValueError):
     """Raised when an AI decision proposal is incomplete or unsafe to apply."""
+
+
+class SourceVerificationError(DecisionError):
+    """Raised when publication evidence cannot verify its claimed authority."""
 
 
 def canonical_product_category(value: str) -> str:
@@ -317,6 +479,145 @@ def _url_has_trusted_domain(url: str, trusted_domains: frozenset[str]) -> bool:
     )
 
 
+def _manufacturer_tokens(manufacturer: str) -> tuple[str, ...]:
+    normalized = unicodedata.normalize("NFKC", manufacturer).casefold()
+    tokens = [
+        identity_key(token)
+        for token in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+    ]
+    meaningful = [
+        token
+        for token in tokens
+        if len(token) >= 2 and token not in _GENERIC_MANUFACTURER_TOKENS
+    ]
+    return tuple(dict.fromkeys(meaningful))
+
+
+def _registrable_domain_label(hostname: str) -> str:
+    if is_shared_source_hostname(hostname):
+        return ""
+    labels = [
+        label
+        for label in hostname.rstrip(".").casefold().split(".")
+        if label
+    ]
+    if len(labels) < 2:
+        return ""
+    if (
+        len(labels) >= 3
+        and len(labels[-1]) == 2
+        and labels[-2] in _COMMON_COUNTRY_SECOND_LEVELS
+    ):
+        return labels[-3]
+    return labels[-2]
+
+
+def _manufacturer_matches_domain(manufacturer: str, url: str) -> bool:
+    hostname = urlsplit(url).hostname or ""
+    domain_label = _registrable_domain_label(hostname)
+    normalized = unicodedata.normalize("NFKC", manufacturer).casefold()
+    domain_tokens: list[str] = []
+    for raw_token in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE):
+        token = identity_key(raw_token)
+        if len(token) >= 2 and token not in _LEGAL_ENTITY_TOKENS:
+            domain_tokens.append(token)
+    meaningful_tokens = set(_manufacturer_tokens(manufacturer))
+    if not domain_label or not domain_tokens or not meaningful_tokens:
+        return False
+    prefix_candidates = {
+        "".join(domain_tokens[:index])
+        for index in range(1, len(domain_tokens) + 1)
+        if any(
+            token in meaningful_tokens for token in domain_tokens[:index]
+        )
+    }
+    hyphenated_prefix_candidates = {
+        "-".join(domain_tokens[:index])
+        for index in range(1, len(domain_tokens) + 1)
+        if any(
+            token in meaningful_tokens for token in domain_tokens[:index]
+        )
+    }
+    return domain_label in (
+        prefix_candidates | hyphenated_prefix_candidates | meaningful_tokens
+    )
+
+
+def _body_supports_manufacturer_identity(
+    body: str,
+    *,
+    manufacturer_tokens: tuple[str, ...],
+    expected_product_name: str,
+) -> bool:
+    body_tokens = {
+        identity_key(token)
+        for token in re.findall(
+            r"[^\W_]+",
+            unicodedata.normalize("NFKC", body).casefold(),
+            flags=re.UNICODE,
+        )
+    }
+    return text_contains_exact_identity(expected_product_name, body) and all(
+        token in body_tokens for token in manufacturer_tokens
+    )
+
+
+def _auto_verified_manufacturer_urls(
+    items: list[dict[str, Any]],
+    *,
+    manufacturer: str,
+    expected_product_name: str,
+    evidence_body_by_url: Mapping[str, str],
+) -> set[str]:
+    """Verify obvious official manufacturer hosts without a maintained map.
+
+    The model proposes source types, but it cannot authorize an arbitrary host:
+    the candidate must use HTTPS on a non-shared organization host, its
+    registrable label must exactly match a manufacturer-derived label, its
+    extract must contain every meaningful manufacturer token and the complete
+    catalogue model identity, and a second extracted organization must
+    independently corroborate that same identity.
+    """
+
+    manufacturer_tokens = _manufacturer_tokens(manufacturer)
+    if not manufacturer_tokens:
+        return set()
+    corroborating_labels = {
+        _registrable_domain_label(urlsplit(url).hostname or "")
+        for url, body in evidence_body_by_url.items()
+        if (
+            urlsplit(url).scheme.casefold() == "https"
+            and _body_supports_manufacturer_identity(
+                body,
+                manufacturer_tokens=manufacturer_tokens,
+                expected_product_name=expected_product_name,
+            )
+        )
+    }
+    corroborating_labels.discard("")
+    verified: set[str] = set()
+    for item in items:
+        url = item["url"]
+        body = evidence_body_by_url.get(url, "")
+        parsed = urlsplit(url)
+        candidate_label = _registrable_domain_label(parsed.hostname or "")
+        if (
+            item["source_type"] == "manufacturer"
+            and parsed.scheme.casefold() == "https"
+            and _manufacturer_matches_domain(manufacturer, url)
+            and _body_supports_manufacturer_identity(
+                body,
+                manufacturer_tokens=manufacturer_tokens,
+                expected_product_name=expected_product_name,
+            )
+            and any(
+                label != candidate_label for label in corroborating_labels
+            )
+        ):
+            verified.add(url)
+    return verified
+
+
 def _fact_value_present(value: Any, unit: str, normalized_body: str) -> bool:
     value_key = identity_key(str(value))
     unit_key = identity_key(unit)
@@ -345,6 +646,105 @@ def _quote_supports_fact(
         and _fact_value_present(value, unit, quote_key)
         and text_contains_exact_identity(expected_product_name, quote)
         and not text_contains_competing_identity(expected_product_name, quote)
+    )
+
+
+def _quote_supports_out_of_scope(
+    quote: str,
+    *,
+    expected_product_name: str,
+    body: str,
+) -> bool:
+    normalized_quote = re.sub(
+        r"\s+",
+        " ",
+        unicodedata.normalize("NFKC", quote).casefold(),
+    ).strip()
+    normalized_body = re.sub(
+        r"\s+",
+        " ",
+        unicodedata.normalize("NFKC", body).casefold(),
+    ).strip()
+    has_explicit_type = (
+        _OUT_OF_SCOPE_ENGLISH_TYPE_RE.search(normalized_quote) is not None
+        or any(
+            term in normalized_quote
+            for term in _OUT_OF_SCOPE_CJK_TYPE_TERMS
+        )
+    )
+    expected_type_is_explicit = (
+        _OUT_OF_SCOPE_ENGLISH_TYPE_RE.search(expected_product_name) is not None
+        or any(
+            term in expected_product_name
+            for term in _OUT_OF_SCOPE_CJK_TYPE_TERMS
+        )
+    )
+    has_in_scope_type = (
+        _IN_SCOPE_ENGLISH_TYPE_RE.search(normalized_quote) is not None
+        or any(term in normalized_quote for term in _IN_SCOPE_CJK_TYPE_TERMS)
+    )
+    has_negation_language = (
+        _OUT_OF_SCOPE_NEGATION_RE.search(normalized_quote) is not None
+        or "不是" in normalized_quote
+        or "并非" in normalized_quote
+    )
+    has_accessory_language = (
+        _OUT_OF_SCOPE_ACCESSORY_RE.search(normalized_quote) is not None
+        or "包含" in normalized_quote
+        or "配有" in normalized_quote
+        or "使用" in normalized_quote
+    )
+    has_quoted_relation = (
+        _OUT_OF_SCOPE_RELATION_RE.search(normalized_quote) is not None
+        or _OUT_OF_SCOPE_IS_A_RELATION_RE.search(normalized_quote) is not None
+        or (
+            any(
+                marker in normalized_quote
+                for marker in ("类型：", "类型:", "类别：", "类别:", "属于")
+            )
+            and any(
+                term in normalized_quote
+                for term in _OUT_OF_SCOPE_CJK_TYPE_TERMS
+            )
+        )
+    )
+    has_explicit_relation = expected_type_is_explicit or has_quoted_relation
+    return (
+        len(normalized_quote) >= 8
+        and normalized_quote in normalized_body
+        and has_explicit_type
+        and has_explicit_relation
+        and (has_quoted_relation or not has_in_scope_type)
+        and (has_quoted_relation or not has_accessory_language)
+        and not has_negation_language
+        and text_contains_exact_identity(expected_product_name, quote)
+        and not text_contains_competing_identity(expected_product_name, quote)
+    )
+
+
+def _decision_identifies_generic_hardware(
+    *,
+    model: str,
+    product_category: str,
+    summary: str,
+) -> bool:
+    """Return whether identity-bearing fields describe commodity hardware."""
+
+    if any(
+        _OUT_OF_SCOPE_ENGLISH_TYPE_RE.search(value) is not None
+        or any(term in value for term in _OUT_OF_SCOPE_CJK_TYPE_TERMS)
+        for value in (model, product_category)
+    ):
+        return True
+    normalized_summary = re.sub(
+        r"\s+",
+        " ",
+        unicodedata.normalize("NFKC", summary).casefold(),
+    ).strip()
+    return (
+        _OUT_OF_SCOPE_RELATION_RE.search(normalized_summary) is not None
+        and _OUT_OF_SCOPE_ACCESSORY_RE.search(normalized_summary) is None
+        and _OUT_OF_SCOPE_NEGATION_RE.search(normalized_summary) is None
     )
 
 
@@ -379,9 +779,11 @@ def validate_decision(
     minimum_fact_confidence: float = 0.8,
     mirrors_allowed: bool = False,
     allowed_evidence_urls: set[str] | None = None,
+    allowed_classification_urls: set[str] | None = None,
     trusted_source_domains: set[str] | frozenset[str] | None = None,
     expected_product_name: str | None = None,
     evidence_text_by_url: Mapping[str, str] | None = None,
+    classification_text_by_url: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return a normalized decision or reject it before any Wiki mutation."""
 
@@ -424,15 +826,6 @@ def validate_decision(
         if not isinstance(item.get("is_primary"), bool):
             raise DecisionError(f"datasheets[{index}].is_primary must be boolean")
         url = validate_public_url(item.get("url"), f"datasheets[{index}].url")
-        if (
-            outcome == "publish"
-            and source_type in TRUSTED_TYPES
-            and not _url_has_trusted_domain(url, trusted_domains)
-        ):
-            raise DecisionError(
-                f"datasheets[{index}] claims a trusted source type for "
-                "a domain not approved by the operator"
-            )
         datasheets.append(
             {
                 "url": url,
@@ -455,15 +848,6 @@ def validate_decision(
         if source_type not in SOURCE_TYPES:
             raise DecisionError(f"sources[{index}].source_type is invalid")
         url = validate_public_url(item.get("url"), f"sources[{index}].url")
-        if (
-            outcome == "publish"
-            and source_type in TRUSTED_TYPES
-            and not _url_has_trusted_domain(url, trusted_domains)
-        ):
-            raise DecisionError(
-                f"sources[{index}] claims a trusted source type for "
-                "a domain not approved by the operator"
-            )
         sources.append(
             {
                 "url": url,
@@ -484,6 +868,89 @@ def validate_decision(
         if undeclared:
             raise DecisionError("decision cites URLs not extracted for this lease")
 
+    classification_evidence_raw = raw.get("classification_evidence_urls", [])
+    if (
+        not isinstance(classification_evidence_raw, list)
+        or len(classification_evidence_raw) > 5
+    ):
+        raise DecisionError(
+            "classification_evidence_urls must be an array of at most 5 URLs"
+        )
+    classification_evidence_urls = [
+        validate_public_url(url, "classification_evidence_urls")
+        for url in classification_evidence_raw
+    ]
+    if len(set(classification_evidence_urls)) != len(classification_evidence_urls):
+        raise DecisionError("classification_evidence_urls must be unique")
+    if allowed_classification_urls is not None:
+        normalized_classification_urls = {
+            validate_public_url(url, "allowed_classification_urls")
+            for url in allowed_classification_urls
+        }
+        if not set(classification_evidence_urls) <= normalized_classification_urls:
+            raise DecisionError(
+                "classification evidence must come from this lease's extracts"
+            )
+
+    normalized_classification_text: dict[str, str] = {}
+    if classification_text_by_url is not None:
+        if (
+            not isinstance(classification_text_by_url, Mapping)
+            or len(classification_text_by_url) > 5
+        ):
+            raise DecisionError(
+                "classification_text_by_url must map at most 5 URLs to extracted text"
+            )
+        for raw_url, body in classification_text_by_url.items():
+            url = validate_public_url(raw_url, "classification_text_by_url")
+            if not isinstance(body, str) or not body.strip() or len(body) > 200_000:
+                raise DecisionError(
+                    "classification_text_by_url values must be bounded non-empty strings"
+                )
+            normalized_classification_text[url] = body
+
+    classification_quotes_raw = raw.get(
+        "classification_evidence_quotes",
+        [],
+    )
+    if (
+        not isinstance(classification_quotes_raw, list)
+        or len(classification_quotes_raw) > 5
+    ):
+        raise DecisionError(
+            "classification_evidence_quotes must be an array of at most 5 entries"
+        )
+    classification_evidence_quotes: list[dict[str, str]] = []
+    for index, quote_item in enumerate(classification_quotes_raw):
+        if not isinstance(quote_item, Mapping):
+            raise DecisionError(
+                f"classification_evidence_quotes[{index}] must be an object"
+            )
+        if set(quote_item) != {"url", "quote"}:
+            raise DecisionError(
+                f"classification_evidence_quotes[{index}] must contain only "
+                "url and quote"
+            )
+        quote_url = validate_public_url(
+            quote_item.get("url"),
+            f"classification_evidence_quotes[{index}].url",
+        )
+        quote = _text(
+            quote_item.get("quote"),
+            f"classification_evidence_quotes[{index}].quote",
+            required=True,
+            limit=500,
+        )
+        if quote_url not in classification_evidence_urls:
+            raise DecisionError(
+                "classification evidence quote URLs must also appear in "
+                "classification_evidence_urls"
+            )
+        classification_evidence_quotes.append(
+            {"url": quote_url, "quote": quote}
+        )
+
+    evidence_body_by_url: dict[str, str] = {}
     normalized_evidence_text: dict[str, str] = {}
     if evidence_text_by_url is not None:
         if not isinstance(evidence_text_by_url, Mapping) or len(evidence_text_by_url) > 5:
@@ -504,12 +971,22 @@ def validate_decision(
                     "publish evidence must contain the complete catalogue "
                     "model identity"
                 )
+            evidence_body_by_url[url] = body
             normalized_evidence_text[url] = identity_key(body)
 
     summary = _text(raw.get("summary"), "summary", limit=2000)
+    manufacturer = _text(raw.get("manufacturer"), "manufacturer", limit=300)
+    model = _text(raw.get("model"), "model", limit=300)
     product_category = canonical_product_category(
         _text(raw.get("product_category"), "product_category", limit=100)
     )
+    auto_verified_urls = _auto_verified_manufacturer_urls(
+        datasheets + sources,
+        manufacturer=manufacturer,
+        expected_product_name=expected_product_name or "",
+        evidence_body_by_url=evidence_body_by_url,
+    )
+
     review_summary = _text(
         raw.get("review_summary"), "review_summary", limit=1500
     )
@@ -704,6 +1181,58 @@ def validate_decision(
     if disputed_facts:
         raise DecisionError("conflicted fields must not also appear as verified facts")
 
+    if outcome == "out_of_scope":
+        if confidence < minimum_confidence:
+            raise DecisionError(
+                "out_of_scope confidence is below the configured threshold"
+            )
+        if not product_category:
+            raise DecisionError("out_of_scope requires a public product_category")
+        if not summary:
+            raise DecisionError("out_of_scope requires a short classification summary")
+        if not classification_evidence_urls:
+            raise DecisionError(
+                "out_of_scope requires extracted classification evidence"
+            )
+        if not classification_evidence_quotes:
+            raise DecisionError(
+                "out_of_scope requires an exact hardware-type classification quote"
+            )
+        if any(
+            (
+                datasheets,
+                sources,
+                facts,
+                normalized_conflicts,
+                review_summary,
+                review_evidence_urls,
+            )
+        ):
+            raise DecisionError(
+                "out_of_scope must not contain publication or review evidence"
+            )
+        if not any(
+            url in normalized_classification_text
+            and text_contains_exact_identity(
+                expected_product_name or "",
+                normalized_classification_text[url],
+            )
+            for url in classification_evidence_urls
+        ):
+            raise DecisionError(
+                "out_of_scope evidence must contain the complete catalogue identity"
+            )
+        for index, item in enumerate(classification_evidence_quotes):
+            if not _quote_supports_out_of_scope(
+                item["quote"],
+                expected_product_name=expected_product_name or "",
+                body=normalized_classification_text.get(item["url"], ""),
+            ):
+                raise DecisionError(
+                    f"classification_evidence_quotes[{index}] is not a "
+                    "contiguous target-model hardware-type quote from the extract"
+                )
+
     if outcome == "publish":
         if confidence < minimum_confidence:
             raise DecisionError("publish confidence is below the configured threshold")
@@ -714,10 +1243,20 @@ def validate_decision(
             )
         if not summary:
             raise DecisionError("publish requires a user-facing product summary")
+        if not manufacturer:
+            raise DecisionError("publish requires a discovered manufacturer")
+        if _decision_identifies_generic_hardware(
+            model=model,
+            product_category=product_category,
+            summary=summary,
+        ):
+            raise DecisionError(
+                "publish cannot classify the catalogue product as generic "
+                "hardware; return out_of_scope with exact classification "
+                "evidence"
+            )
         expected_identity = identity_key(expected_product_name or "")
-        proposed_identity = identity_key(
-            _text(raw.get("model"), "model", required=True, limit=300)
-        )
+        proposed_identity = identity_key(model)
         if not expected_identity or proposed_identity != expected_identity:
             raise DecisionError(
                 "publish model does not exactly match the catalogue product name"
@@ -729,12 +1268,19 @@ def validate_decision(
         primary = [item for item in datasheets if item["is_primary"]]
         if not primary:
             raise DecisionError("publish requires a primary datasheet")
-        trusted_primary = [
+        configured_primary = [
             item
             for item in primary
             if item["source_type"] in TRUSTED_TYPES
             and _url_has_trusted_domain(item["url"], trusted_domains)
         ]
+        auto_primary = [
+            item
+            for item in primary
+            if item["source_type"] == "manufacturer"
+            and item["url"] in auto_verified_urls
+        ]
+        trusted_primary = configured_primary + auto_primary
         if not trusted_primary:
             mirror_domains = {
                 ".".join((urlsplit(item["url"]).hostname or "").split(".")[-2:])
@@ -747,25 +1293,54 @@ def validate_decision(
                 or len(mirror_domains) < 2
                 or any(item["source_type"] != "mirror" for item in primary)
             ):
-                raise DecisionError(
-                    "primary datasheet needs a trusted source or two enabled independent mirrors"
+                raise SourceVerificationError(
+                    "primary datasheet needs an automatically verified manufacturer "
+                    "source, a configured domain override, or two enabled independent "
+                    "mirrors"
                 )
-        trusted_fact_urls = {
+        configured_fact_urls = {
             item["url"]
             for item in datasheets + sources
             if item["source_type"] in TRUSTED_TYPES
             and _url_has_trusted_domain(item["url"], trusted_domains)
         }
+        auto_fact_urls = {
+            item["url"]
+            for item in datasheets + sources
+            if item["source_type"] == "manufacturer"
+            and item["url"] in auto_verified_urls
+        }
         for index, fact in enumerate(facts):
             quoted_urls = {
                 item["url"] for item in fact["evidence_quotes"]
             }
-            if trusted_primary:
-                trusted_evidence = quoted_urls & trusted_fact_urls
+            if configured_primary:
+                trusted_evidence = quoted_urls & configured_fact_urls
                 if not trusted_evidence:
-                    raise DecisionError(
-                        f"facts[{index}] needs evidence from an "
-                        "operator-approved trusted domain"
+                    raise SourceVerificationError(
+                        f"facts[{index}] needs evidence from an automatically "
+                        "verified manufacturer source or configured domain override"
+                    )
+            elif auto_primary:
+                automatic_evidence = quoted_urls & auto_fact_urls
+                quoted_organization_labels = {
+                    _registrable_domain_label(urlsplit(url).hostname or "")
+                    for url in quoted_urls
+                    if source_types_by_url.get(url) != "community"
+                    and urlsplit(url).scheme.casefold() == "https"
+                }
+                automatic_labels = {
+                    _registrable_domain_label(urlsplit(url).hostname or "")
+                    for url in automatic_evidence
+                }
+                if not automatic_evidence or not any(
+                    label and label not in automatic_labels
+                    for label in quoted_organization_labels
+                ):
+                    raise SourceVerificationError(
+                        f"facts[{index}] needs exact quotes from both the "
+                        "automatically verified manufacturer candidate and a "
+                        "second independent non-community domain"
                     )
             else:
                 matching_mirror_domains = {
@@ -785,12 +1360,14 @@ def validate_decision(
         "lease_token": lease_token,
         "outcome": outcome,
         "confidence": confidence,
-        "manufacturer": _text(raw.get("manufacturer"), "manufacturer", limit=300),
-        "model": _text(raw.get("model"), "model", limit=300),
+        "manufacturer": manufacturer,
+        "model": model,
         "product_category": product_category,
         "summary": summary,
         "review_summary": review_summary,
         "review_evidence_urls": review_evidence_urls,
+        "classification_evidence_urls": classification_evidence_urls,
+        "classification_evidence_quotes": classification_evidence_quotes,
         "decision_notes": _text(
             raw.get("decision_notes"), "decision_notes", required=True, limit=1000
         ),
@@ -803,6 +1380,7 @@ def validate_decision(
 
 __all__ = [
     "DecisionError",
+    "SourceVerificationError",
     "canonical_product_category",
     "identity_key",
     "text_contains_competing_identity",

@@ -2,14 +2,18 @@
 
 SQLite owns only orchestration state; the PostgreSQL catalogue remains the
 source of truth.  Every mutating scheduler operation uses ``BEGIN IMMEDIATE``
-so two workers can safely share the same state database.
+to prevent duplicate product claims at the lease layer. The supported HTTP
+deployment remains one worker process because publication fences are
+process-local.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import re
 import sqlite3
 import urllib.parse
 import uuid
@@ -23,9 +27,66 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 BACKOFF_DAYS = (30, 90, 180)
 TRANSIENT_BACKOFF_HOURS = (1, 6, 24)
+INVALID_DECISION_BACKOFF_HOURS = (24, 72, 168, 720)
+SOURCE_VERIFICATION_BACKOFF_DAYS = (7, 30, 90, 365)
+RESEARCH_ACTION_STATUSES = (
+    "started",
+    "completed",
+    "failed",
+    "uncertain",
+)
+RESEARCH_ACTIONS = frozenset({"search", "extract", "ai"})
+MAX_RESEARCH_ACTION_NAME_LENGTH = 64
+MAX_RESEARCH_RESULT_SUMMARY_BYTES = 32 * 1024
+MAX_RESEARCH_ACTION_ERROR_LENGTH = 1000
+MAX_RESEARCH_ROUNDS = 3
+MAX_RESEARCH_TOTAL_QUERIES = 7
+MAX_RESEARCH_TOTAL_URLS = 5
+MAX_RESEARCH_TOTAL_CREDITS = 100.0
+MAX_LEGACY_SEARCH_QUERIES = 3
+_RESEARCH_ACTION_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
+_RESEARCH_SUMMARY_BODY_KEYS = frozenset(
+    {
+        "body",
+        "content",
+        "document",
+        "evidence_text",
+        "html",
+        "markdown",
+        "prompt",
+        "quote",
+        "raw_content",
+        "response",
+        "text",
+    }
+)
+_RESEARCH_SUMMARY_BODY_KEYS_COLLAPSED = frozenset(
+    key.replace("_", "") for key in _RESEARCH_SUMMARY_BODY_KEYS
+)
+_RESEARCH_AI_ACTION_TYPES = frozenset({"final", "search_more"})
+_RESEARCH_AI_GAPS = frozenset(
+    {
+        "manufacturer_identity",
+        "primary_datasheet",
+        "independent_corroboration",
+        "missing_exact_fact",
+        "conflict_resolution",
+        "scope_classification",
+    }
+)
+_RESEARCH_AI_OUTCOMES = frozenset(
+    {
+        "",
+        "publish",
+        "no_datasheet",
+        "ambiguous",
+        "insufficient_identity",
+        "out_of_scope",
+    }
+)
 TRANSIENT_OUTCOMES = frozenset(
     {
         "tavily_error",
@@ -33,7 +94,6 @@ TRANSIENT_OUTCOMES = frozenset(
         "wikijs_error",
         "error",
         "lease_expired",
-        "invalid_decision",
         "configuration_error",
         "publish_error",
     }
@@ -107,6 +167,47 @@ _CREATE_SCHEMA = (
     """
     CREATE INDEX IF NOT EXISTS attempts_product_idx
         ON attempts(product_id, attempt_id)
+    """,
+)
+
+_CREATE_RESEARCH_ACTION_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS research_actions (
+        action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attempt_id INTEGER NOT NULL
+            REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+        round_number INTEGER NOT NULL CHECK (round_number >= 0),
+        action TEXT NOT NULL
+            CHECK (length(action) BETWEEN 1 AND 64),
+        status TEXT NOT NULL
+            CHECK (status IN ('started', 'completed', 'failed', 'uncertain')),
+        request_fingerprint TEXT NOT NULL
+            CHECK (
+                length(request_fingerprint) = 64
+                AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        result_summary_json TEXT,
+        credits REAL
+            CHECK (credits IS NULL OR credits >= 0),
+        error TEXT,
+        CHECK (
+            (status = 'started' AND finished_at IS NULL)
+            OR
+            (status <> 'started' AND finished_at IS NOT NULL)
+        ),
+        UNIQUE (attempt_id, round_number, action),
+        UNIQUE (attempt_id, action, request_fingerprint)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS research_actions_attempt_idx
+        ON research_actions(attempt_id, round_number, action)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS research_actions_status_idx
+        ON research_actions(status, action)
     """,
 )
 
@@ -233,6 +334,33 @@ class AttemptRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ResearchActionRecord:
+    """One at-most-once paid or externally visible research action."""
+
+    action_id: int
+    attempt_id: int
+    product_id: str
+    round_number: int
+    action: str
+    status: str
+    request_fingerprint: str
+    scope_fingerprint: str | None
+    started_at: datetime
+    finished_at: datetime | None
+    result_summary: Any
+    credits: float | None
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchActionStartResult:
+    """Return an action record and whether the caller may execute it."""
+
+    record: ResearchActionRecord
+    should_execute: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PublishedProduct:
     """The latest successful Wiki publication metadata for one product."""
 
@@ -307,6 +435,347 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _research_action_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("research action must be a string")
+    action = value.strip().casefold()
+    if not _RESEARCH_ACTION_PATTERN.fullmatch(action):
+        raise ValueError(
+            "research action must be a lowercase identifier of at most "
+            f"{MAX_RESEARCH_ACTION_NAME_LENGTH} characters"
+        )
+    if action not in RESEARCH_ACTIONS:
+        raise ValueError(
+            "research action must be one of: ai, extract, search"
+        )
+    return action
+
+
+def _research_round_number(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("round_number must be an integer")
+    if not 0 <= value < MAX_RESEARCH_ROUNDS:
+        raise ValueError(
+            f"round_number must be between 0 and {MAX_RESEARCH_ROUNDS - 1}"
+        )
+    return value
+
+
+def _research_request_fingerprint(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("request_fingerprint must be a string")
+    fingerprint = value.strip().casefold()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise ValueError("request_fingerprint must be a SHA-256 hex digest")
+    return fingerprint
+
+
+def research_request_fingerprint(action: str, request: Any) -> str:
+    """Hash a paid action request without persisting its potentially sensitive body."""
+
+    normalized_action = _research_action_name(action)
+    payload = _canonical_json(
+        {
+            "action": normalized_action,
+            "request": request,
+        }
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _research_credits(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise TypeError("credits must be a number")
+    credits = float(value)
+    if not math.isfinite(credits) or credits < 0:
+        raise ValueError("credits must be finite and non-negative")
+    return credits
+
+
+def _research_error(value: Any, *, required: bool) -> str | None:
+    if value is None:
+        if required:
+            raise ValueError("failed or uncertain research actions need an error")
+        return None
+    if not isinstance(value, str):
+        raise TypeError("research action error must be a string")
+    error = " ".join(value.split())
+    if required and not error:
+        raise ValueError("failed or uncertain research actions need an error")
+    if len(error) > MAX_RESEARCH_ACTION_ERROR_LENGTH:
+        raise ValueError(
+            "research action error exceeds "
+            f"{MAX_RESEARCH_ACTION_ERROR_LENGTH} characters"
+        )
+    return error or None
+
+
+def _reject_research_bodies(value: Any) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            separated_key = re.sub(
+                r"(?<=[a-z0-9])(?=[A-Z])",
+                "_",
+                str(key),
+            )
+            normalized_key = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                separated_key.casefold(),
+            ).strip("_")
+            collapsed_key = normalized_key.replace("_", "")
+            if (
+                normalized_key in _RESEARCH_SUMMARY_BODY_KEYS
+                or collapsed_key in _RESEARCH_SUMMARY_BODY_KEYS_COLLAPSED
+                or any(
+                    token in _RESEARCH_SUMMARY_BODY_KEYS
+                    or token.replace("_", "")
+                    in _RESEARCH_SUMMARY_BODY_KEYS_COLLAPSED
+                    for token in normalized_key.split("_")
+                )
+            ):
+                raise ValueError(
+                    "research result summaries cannot persist response bodies "
+                    f"or evidence text ({key!r})"
+                )
+            _reject_research_bodies(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_research_bodies(item)
+
+
+def _bounded_summary_strings(
+    value: Any,
+    *,
+    name: str,
+    maximum: int,
+    item_limit: int,
+) -> list[str]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise TypeError(f"{name} must be an array of strings")
+    if len(value) > maximum:
+        raise ValueError(f"{name} may contain at most {maximum} items")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError(f"{name} must be an array of strings")
+        normalized = " ".join(item.split())
+        if not normalized or len(normalized) > item_limit:
+            raise ValueError(
+                f"{name} items must contain 1-{item_limit} characters"
+            )
+        result.append(normalized)
+    return result
+
+
+def _bounded_summary_text(
+    value: Any,
+    *,
+    name: str,
+    maximum: int,
+    allowed: frozenset[str] | None = None,
+) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    normalized = " ".join(value.split())
+    if len(normalized) > maximum:
+        raise ValueError(f"{name} must contain at most {maximum} characters")
+    if allowed is not None and normalized not in allowed:
+        raise ValueError(f"{name} contains an unsupported value")
+    return normalized
+
+
+def _bounded_summary_count(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if not 0 <= value <= 100:
+        raise ValueError(f"{name} must be between 0 and 100")
+    return value
+
+
+def _bounded_summary_credits(value: Any, *, name: str) -> int | float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0 <= float(value) <= MAX_RESEARCH_TOTAL_CREDITS
+    ):
+        raise ValueError(
+            f"{name} must be a finite number between 0 and "
+            f"{MAX_RESEARCH_TOTAL_CREDITS:g}"
+        )
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
+def _research_result_summary_json(
+    action: str,
+    value: Any,
+    *,
+    require_successful_urls: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("research result_summary must be a mapping")
+    summary = dict(value)
+    _reject_research_bodies(summary)
+    allowed_fields = {
+        "search": frozenset(
+            {
+                "queries",
+                "candidate_urls",
+                "request_ids",
+                "provider_requests",
+                "completed_provider_requests",
+                "known_partial_credits",
+            }
+        ),
+        "extract": frozenset(
+            {
+                "submitted_urls",
+                "successful_urls",
+                "provider_requests",
+                "completed_provider_requests",
+                "known_partial_credits",
+            }
+        ),
+        "ai": frozenset(
+            {
+                "action_type",
+                "gap",
+                "queries",
+                "outcome",
+                "manufacturer",
+                "provider_requests",
+                "provider_fingerprint",
+                "http_status",
+                "error_type",
+            }
+        ),
+    }[action]
+    unsupported = set(summary) - allowed_fields
+    if unsupported:
+        raise ValueError(
+            "research result_summary contains unsupported fields: "
+            + ", ".join(sorted(str(field) for field in unsupported))
+        )
+    if "queries" in summary:
+        summary["queries"] = _bounded_summary_strings(
+            summary["queries"],
+            name="queries",
+            maximum=3,
+            item_limit=400,
+        )
+    if "request_ids" in summary:
+        summary["request_ids"] = _bounded_summary_strings(
+            summary["request_ids"],
+            name="request_ids",
+            maximum=20,
+            item_limit=200,
+        )
+    if "candidate_urls" in summary:
+        summary["candidate_urls"] = _canonical_urls(
+            summary["candidate_urls"],
+            maximum=20,
+        )
+    if "submitted_urls" in summary:
+        summary["submitted_urls"] = _canonical_urls(
+            summary["submitted_urls"],
+            maximum=5,
+            require_nonempty=True,
+        )
+    if "successful_urls" in summary:
+        summary["successful_urls"] = _canonical_urls(
+            summary["successful_urls"],
+            maximum=5,
+        )
+    for field in ("provider_requests", "completed_provider_requests"):
+        if field in summary:
+            summary[field] = _bounded_summary_count(
+                summary[field],
+                name=field,
+            )
+    if "known_partial_credits" in summary:
+        summary["known_partial_credits"] = _bounded_summary_credits(
+            summary["known_partial_credits"],
+            name="known_partial_credits",
+        )
+    if "action_type" in summary:
+        summary["action_type"] = _bounded_summary_text(
+            summary["action_type"],
+            name="action_type",
+            maximum=20,
+            allowed=_RESEARCH_AI_ACTION_TYPES,
+        )
+    if "gap" in summary:
+        summary["gap"] = _bounded_summary_text(
+            summary["gap"],
+            name="gap",
+            maximum=50,
+            allowed=_RESEARCH_AI_GAPS,
+        )
+    if "outcome" in summary:
+        summary["outcome"] = _bounded_summary_text(
+            summary["outcome"],
+            name="outcome",
+            maximum=100,
+            allowed=_RESEARCH_AI_OUTCOMES,
+        )
+    if "manufacturer" in summary:
+        summary["manufacturer"] = _bounded_summary_text(
+            summary["manufacturer"],
+            name="manufacturer",
+            maximum=300,
+        )
+    if "provider_fingerprint" in summary:
+        summary["provider_fingerprint"] = _research_request_fingerprint(
+            summary["provider_fingerprint"]
+        )
+    if "http_status" in summary:
+        status = summary["http_status"]
+        if (
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or not 100 <= status <= 599
+        ):
+            raise ValueError("http_status must be between 100 and 599")
+    if "error_type" in summary:
+        error_type = summary["error_type"]
+        if (
+            not isinstance(error_type, str)
+            or re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_]{0,99}",
+                error_type,
+            )
+            is None
+        ):
+            raise ValueError("error_type must be a bounded class name")
+    if (
+        action == "extract"
+        and require_successful_urls
+        and "successful_urls" not in summary
+    ):
+        raise ValueError(
+            "extract result_summary must include successful_urls"
+        )
+    if (
+        action == "extract"
+        and require_successful_urls
+        and "submitted_urls" not in summary
+    ):
+        raise ValueError(
+            "extract result_summary must include submitted_urls"
+        )
+    serialized = _canonical_json(summary)
+    if len(serialized.encode("utf-8")) > MAX_RESEARCH_RESULT_SUMMARY_BYTES:
+        raise ValueError(
+            "research result_summary exceeds "
+            f"{MAX_RESEARCH_RESULT_SUMMARY_BYTES} bytes"
+        )
+    return serialized
+
+
 def _canonical_url(value: Any) -> str:
     """Return a conservative canonical form for attempt-local URL binding."""
 
@@ -363,6 +832,31 @@ def _usage_json(usage: Mapping[str, Any]) -> str:
     return _canonical_json(dict(usage))
 
 
+def _audited_usage_credits(
+    serialized: str | None,
+    *,
+    name: str,
+) -> float:
+    """Return known legacy credits or fail closed when mixing audit formats."""
+
+    if serialized is None:
+        return 0.0
+    try:
+        usage = json.loads(serialized)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StateError(f"{name} usage audit is invalid") from exc
+    if not isinstance(usage, Mapping) or "credits" not in usage:
+        raise StateError(
+            f"{name} usage audit has no finite non-negative credits"
+        )
+    try:
+        return _research_credits(usage["credits"])
+    except (TypeError, ValueError) as exc:
+        raise StateError(
+            f"{name} usage audit has no finite non-negative credits"
+        ) from exc
+
+
 def _product_mapping(product: Any) -> dict[str, Any]:
     if isinstance(product, Mapping):
         raw = dict(product)
@@ -407,6 +901,20 @@ def retry_delay(outcome: str, consecutive_failures: int) -> timedelta:
         raise ValueError("consecutive_failures must be positive")
     if outcome == "wikijs_conflict":
         return timedelta(hours=24)
+    if outcome == "out_of_scope":
+        return timedelta(days=SYNC_REFRESH_DAYS)
+    if outcome == "source_unverified":
+        index = min(
+            consecutive_failures - 1,
+            len(SOURCE_VERIFICATION_BACKOFF_DAYS) - 1,
+        )
+        return timedelta(days=SOURCE_VERIFICATION_BACKOFF_DAYS[index])
+    if outcome == "invalid_decision":
+        index = min(
+            consecutive_failures - 1,
+            len(INVALID_DECISION_BACKOFF_HOURS) - 1,
+        )
+        return timedelta(hours=INVALID_DECISION_BACKOFF_HOURS[index])
     if outcome in TRANSIENT_OUTCOMES:
         index = min(consecutive_failures - 1, len(TRANSIENT_BACKOFF_HOURS) - 1)
         return timedelta(hours=TRANSIENT_BACKOFF_HOURS[index])
@@ -573,6 +1081,50 @@ class StateStore:
                 )
                 connection.execute("PRAGMA user_version = 4")
                 current = 4
+            if current < 5:
+                # Multi-round research uses an append-only, at-most-once action
+                # ledger. The two unique constraints prevent both reusing a
+                # round/action slot and replaying the same paid request in a
+                # later round of the same attempt.
+                for statement in _CREATE_RESEARCH_ACTION_SCHEMA:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 5")
+                current = 5
+            if current < 6:
+                # Cross-attempt replay suppression follows the actual research
+                # identity/provider configuration, not unrelated catalogue
+                # metadata such as family_code or updated_at.
+                connection.execute(
+                    "ALTER TABLE research_actions "
+                    "ADD COLUMN scope_fingerprint TEXT"
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS research_actions_scope_idx
+                    ON research_actions(scope_fingerprint, status)
+                    """
+                )
+                connection.execute("PRAGMA user_version = 6")
+                current = 6
+            if current < 7:
+                # A short-lived v6 migration populated legacy rows with the
+                # catalogue source hash. That value is not a provider/request
+                # scope and could incorrectly unlock an ambiguous paid call.
+                # Restore those rows to the fail-closed unknown-scope marker.
+                connection.execute(
+                    """
+                    UPDATE research_actions
+                    SET scope_fingerprint = NULL
+                    WHERE scope_fingerprint = (
+                        SELECT attempts.source_hash
+                        FROM attempts
+                        WHERE attempts.attempt_id =
+                              research_actions.attempt_id
+                    )
+                    """
+                )
+                connection.execute("PRAGMA user_version = 7")
+                current = 7
         return current
 
     @property
@@ -1199,6 +1751,854 @@ class StateStore:
             )
         return normalized_success_urls
 
+    def begin_research_action(
+        self,
+        lease_or_token: Lease | str,
+        *,
+        round_number: int,
+        action: str,
+        request_fingerprint: str,
+        scope_fingerprint: str | None = None,
+        blocking_scope_fingerprints: Mapping[str, str] | None = None,
+        now: datetime | None = None,
+    ) -> ResearchActionStartResult:
+        """Reserve one research action without authorizing unsafe exact replay.
+
+        ``should_execute`` is true only for the transaction that inserted the
+        durable ``started`` row. An exact retry returns the existing row with
+        ``should_execute`` false. Before any new provider call, this also
+        suppresses work when an earlier attempt for the same product has a
+        started or uncertain research action under the same action/provider
+        scope. A legacy unresolved row with no reliable scope blocks
+        fail-closed. Completed requests can be repeated by a later attempt
+        because response bodies are deliberately not persisted and autonomous
+        crash recovery may need fresh evidence.
+        """
+
+        normalized_round = _research_round_number(round_number)
+        normalized_action = _research_action_name(action)
+        normalized_fingerprint = _research_request_fingerprint(
+            request_fingerprint
+        )
+        timestamp = _utc(now)
+        now_text = _time_text(timestamp)
+
+        with self._write_transaction() as connection:
+            attempt = self._active_attempt(
+                connection,
+                lease_or_token,
+                timestamp,
+            )
+            if scope_fingerprint is None:
+                # Callers predating provider-aware scopes cannot safely prove
+                # that a later request differs. Persist an explicit unknown
+                # marker so any unresolved legacy action blocks fail-closed.
+                normalized_scope = None
+            else:
+                normalized_scope = _research_request_fingerprint(
+                    scope_fingerprint
+                )
+            if blocking_scope_fingerprints is None:
+                normalized_blocking_scopes = {
+                    candidate: normalized_scope
+                    for candidate in RESEARCH_ACTIONS
+                }
+            else:
+                if set(blocking_scope_fingerprints) != set(RESEARCH_ACTIONS):
+                    raise ValueError(
+                        "blocking_scope_fingerprints must contain exactly "
+                        "ai, extract, and search"
+                    )
+                normalized_blocking_scopes = {
+                    _research_action_name(candidate):
+                    _research_request_fingerprint(candidate_scope)
+                    for candidate, candidate_scope
+                    in blocking_scope_fingerprints.items()
+                }
+            existing = connection.execute(
+                """
+                SELECT ra.*, a.product_id
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                WHERE ra.attempt_id = ?
+                  AND ra.round_number = ?
+                  AND ra.action = ?
+                """,
+                (
+                    attempt["attempt_id"],
+                    normalized_round,
+                    normalized_action,
+                ),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_fingerprint"] != normalized_fingerprint:
+                    raise AttemptBudgetError(
+                        "research round/action slot already contains a "
+                        "different request"
+                    )
+                return ResearchActionStartResult(
+                    self._research_action_record(existing),
+                    False,
+                )
+
+            duplicate = connection.execute(
+                """
+                SELECT round_number
+                FROM research_actions
+                WHERE attempt_id = ?
+                  AND action = ?
+                  AND request_fingerprint = ?
+                """,
+                (
+                    attempt["attempt_id"],
+                    normalized_action,
+                    normalized_fingerprint,
+                ),
+            ).fetchone()
+            if duplicate is not None:
+                raise AttemptBudgetError(
+                    "the same paid research request is already recorded in "
+                    f"round {int(duplicate['round_number'])}"
+                )
+
+            prior_rows = connection.execute(
+                """
+                SELECT ra.*, a.product_id
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                WHERE a.product_id = ?
+                  AND a.attempt_id <> ?
+                  AND ra.status IN ('started', 'uncertain')
+                ORDER BY ra.action_id DESC
+                """,
+                (
+                    attempt["product_id"],
+                    attempt["attempt_id"],
+                ),
+            ).fetchall()
+            for prior in prior_rows:
+                prior_action = str(prior["action"])
+                prior_scope = prior["scope_fingerprint"]
+                blocks = (
+                    prior_scope is None
+                    or prior_action not in normalized_blocking_scopes
+                    or normalized_blocking_scopes[prior_action] is None
+                )
+                if not blocks:
+                    try:
+                        normalized_prior_scope = (
+                            _research_request_fingerprint(prior_scope)
+                        )
+                    except (TypeError, ValueError):
+                        blocks = True
+                    else:
+                        blocks = (
+                            normalized_prior_scope
+                            == normalized_blocking_scopes[prior_action]
+                        )
+                if blocks:
+                    return ResearchActionStartResult(
+                        self._research_action_record(prior),
+                        False,
+                    )
+
+            inserted = connection.execute(
+                """
+                INSERT INTO research_actions (
+                    attempt_id, round_number, action, status,
+                    request_fingerprint, scope_fingerprint, started_at
+                ) VALUES (?, ?, ?, 'started', ?, ?, ?)
+                """,
+                (
+                    attempt["attempt_id"],
+                    normalized_round,
+                    normalized_action,
+                    normalized_fingerprint,
+                    normalized_scope,
+                    now_text,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT ra.*, a.product_id
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                WHERE ra.action_id = ?
+                """,
+                (inserted.lastrowid,),
+            ).fetchone()
+        if row is None:  # defensive: INSERT and SELECT share one transaction
+            raise StateError("research action disappeared after insertion")
+        return ResearchActionStartResult(
+            self._research_action_record(row),
+            True,
+        )
+
+    @staticmethod
+    def _known_candidate_urls(
+        connection: sqlite3.Connection,
+        attempt_id: int,
+    ) -> set[str]:
+        row = connection.execute(
+            """
+            SELECT search_urls_json
+            FROM attempts
+            WHERE attempt_id = ?
+            """,
+            (attempt_id,),
+        ).fetchone()
+        candidates: list[str] = []
+        if row is not None and row["search_urls_json"] is not None:
+            try:
+                candidates.extend(json.loads(row["search_urls_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StateError("legacy search URL audit is invalid") from exc
+        rows = connection.execute(
+            """
+            SELECT result_summary_json
+            FROM research_actions
+            WHERE attempt_id = ?
+              AND action = 'search'
+              AND status = 'completed'
+            ORDER BY action_id
+            """,
+            (attempt_id,),
+        ).fetchall()
+        for action_row in rows:
+            if action_row["result_summary_json"] is None:
+                continue
+            try:
+                summary = json.loads(action_row["result_summary_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StateError("research search summary is invalid") from exc
+            if not isinstance(summary, Mapping):
+                raise StateError("research search summary must be an object")
+            urls = summary.get("candidate_urls", [])
+            try:
+                candidates.extend(
+                    _canonical_urls(urls, maximum=20)
+                )
+            except (TypeError, ValueError) as exc:
+                raise StateError(
+                    "research search candidate URL audit is invalid"
+                ) from exc
+        try:
+            return set(_canonical_urls(candidates))
+        except (TypeError, ValueError) as exc:
+            raise StateError("search candidate URL audit is invalid") from exc
+
+    def finish_research_action(
+        self,
+        lease_or_token: Lease | str,
+        *,
+        round_number: int,
+        action: str,
+        request_fingerprint: str,
+        status: str,
+        result_summary: Mapping[str, Any] | None = None,
+        credits: int | float | Decimal | None = None,
+        error: str | None = None,
+        now: datetime | None = None,
+    ) -> ResearchActionRecord:
+        """Seal a started research action as completed, failed, or uncertain."""
+
+        normalized_round = _research_round_number(round_number)
+        normalized_action = _research_action_name(action)
+        normalized_fingerprint = _research_request_fingerprint(
+            request_fingerprint
+        )
+        if not isinstance(status, str):
+            raise TypeError("research action status must be a string")
+        normalized_status = status.strip().casefold()
+        if normalized_status not in {"completed", "failed", "uncertain"}:
+            raise ValueError(
+                "research action status must be completed, failed, or uncertain"
+            )
+        normalized_error = _research_error(
+            error,
+            required=normalized_status in {"failed", "uncertain"},
+        )
+        if normalized_status == "completed" and normalized_error is not None:
+            raise ValueError("completed research actions cannot have an error")
+        if normalized_status == "completed" and result_summary is None:
+            raise ValueError(
+                "completed research actions require a result_summary"
+            )
+        summary_json = _research_result_summary_json(
+            normalized_action,
+            result_summary,
+            require_successful_urls=(
+                normalized_action == "extract"
+                and normalized_status == "completed"
+            ),
+        )
+        if credits is None and normalized_status != "uncertain":
+            raise ValueError(
+                "completed or failed research actions require an explicit "
+                "known credit count"
+            )
+        normalized_credits = (
+            None if credits is None else _research_credits(credits)
+        )
+        timestamp = _utc(now)
+        now_text = _time_text(timestamp)
+
+        with self._write_transaction() as connection:
+            attempt = self._active_attempt(
+                connection,
+                lease_or_token,
+                timestamp,
+            )
+            row = connection.execute(
+                """
+                SELECT ra.*, a.product_id
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                WHERE ra.attempt_id = ?
+                  AND ra.round_number = ?
+                  AND ra.action = ?
+                """,
+                (
+                    attempt["attempt_id"],
+                    normalized_round,
+                    normalized_action,
+                ),
+            ).fetchone()
+            if row is None:
+                raise AttemptBudgetError(
+                    "research action must begin before it can finish"
+                )
+            if row["request_fingerprint"] != normalized_fingerprint:
+                raise AttemptBudgetError(
+                    "request fingerprint does not match the started "
+                    "research action"
+                )
+            if row["status"] != "started":
+                stored_credits = (
+                    None
+                    if row["credits"] is None
+                    else float(row["credits"])
+                )
+                if (
+                    row["status"] == normalized_status
+                    and row["result_summary_json"] == summary_json
+                    and stored_credits == normalized_credits
+                    and row["error"] == normalized_error
+                ):
+                    return self._research_action_record(row)
+                raise AttemptBudgetError(
+                    "research action is already in a terminal state"
+                )
+
+            if normalized_credits is not None:
+                credit_row = connection.execute(
+                    """
+                    SELECT COALESCE(SUM(credits), 0) AS credits
+                    FROM research_actions
+                    WHERE attempt_id = ? AND action_id <> ?
+                    """,
+                    (attempt["attempt_id"], row["action_id"]),
+                ).fetchone()
+                existing_credits = (
+                    float(credit_row["credits"])
+                    if credit_row is not None
+                    else 0.0
+                )
+                legacy_audit = connection.execute(
+                    """
+                    SELECT search_usage_json, extract_usage_json
+                    FROM attempts
+                    WHERE attempt_id = ?
+                    """,
+                    (attempt["attempt_id"],),
+                ).fetchone()
+                if legacy_audit is None:
+                    raise StateError("attempt usage audit disappeared")
+                existing_credits += _audited_usage_credits(
+                    legacy_audit["search_usage_json"],
+                    name="legacy search",
+                )
+                existing_credits += _audited_usage_credits(
+                    legacy_audit["extract_usage_json"],
+                    name="legacy extract",
+                )
+                if (
+                    existing_credits + normalized_credits
+                    > MAX_RESEARCH_TOTAL_CREDITS
+                ):
+                    raise AttemptBudgetError(
+                        "research action credits exceed the compiled "
+                        f"{MAX_RESEARCH_TOTAL_CREDITS:g}-credit ceiling"
+                    )
+
+            if (
+                normalized_action == "search"
+                and normalized_status == "completed"
+            ):
+                summary = (
+                    json.loads(summary_json)
+                    if summary_json is not None
+                    else {}
+                )
+                queries = summary.get("queries")
+                if not isinstance(queries, list) or not queries:
+                    raise AttemptBudgetError(
+                        "completed search actions must record their queries"
+                    )
+                query_rows = connection.execute(
+                    """
+                    SELECT result_summary_json
+                    FROM research_actions
+                    WHERE attempt_id = ?
+                      AND action = 'search'
+                      AND status = 'completed'
+                      AND action_id <> ?
+                    """,
+                    (attempt["attempt_id"], row["action_id"]),
+                ).fetchall()
+                legacy_query_row = connection.execute(
+                    """
+                    SELECT search_usage_json
+                    FROM attempts
+                    WHERE attempt_id = ?
+                    """,
+                    (attempt["attempt_id"],),
+                ).fetchone()
+                if legacy_query_row is None:
+                    raise StateError("attempt search audit disappeared")
+                # The legacy search endpoint always ran build_queries(), whose
+                # compiled maximum and normal output are three queries.
+                total_queries = len(queries) + (
+                    MAX_LEGACY_SEARCH_QUERIES
+                    if legacy_query_row["search_usage_json"] is not None
+                    else 0
+                )
+                for query_row in query_rows:
+                    previous_summary = json.loads(
+                        query_row["result_summary_json"] or "{}"
+                    )
+                    previous_queries = previous_summary.get("queries", [])
+                    if not isinstance(previous_queries, list):
+                        raise StateError(
+                            "completed search query audit is invalid"
+                        )
+                    total_queries += len(previous_queries)
+                if total_queries > MAX_RESEARCH_TOTAL_QUERIES:
+                    raise AttemptBudgetError(
+                        "research search queries exceed the compiled "
+                        f"{MAX_RESEARCH_TOTAL_QUERIES}-query ceiling"
+                    )
+
+            if (
+                normalized_action == "extract"
+                and normalized_status == "completed"
+            ):
+                summary = (
+                    json.loads(summary_json)
+                    if summary_json is not None
+                    else {}
+                )
+                submitted_urls = set(summary.get("submitted_urls", []))
+                successful_urls = set(summary.get("successful_urls", []))
+                if not successful_urls <= submitted_urls:
+                    raise AttemptBudgetError(
+                        "successful extract URLs must belong to this action's "
+                        "submitted set"
+                    )
+                submitted_rows = connection.execute(
+                    """
+                    SELECT result_summary_json
+                    FROM research_actions
+                    WHERE attempt_id = ?
+                      AND action = 'extract'
+                      AND status = 'completed'
+                      AND action_id <> ?
+                    """,
+                    (attempt["attempt_id"], row["action_id"]),
+                ).fetchall()
+                legacy_extract_row = connection.execute(
+                    """
+                    SELECT extract_urls_json
+                    FROM attempts
+                    WHERE attempt_id = ?
+                    """,
+                    (attempt["attempt_id"],),
+                ).fetchone()
+                if legacy_extract_row is None:
+                    raise StateError("attempt extract audit disappeared")
+                all_submitted_urls = set(submitted_urls)
+                if legacy_extract_row["extract_urls_json"] is not None:
+                    try:
+                        all_submitted_urls.update(
+                            _canonical_urls(
+                                json.loads(
+                                    legacy_extract_row["extract_urls_json"]
+                                ),
+                                maximum=MAX_RESEARCH_TOTAL_URLS,
+                            )
+                        )
+                    except (
+                        TypeError,
+                        ValueError,
+                        json.JSONDecodeError,
+                    ) as exc:
+                        raise StateError(
+                            "legacy extract URL audit is invalid"
+                        ) from exc
+                for submitted_row in submitted_rows:
+                    previous_summary = json.loads(
+                        submitted_row["result_summary_json"] or "{}"
+                    )
+                    previous_submitted = previous_summary.get(
+                        "submitted_urls",
+                        [],
+                    )
+                    if not isinstance(previous_submitted, list):
+                        raise StateError(
+                            "completed extract submitted URL audit is invalid"
+                        )
+                    all_submitted_urls.update(previous_submitted)
+                if len(all_submitted_urls) > MAX_RESEARCH_TOTAL_URLS:
+                    raise AttemptBudgetError(
+                        "research extracts exceed the compiled "
+                        f"{MAX_RESEARCH_TOTAL_URLS}-URL ceiling"
+                    )
+                outside = submitted_urls - self._known_candidate_urls(
+                    connection,
+                    int(attempt["attempt_id"]),
+                )
+                if outside:
+                    raise AttemptBudgetError(
+                        "submitted extract URLs must belong to a completed "
+                        "search action"
+                    )
+
+            changed = connection.execute(
+                """
+                UPDATE research_actions
+                SET status = ?, finished_at = ?, result_summary_json = ?,
+                    credits = ?, error = ?
+                WHERE action_id = ? AND status = 'started'
+                """,
+                (
+                    normalized_status,
+                    now_text,
+                    summary_json,
+                    normalized_credits,
+                    normalized_error,
+                    row["action_id"],
+                ),
+            )
+            if changed.rowcount != 1:  # defensive under BEGIN IMMEDIATE
+                raise AttemptBudgetError(
+                    "research action is already in a terminal state"
+                )
+            finished = connection.execute(
+                """
+                SELECT ra.*, a.product_id
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                WHERE ra.action_id = ?
+                """,
+                (row["action_id"],),
+            ).fetchone()
+        if finished is None:  # defensive
+            raise StateError("research action disappeared after completion")
+        return self._research_action_record(finished)
+
+    def get_research_action(
+        self,
+        attempt_id: int,
+        round_number: int,
+        action: str,
+    ) -> ResearchActionRecord | None:
+        """Return one action slot without requiring its lease to remain active."""
+
+        normalized_attempt = self._research_attempt_id(attempt_id)
+        normalized_round = _research_round_number(round_number)
+        normalized_action = _research_action_name(action)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT ra.*, a.product_id
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                WHERE ra.attempt_id = ?
+                  AND ra.round_number = ?
+                  AND ra.action = ?
+                """,
+                (
+                    normalized_attempt,
+                    normalized_round,
+                    normalized_action,
+                ),
+            ).fetchone()
+        return (
+            self._research_action_record(row)
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    def _research_attempt_id(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError("attempt_id must be an integer")
+        if value <= 0:
+            raise ValueError("attempt_id must be positive")
+        return value
+
+    def research_action_history(
+        self,
+        *,
+        attempt_id: int | None = None,
+        product_id: Any | None = None,
+        limit: int = 1000,
+    ) -> list[ResearchActionRecord]:
+        """Return bounded action-ledger rows in creation order."""
+
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if attempt_id is not None:
+            clauses.append("ra.attempt_id = ?")
+            parameters.append(self._research_attempt_id(attempt_id))
+        if product_id is not None:
+            product_text = str(product_id).strip()
+            if not product_text:
+                raise ValueError("product_id must be non-empty")
+            clauses.append("a.product_id = ?")
+            parameters.append(product_text)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.append(limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT ra.*, a.product_id
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                {where}
+                ORDER BY ra.action_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [self._research_action_record(row) for row in rows]
+
+    def recent_ai_provider_rejection(
+        self,
+        provider_fingerprint: str,
+        *,
+        http_statuses: Iterable[int],
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> int | None:
+        """Return a recent provider-global AI rejection for this configuration."""
+
+        normalized_fingerprint = _research_request_fingerprint(
+            provider_fingerprint
+        )
+        if not isinstance(within, timedelta) or within <= timedelta(0):
+            raise ValueError("within must be a positive timedelta")
+        normalized_statuses = {
+            int(status)
+            for status in http_statuses
+            if (
+                not isinstance(status, bool)
+                and isinstance(status, int)
+                and 100 <= status <= 599
+            )
+        }
+        if not normalized_statuses:
+            raise ValueError("http_statuses must contain an HTTP status")
+        cutoff = _time_text(_utc(now) - within)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT result_summary_json
+                FROM research_actions
+                WHERE action = 'ai'
+                  AND status IN ('failed', 'uncertain')
+                  AND finished_at >= ?
+                  AND result_summary_json IS NOT NULL
+                ORDER BY action_id DESC
+                LIMIT 1000
+                """,
+                (cutoff,),
+            ).fetchall()
+        for row in rows:
+            try:
+                summary = json.loads(row["result_summary_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StateError(
+                    "AI provider rejection audit is invalid"
+                ) from exc
+            if not isinstance(summary, Mapping):
+                raise StateError("AI provider rejection audit is invalid")
+            status = summary.get("http_status")
+            if (
+                summary.get("provider_fingerprint")
+                == normalized_fingerprint
+                and isinstance(status, int)
+                and not isinstance(status, bool)
+                and status in normalized_statuses
+            ):
+                return status
+        return None
+
+    def recent_ai_provider_error_products(
+        self,
+        provider_fingerprint: str,
+        *,
+        error_types: Iterable[str],
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> int:
+        """Count distinct products with a recent matching AI provider error."""
+
+        normalized_fingerprint = _research_request_fingerprint(
+            provider_fingerprint
+        )
+        if not isinstance(within, timedelta) or within <= timedelta(0):
+            raise ValueError("within must be a positive timedelta")
+        normalized_error_types = {
+            value.strip()
+            for value in error_types
+            if isinstance(value, str)
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", value.strip())
+        }
+        if not normalized_error_types:
+            raise ValueError("error_types must contain a valid class name")
+        cutoff = _time_text(_utc(now) - within)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT a.product_id, ra.result_summary_json
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                WHERE ra.action = 'ai'
+                  AND ra.status IN ('failed', 'uncertain')
+                  AND ra.finished_at >= ?
+                  AND ra.result_summary_json IS NOT NULL
+                ORDER BY ra.action_id DESC
+                LIMIT 1000
+                """,
+                (cutoff,),
+            ).fetchall()
+        products: set[str] = set()
+        for row in rows:
+            try:
+                summary = json.loads(row["result_summary_json"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StateError("AI provider error audit is invalid") from exc
+            if not isinstance(summary, Mapping):
+                raise StateError("AI provider error audit is invalid")
+            if (
+                summary.get("provider_fingerprint")
+                == normalized_fingerprint
+                and summary.get("error_type") in normalized_error_types
+            ):
+                products.add(str(row["product_id"]))
+        return len(products)
+
+    def research_action_stats(
+        self,
+        *,
+        attempt_id: int | None = None,
+        product_id: Any | None = None,
+    ) -> dict[str, Any]:
+        """Return JSON-friendly action counts and known credit totals."""
+
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        if attempt_id is not None:
+            clauses.append("ra.attempt_id = ?")
+            parameters.append(self._research_attempt_id(attempt_id))
+        if product_id is not None:
+            product_text = str(product_id).strip()
+            if not product_text:
+                raise ValueError("product_id must be non-empty")
+            clauses.append("a.product_id = ?")
+            parameters.append(product_text)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self._connection() as connection:
+            totals = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS actions,
+                    COALESCE(SUM(ra.credits), 0) AS known_credits,
+                    SUM(
+                        CASE
+                            WHEN ra.credits IS NULL
+                              OR ra.status = 'uncertain'
+                            THEN 1
+                            ELSE 0
+                        END
+                    )
+                        AS unknown_credit_actions,
+                    MAX(ra.round_number) AS max_round
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                {where}
+                """,
+                parameters,
+            ).fetchone()
+            status_rows = connection.execute(
+                f"""
+                SELECT ra.status, COUNT(*) AS actions
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                {where}
+                GROUP BY ra.status
+                ORDER BY ra.status
+                """,
+                parameters,
+            ).fetchall()
+            action_rows = connection.execute(
+                f"""
+                SELECT
+                    ra.action,
+                    COUNT(*) AS actions,
+                    COALESCE(SUM(ra.credits), 0) AS credits
+                FROM research_actions AS ra
+                JOIN attempts AS a ON a.attempt_id = ra.attempt_id
+                {where}
+                GROUP BY ra.action
+                ORDER BY ra.action
+                """,
+                parameters,
+            ).fetchall()
+
+        by_status = {status: 0 for status in RESEARCH_ACTION_STATUSES}
+        for row in status_rows:
+            by_status[str(row["status"])] = int(row["actions"])
+        by_action = {
+            str(row["action"]): {
+                "actions": int(row["actions"]),
+                "credits": float(row["credits"]),
+            }
+            for row in action_rows
+        }
+        if totals is None:  # aggregate SELECT always returns one row
+            raise StateError("research action statistics query returned no row")
+        return {
+            "actions": int(totals["actions"]),
+            "known_credits": float(totals["known_credits"]),
+            "unknown_credit_actions": int(
+                totals["unknown_credit_actions"] or 0
+            ),
+            "max_round": (
+                int(totals["max_round"])
+                if totals["max_round"] is not None
+                else None
+            ),
+            "by_status": by_status,
+            "by_action": by_action,
+        }
+
     def allowed_evidence_urls(
         self,
         lease_token: str,
@@ -1210,19 +2610,83 @@ class StateStore:
         timestamp = _utc(now)
         with self._connection() as connection:
             row = self._active_attempt(connection, lease_token, timestamp)
-        if (
-            row["extract_usage_json"] is None
-            or row["extract_success_urls_json"] is None
-        ):
-            return []
-        return list(json.loads(row["extract_success_urls_json"]))
+            urls: list[str] = []
+            if (
+                row["extract_usage_json"] is not None
+                and row["extract_success_urls_json"] is not None
+            ):
+                try:
+                    urls.extend(json.loads(row["extract_success_urls_json"]))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise StateError(
+                        "legacy successful extract URL audit is invalid"
+                    ) from exc
+            actions = connection.execute(
+                """
+                SELECT result_summary_json
+                FROM research_actions
+                WHERE attempt_id = ?
+                  AND action = 'extract'
+                  AND status = 'completed'
+                ORDER BY action_id
+                """,
+                (row["attempt_id"],),
+            ).fetchall()
+            for action_row in actions:
+                if action_row["result_summary_json"] is None:
+                    raise StateError(
+                        "completed extract action has no result summary"
+                    )
+                try:
+                    summary = json.loads(action_row["result_summary_json"])
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise StateError(
+                        "research extract summary is invalid"
+                    ) from exc
+                if not isinstance(summary, Mapping):
+                    raise StateError(
+                        "research extract summary must be an object"
+                    )
+                successful_urls = summary.get("successful_urls")
+                try:
+                    urls.extend(
+                        _canonical_urls(successful_urls, maximum=5)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise StateError(
+                        "research successful extract URL audit is invalid"
+                    ) from exc
+        try:
+            return _canonical_urls(urls)
+        except (TypeError, ValueError) as exc:
+            raise StateError(
+                "successful extract URL audit is invalid"
+            ) from exc
 
     def reclaim_expired_leases(self, *, now: datetime | None = None) -> int:
-        """Close expired attempts and place their products in transient backoff."""
+        """Close expired attempts, preserving immediate source-change work."""
 
         timestamp = _utc(now)
         with self._write_transaction() as connection:
             return self._reclaim_expired(connection, timestamp)
+
+    @staticmethod
+    def _mark_started_research_actions_uncertain(
+        connection: sqlite3.Connection,
+        attempt_id: int,
+        *,
+        finished_at: str,
+        error: str,
+    ) -> int:
+        changed = connection.execute(
+            """
+            UPDATE research_actions
+            SET status = 'uncertain', finished_at = ?, error = ?
+            WHERE attempt_id = ? AND status = 'started'
+            """,
+            (finished_at, error, attempt_id),
+        )
+        return max(changed.rowcount, 0)
 
     def _reclaim_expired(
         self, connection: sqlite3.Connection, timestamp: datetime
@@ -1230,38 +2694,83 @@ class StateStore:
         now_text = _time_text(timestamp)
         rows = connection.execute(
             """
-            SELECT product_id, lease_token, consecutive_failures
-            FROM products
-            WHERE status = 'leased' AND lease_until <= ?
+            SELECT
+                p.product_id,
+                p.lease_token,
+                p.consecutive_failures,
+                p.source_hash,
+                p.leased_source_hash,
+                p.reschedule_requested,
+                a.attempt_id
+            FROM products AS p
+            JOIN attempts AS a ON a.lease_token = p.lease_token
+            WHERE p.status = 'leased'
+              AND p.lease_until <= ?
+              AND a.finished_at IS NULL
             """,
             (now_text,),
         ).fetchall()
         for row in rows:
-            failures = int(row["consecutive_failures"]) + 1
-            next_run = timestamp + retry_delay("lease_expired", failures)
+            source_changed = (
+                bool(row["reschedule_requested"])
+                or row["source_hash"] != row["leased_source_hash"]
+            )
+            if source_changed:
+                attempt_outcome = "stale_source"
+                attempt_error = (
+                    "source changed before the expired lease completed"
+                )
+                failures = 0
+                product_status = "due"
+                next_run = timestamp
+                product_error = None
+            else:
+                attempt_outcome = "lease_expired"
+                attempt_error = (
+                    "worker lease expired before an outcome was recorded"
+                )
+                failures = int(row["consecutive_failures"]) + 1
+                product_status = "backoff"
+                next_run = timestamp + retry_delay(
+                    "lease_expired",
+                    failures,
+                )
+                product_error = "worker lease expired"
+            self._mark_started_research_actions_uncertain(
+                connection,
+                int(row["attempt_id"]),
+                finished_at=now_text,
+                error="lease expired before research action completion",
+            )
             connection.execute(
                 """
                 UPDATE attempts
-                SET finished_at = ?, outcome = 'lease_expired',
-                    error = 'worker lease expired before an outcome was recorded'
+                SET finished_at = ?, outcome = ?, error = ?
                 WHERE lease_token = ? AND finished_at IS NULL
                 """,
-                (now_text, row["lease_token"]),
+                (
+                    now_text,
+                    attempt_outcome,
+                    attempt_error,
+                    row["lease_token"],
+                ),
             )
             connection.execute(
                 """
                 UPDATE products
-                SET status = 'backoff', next_run_at = ?,
+                SET status = ?, next_run_at = ?,
                     consecutive_failures = ?,
                     lease_token = NULL, lease_owner = NULL, lease_until = NULL,
                     leased_source_hash = NULL, reschedule_requested = 0,
-                    last_outcome = 'lease_expired',
-                    last_error = 'worker lease expired', updated_at = ?
+                    last_outcome = ?, last_error = ?, updated_at = ?
                 WHERE product_id = ? AND status = 'leased' AND lease_token = ?
                 """,
                 (
+                    product_status,
                     _time_text(next_run),
                     failures,
+                    attempt_outcome,
+                    product_error,
                     now_text,
                     row["product_id"],
                     row["lease_token"],
@@ -1285,8 +2794,8 @@ class StateStore:
         """Finish a lease, audit it, and schedule refresh or retry.
 
         ``synced`` and ``success`` are refreshed in 365 days. Content outcomes
-        follow 30/90/180-day backoff; transient failures use 1/6/24 hours and a
-        Wiki.js edit conflict uses 24 hours.
+        use outcome-specific automatic backoff; transient failures use
+        1/6/24 hours and a Wiki.js edit conflict uses 24 hours.
         """
 
         if lease is not None and lease_token is not None:
@@ -1335,6 +2844,13 @@ class StateStore:
                 or lease.source_hash != row["leased_source_hash"]
             ):
                 raise LeaseLostError("lease identity does not match durable state")
+
+            self._mark_started_research_actions_uncertain(
+                connection,
+                int(row["attempt_id"]),
+                finished_at=now_text,
+                error="attempt ended before research action completion",
+            )
 
             if row["reschedule_requested"] or row["source_hash"] != row["leased_source_hash"]:
                 stale_details = {
@@ -1392,8 +2908,26 @@ class StateStore:
                 last_success = row["last_success_at"]
             else:
                 failures = int(row["consecutive_failures"]) + 1
+                previous_outcomes = connection.execute(
+                    """
+                    SELECT outcome
+                    FROM attempts
+                    WHERE product_id = ? AND finished_at IS NOT NULL
+                    ORDER BY attempt_id DESC
+                    LIMIT 32
+                    """,
+                    (row["product_id"],),
+                ).fetchall()
+                outcome_streak = 1
+                for previous in previous_outcomes:
+                    if previous["outcome"] != stored_outcome:
+                        break
+                    outcome_streak += 1
                 status = "backoff"
-                next_run = timestamp + retry_delay(stored_outcome, failures)
+                next_run = timestamp + retry_delay(
+                    stored_outcome,
+                    outcome_streak,
+                )
                 last_error = error
                 last_success = row["last_success_at"]
 
@@ -1488,6 +3022,61 @@ class StateStore:
         if include_zero:
             return {status: counts.get(status, 0) for status in PRODUCT_STATUSES}
         return counts
+
+    def outcome_counts(self) -> dict[str, int]:
+        """Return aggregate finished-attempt counts without exposing evidence."""
+
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT outcome, COUNT(*) AS count
+                FROM attempts
+                WHERE finished_at IS NOT NULL AND outcome IS NOT NULL
+                GROUP BY outcome
+                ORDER BY count DESC, outcome
+                """
+            ).fetchall()
+        return {str(row["outcome"]): int(row["count"]) for row in rows}
+
+    def recent_distinct_outcome_streak(
+        self,
+        outcome: str,
+        *,
+        limit: int,
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> int:
+        """Count distinct products in the newest consecutive outcome streak."""
+
+        if not isinstance(outcome, str) or not outcome.strip():
+            raise ValueError("outcome must be a non-empty string")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive integer")
+        if not isinstance(within, timedelta) or within <= timedelta(0):
+            raise ValueError("within must be a positive timedelta")
+        cutoff = _utc(now) - within
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT product_id, outcome
+                FROM attempts
+                WHERE finished_at IS NOT NULL AND finished_at >= ?
+                ORDER BY attempt_id DESC
+                """,
+                (_time_text(cutoff),),
+            ).fetchall()
+        expected = outcome.strip().casefold()
+        product_ids: set[str] = set()
+        for row in rows:
+            if (
+                not isinstance(row["outcome"], str)
+                or row["outcome"].casefold() != expected
+            ):
+                break
+            product_ids.add(str(row["product_id"]))
+            if len(product_ids) >= limit:
+                return limit
+        return len(product_ids)
 
     def published_products(
         self,
@@ -1640,4 +3229,41 @@ class StateStore:
                 if row["extract_usage_json"] is not None
                 else None
             ),
+        )
+
+    @staticmethod
+    def _research_action_record(row: sqlite3.Row) -> ResearchActionRecord:
+        raw_scope = row["scope_fingerprint"]
+        try:
+            normalized_scope = (
+                None
+                if raw_scope is None
+                else _research_request_fingerprint(raw_scope)
+            )
+        except (TypeError, ValueError):
+            # Unknown legacy values are represented as an absent scope so
+            # callers retain the same fail-closed replay behavior.
+            normalized_scope = None
+        return ResearchActionRecord(
+            action_id=int(row["action_id"]),
+            attempt_id=int(row["attempt_id"]),
+            product_id=str(row["product_id"]),
+            round_number=int(row["round_number"]),
+            action=str(row["action"]),
+            status=str(row["status"]),
+            request_fingerprint=str(row["request_fingerprint"]),
+            scope_fingerprint=normalized_scope,
+            started_at=_parse_time(row["started_at"]),  # type: ignore[arg-type]
+            finished_at=_parse_time(row["finished_at"]),
+            result_summary=(
+                json.loads(row["result_summary_json"])
+                if row["result_summary_json"] is not None
+                else None
+            ),
+            credits=(
+                float(row["credits"])
+                if row["credits"] is not None
+                else None
+            ),
+            error=row["error"],
         )

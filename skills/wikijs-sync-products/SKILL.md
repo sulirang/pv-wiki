@@ -162,7 +162,11 @@ PGUSER=...                # read-only
 PGPASSWORD=...
 PGSSLMODE=verify-full
 PGSSLROOTCERT=/run/pv-wiki/catalogue-ca.pem
-PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON={"Huawei":["solar.huawei.com"]}
+PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON=  # optional override/fast path
+PV_WIKI_RESEARCH_MAX_ROUNDS=3
+PV_WIKI_RESEARCH_MAX_QUERIES=7
+PV_WIKI_RESEARCH_MAX_CREDITS=20
+PV_WIKI_RESEARCH_MAX_SECONDS=600
 PV_WIKI_WORKER_TOKEN=...  # separate 32+ character random value
 ```
 
@@ -176,21 +180,33 @@ path.
 The supported AI protocol is OpenAI-compatible Chat Completions. The worker
 adds `/chat/completions` to `AI_BASE_URL`. HTTPS is mandatory by default.
 Loopback HTTP is accepted; another trusted private HTTP endpoint requires the
-operator to explicitly set `AI_ALLOW_INSECURE_HTTP=true`. The model receives bounded public identity
-and extracted evidence only; it does not receive product database IDs, family
-codes, lease tokens, or credentials. The local decision gate, not the model,
-controls Wiki.js writes. A model cannot grant a source trusted status: a
-manufacturer, regulatory, or authorized URL must match the operator-owned
-domain mapping for that exact catalogue `brand_code` in
-`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`. For certificate-verifying PostgreSQL
+operator to explicitly set `AI_ALLOW_INSECURE_HTTP=true`. The model receives
+bounded public identity, search discovery hints, and extracted evidence; it
+does not receive product database IDs, family codes, lease tokens, or
+credentials. It discovers manufacturer and product type and may classify
+matching generic hardware as out of scope. The local decision gate, not the model,
+controls Wiki.js writes. Within one `/run-one`, the model may request at most
+two supplemental passes using a fixed evidence-gap enum and locally validated
+queries bound to the exact product model. It cannot provide a domain allowlist,
+change the configured budgets, or call Wiki.js. `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` is an optional
+public-manufacturer alias override and verification fast path, not a complete
+registry that an operator must maintain. Without a match, the local gate may
+automatically verify only an HTTPS manufacturer host whose name is consistent
+with the AI-discovered manufacturer and whose bounded extract contains both the
+manufacturer and complete catalogue model. A second independent HTTPS extract
+must corroborate that identity, and every published fact needs exact quotes
+from both domains. Failure becomes
+`source_unverified`: it is audited and retried automatically, without creating
+a product issue or manual-review task. The model cannot grant trust by itself.
+For certificate-verifying PostgreSQL
 modes, mount the catalogue public/private CA from `CATALOGUE_CA_PATH`
 read-only as documented in the deployment guide.
 Only bounded extracts containing the exact full model are eligible evidence;
 the document may also cover sibling models in the same series. Each
 specification must include a short exact target-model-only extract span
 containing the model, source field label, and value, with no sibling model or
-revision inside that span. Route ambiguous multi-model table rows to supervised
-handling.
+revision inside that span. Record ambiguous multi-model table rows as a normal
+non-publish outcome and retry them automatically; do not open a review issue.
 
 Run `pv-wiki doctor` before any live probes, then `pv-wiki doctor --live`. The
 doctor validates AI configuration but intentionally spends no AI or Tavily
@@ -211,9 +227,10 @@ Header name: Authorization
 Header value: Bearer <PV_WIKI_WORKER_TOKEN>
 ```
 
-Attach that credential to all three HTTP Request nodes. Configure the user's
-chosen n8n Error Workflow/notification channel. Imports stay inactive until
-acceptance is complete.
+Attach that credential to all four HTTP Request nodes. Configure the user's
+chosen n8n Error Workflow/notification channel only for systemic or batch-level
+failures. Normal product non-publish outcomes must not create alerts or issue
+tickets. Imports stay inactive until acceptance is complete.
 
 The product workflow calls fixed internal endpoints:
 
@@ -222,21 +239,57 @@ Monthly/Manual Trigger
   → POST /sync-catalogue
   → POST /run-one
   → IF processed=true, loop to POST /run-one
+
+Hourly Due Recovery
+  → POST /run-one
+  → IF processed=true, loop to POST /run-one
+Daily Catalogue Recovery
+  -> POST /refresh-catalogue
+  -> POST /run-one
+  -> IF processed=true, loop to POST /run-one
 ```
 
 The monthly product trigger runs at 08:05 Asia/Shanghai (00:05 UTC) on day 1,
-shortly after Tavily's first-day credit reset. The homepage workflow calls
-`POST /publish-home` daily at 02:35 Asia/Shanghai. Only idempotent
-catalogue/home calls use bounded HTTP retries; `Run One Product` relies on
-worker queue backoff and loops only when the response says
-`processed=true`. A no-due result or exhaustion of every configured Tavily
-key ends the loop. There is no shell node and no arbitrary request body.
+shortly after Tavily's first-day credit reset. A daily 03:17 refresh retries
+catalogue ingestion without waking quota-paused products. The hourly trigger
+resumes due and backoff work without rerunning the catalogue sync. The homepage workflow calls
+`POST /publish-home` daily at 02:35 Asia/Shanghai. Catalogue/home calls use
+bounded idempotent retries. `Run One Product` uses three retry-safe calls as a
+batch circuit breaker and a 45-minute timeout: leases, the product-operation lock, and the worker's
+per-action request ledger prevent duplicate mutation or blind paid-call
+replays, while consecutive provider/system failures stop one workflow batch.
+If the hourly trigger overlaps a still-running batch, `/run-one` returns the
+clean stop reason `worker_busy` instead of creating a false workflow failure.
+Catalogue sync has a separate serialized lock, so the monthly refresh can
+overlap a product batch; a source change invalidates and reschedules the active
+lease. Catalogue writes and the final source-check/Wiki-mutation/outcome
+sequence share a publication fence, so a locally applied source revision cannot
+be inserted midway through publication. Homepage publication also has its own
+serialized lock and targets a different Wiki path. This is a single-process
+fence: keep exactly one worker replica and do not run mutating CLI commands
+concurrently with the scheduled HTTP worker.
+The queue loops only when the response says `processed=true`. A no-due result
+or exhaustion of every configured Tavily key ends the loop. There is no shell
+node and no arbitrary request body.
+
+Legal non-publish results, including `no_datasheet`, `ambiguous`,
+`insufficient_identity`, `out_of_scope`, and runtime `source_unverified`, are
+silently stored in the audit and retried by the queue. They do not require a
+person to review one issue per product. Provider, configuration, database, or
+service failures that stop the workflow remain batch-level alerts.
 
 When the user adds or replaces a Tavily key, update `TAVILY_API_KEYS`, recreate
-the worker so it receives the new environment, and manually start the product
-workflow. Its initial catalogue sync wakes quota-paused products. HTTP 429 is a
-transient request-rate limit; Tavily plan/pay-as-you-go exhaustion uses HTTP
-432/433 and rotates to the next key.
+the worker so it receives the new environment, then run
+`Manual / New Key Start` once to wake quota-paused products immediately and
+validate the key. Otherwise their first-of-next-UTC-month wake time remains.
+HTTP 429 is a transient request-rate limit; Tavily plan/pay-as-you-go
+exhaustion uses HTTP 432/433 and rotates to the next key. Known partial work
+before an explicit quota/4xx response is audited and remains retryable; only
+ambiguous paid requests are replay-suppressed.
+
+Catalogue ingestion is history-preserving: absence from a later source snapshot
+does not automatically archive/delete a product or remove it from the homepage.
+Do not infer destructive retirement without an explicit user policy.
 
 ## 6. Acceptance
 

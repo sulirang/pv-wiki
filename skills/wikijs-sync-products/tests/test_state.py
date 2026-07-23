@@ -184,6 +184,40 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(outcome.next_run_at, current + timedelta(days=expected_days))
             current = outcome.next_run_at
 
+    def test_out_of_scope_is_skipped_until_the_annual_source_refresh(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("scope-worker", now=T0)
+
+        outcome = self.store.record_outcome(lease, "out_of_scope", now=T0)
+
+        self.assertEqual("backoff", outcome.status)
+        self.assertEqual(
+            T0 + timedelta(days=state.SYNC_REFRESH_DAYS),
+            outcome.next_run_at,
+        )
+
+    def test_source_unverified_retries_without_creating_a_manual_queue(self):
+        self.store.upsert_product(product(), now=T0)
+        current = T0
+        for expected_days in (7, 30, 90, 365, 365):
+            lease = self.store.lease_next("source-worker", now=current)
+            outcome = self.store.record_outcome(
+                lease,
+                "source_unverified",
+                now=current,
+            )
+            self.assertEqual("backoff", outcome.status)
+            self.assertEqual(
+                current + timedelta(days=expected_days),
+                outcome.next_run_at,
+            )
+            current = outcome.next_run_at
+
+        self.assertEqual(
+            {"source_unverified": 5},
+            self.store.outcome_counts(),
+        )
+
     def test_transient_and_conflict_outcomes_use_short_backoff(self):
         self.store.upsert_product(product(), now=T0)
         current = T0
@@ -194,7 +228,7 @@ class StateStoreTests(unittest.TestCase):
             "invalid_decision",
             "publish_error",
         )
-        expected_hours = (1, 6, 24, 24, 24)
+        expected_hours = (1, 1, 1, 24, 1)
         for failure_number, (name, hours) in enumerate(
             zip(outcomes, expected_hours),
             start=1,
@@ -418,6 +452,902 @@ class StateStoreTests(unittest.TestCase):
         finally:
             reopened.close()
 
+    def test_research_action_ledger_is_at_most_once_and_queryable(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next(
+            "research-worker",
+            lease_seconds=3600,
+            now=T0,
+        )
+        search_request = {
+            "max_results": 5,
+            "queries": ['"Panel" datasheet'],
+        }
+        search_fingerprint = state.research_request_fingerprint(
+            "search",
+            search_request,
+        )
+        self.assertEqual(
+            search_fingerprint,
+            state.research_request_fingerprint(
+                "search",
+                dict(reversed(list(search_request.items()))),
+            ),
+        )
+        self.assertNotEqual(
+            search_fingerprint,
+            state.research_request_fingerprint("extract", search_request),
+        )
+
+        started = self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            now=T0,
+        )
+        self.assertTrue(started.should_execute)
+        self.assertEqual("started", started.record.status)
+        self.assertIsNone(started.record.credits)
+
+        replay = self.store.begin_research_action(
+            lease.token,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            now=T0 + timedelta(seconds=1),
+        )
+        self.assertFalse(replay.should_execute)
+        self.assertEqual(started.record.action_id, replay.record.action_id)
+        self.assertEqual("started", replay.record.status)
+
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "different request",
+        ):
+            self.store.begin_research_action(
+                lease,
+                round_number=0,
+                action="search",
+                request_fingerprint=state.research_request_fingerprint(
+                    "search",
+                    {"queries": ['"Panel" manual']},
+                ),
+                now=T0 + timedelta(seconds=1),
+            )
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "already recorded",
+        ):
+            self.store.begin_research_action(
+                lease,
+                round_number=1,
+                action="search",
+                request_fingerprint=search_fingerprint,
+                now=T0 + timedelta(seconds=1),
+            )
+
+        search_summary = {
+            "queries": ['  "Panel"   datasheet  '],
+            "candidate_urls": [
+                "HTTPS://Manufacturer.Example:443/panel.pdf#page=1",
+                "https://docs.example/panel",
+            ],
+            "request_ids": ["request-1"],
+        }
+        completed_search = self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            status="completed",
+            result_summary=search_summary,
+            credits=3,
+            now=T0 + timedelta(seconds=2),
+        )
+        self.assertEqual("completed", completed_search.status)
+        self.assertEqual(3.0, completed_search.credits)
+        self.assertEqual(
+            ['"Panel" datasheet'],
+            completed_search.result_summary["queries"],
+        )
+        self.assertEqual(
+            "https://manufacturer.example/panel.pdf",
+            completed_search.result_summary["candidate_urls"][0],
+        )
+        exact_finish_replay = self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            status="completed",
+            result_summary=search_summary,
+            credits=3,
+            now=T0 + timedelta(seconds=3),
+        )
+        self.assertEqual(completed_search, exact_finish_replay)
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "terminal state",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action="search",
+                request_fingerprint=search_fingerprint,
+                status="failed",
+                credits=3,
+                error="late failure",
+                now=T0 + timedelta(seconds=3),
+            )
+
+        extract_fingerprint = state.research_request_fingerprint(
+            "extract",
+            {"urls": ["https://manufacturer.example/panel.pdf"]},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="extract",
+            request_fingerprint=extract_fingerprint,
+            now=T0 + timedelta(seconds=3),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "require a result_summary",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action="extract",
+                request_fingerprint=extract_fingerprint,
+                status="completed",
+                result_summary=None,
+                credits=1,
+                now=T0 + timedelta(seconds=4),
+            )
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "completed search action",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action="extract",
+                request_fingerprint=extract_fingerprint,
+                status="completed",
+                result_summary={
+                    "submitted_urls": ["https://outside.example/panel"],
+                    "successful_urls": ["https://outside.example/panel"]
+                },
+                credits=1,
+                now=T0 + timedelta(seconds=4),
+            )
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "submitted set",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action="extract",
+                request_fingerprint=extract_fingerprint,
+                status="completed",
+                result_summary={
+                    "submitted_urls": [
+                        "https://manufacturer.example/panel.pdf"
+                    ],
+                    "successful_urls": [
+                        "https://docs.example/panel"
+                    ],
+                },
+                credits=1,
+                now=T0 + timedelta(seconds=4),
+            )
+        completed_extract = self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="extract",
+            request_fingerprint=extract_fingerprint,
+            status="completed",
+            result_summary={
+                "submitted_urls": [
+                    "https://manufacturer.example/panel.pdf"
+                ],
+                "successful_urls": [
+                    "https://manufacturer.example/panel.pdf"
+                ]
+            },
+            credits=1,
+            now=T0 + timedelta(seconds=4),
+        )
+        self.assertEqual("completed", completed_extract.status)
+
+        failed_fingerprint = state.research_request_fingerprint(
+            "ai",
+            {"round": 0},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="ai",
+            request_fingerprint=failed_fingerprint,
+            now=T0 + timedelta(seconds=5),
+        )
+        with self.assertRaisesRegex(ValueError, "explicit known credit"):
+            self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action="ai",
+                request_fingerprint=failed_fingerprint,
+                status="failed",
+                error="provider rejected request",
+                now=T0 + timedelta(seconds=6),
+            )
+        failed = self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="ai",
+            request_fingerprint=failed_fingerprint,
+            status="failed",
+            credits=0,
+            error="provider rejected request",
+            now=T0 + timedelta(seconds=6),
+        )
+        self.assertEqual("failed", failed.status)
+
+        uncertain_fingerprint = state.research_request_fingerprint(
+            "ai",
+            {"round": 1},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=1,
+            action="ai",
+            request_fingerprint=uncertain_fingerprint,
+            now=T0 + timedelta(seconds=7),
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "require a result_summary",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=1,
+                action="ai",
+                request_fingerprint=uncertain_fingerprint,
+                status="completed",
+                result_summary=None,
+                credits=0,
+                now=T0 + timedelta(seconds=8),
+            )
+        with self.assertRaisesRegex(ValueError, "response bodies"):
+            self.store.finish_research_action(
+                lease,
+                round_number=1,
+                action="ai",
+                request_fingerprint=uncertain_fingerprint,
+                status="completed",
+                result_summary={"raw_content": "must not be persisted"},
+                now=T0 + timedelta(seconds=8),
+            )
+        with self.assertRaisesRegex(ValueError, "response bodies"):
+            self.store.finish_research_action(
+                lease,
+                round_number=1,
+                action="ai",
+                request_fingerprint=uncertain_fingerprint,
+                status="completed",
+                result_summary={"rawContent": "must not be persisted"},
+                now=T0 + timedelta(seconds=8),
+            )
+        for forbidden_key in (
+            "responseBody",
+            "promptText",
+            "evidenceText",
+            "fullText",
+            "htmlBody",
+            "document",
+        ):
+            with self.subTest(forbidden_key=forbidden_key), self.assertRaisesRegex(
+                ValueError,
+                "response bodies",
+            ):
+                self.store.finish_research_action(
+                    lease,
+                    round_number=1,
+                    action="ai",
+                    request_fingerprint=uncertain_fingerprint,
+                    status="completed",
+                    result_summary={
+                        forbidden_key: "must not be persisted"
+                    },
+                    now=T0 + timedelta(seconds=8),
+                )
+        for field, nested_value in (
+            ("manufacturer", {"payload": "full response"}),
+            ("gap", {"transcript": "full response"}),
+            ("provider_requests", {"value": 1}),
+        ):
+            with self.subTest(field=field), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                self.store.finish_research_action(
+                    lease,
+                    round_number=1,
+                    action="ai",
+                    request_fingerprint=uncertain_fingerprint,
+                    status="completed",
+                    result_summary={field: nested_value},
+                    credits=0,
+                    now=T0 + timedelta(seconds=8),
+                )
+        uncertain = self.store.finish_research_action(
+            lease,
+            round_number=1,
+            action="ai",
+            request_fingerprint=uncertain_fingerprint,
+            status="uncertain",
+            error="response may have been consumed",
+            now=T0 + timedelta(seconds=8),
+        )
+        self.assertEqual("uncertain", uncertain.status)
+        self.assertIsNone(uncertain.credits)
+
+        self.assertEqual(
+            completed_search,
+            self.store.get_research_action(lease.attempt_id, 0, "search"),
+        )
+        history = self.store.research_action_history(
+            attempt_id=lease.attempt_id
+        )
+        self.assertEqual(
+            ["search", "extract", "ai", "ai"],
+            [item.action for item in history],
+        )
+        self.assertEqual(
+            history,
+            self.store.research_action_history(product_id="P-1"),
+        )
+        stats = self.store.research_action_stats(attempt_id=lease.attempt_id)
+        self.assertEqual(4, stats["actions"])
+        self.assertEqual(4.0, stats["known_credits"])
+        self.assertEqual(1, stats["unknown_credit_actions"])
+        self.assertEqual(1, stats["max_round"])
+        self.assertEqual(2, stats["by_status"]["completed"])
+        self.assertEqual(1, stats["by_status"]["failed"])
+        self.assertEqual(1, stats["by_status"]["uncertain"])
+        self.assertEqual(
+            {"actions": 1, "credits": 3.0},
+            stats["by_action"]["search"],
+        )
+
+    def test_completed_research_extracts_extend_legacy_allowed_evidence(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next(
+            "research-worker",
+            lease_seconds=3600,
+            now=T0,
+        )
+        legacy_url = "https://legacy.example/panel.pdf"
+        researched_url = "https://manufacturer.example/panel.pdf"
+        self.store.begin_search(lease, now=T0)
+        self.store.finish_search(
+            lease,
+            [legacy_url],
+            {"credits": 1},
+            now=T0 + timedelta(seconds=1),
+        )
+        self.store.begin_extract(
+            lease,
+            [legacy_url],
+            now=T0 + timedelta(seconds=2),
+        )
+        self.store.finish_extract(
+            lease,
+            [legacy_url],
+            {"credits": 1},
+            now=T0 + timedelta(seconds=3),
+        )
+
+        search_fingerprint = state.research_request_fingerprint(
+            "search",
+            {"queries": ['"Panel" manufacturer']},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            now=T0 + timedelta(seconds=4),
+        )
+        self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            status="completed",
+            result_summary={
+                "queries": ['"Panel" manufacturer'],
+                "candidate_urls": [researched_url],
+            },
+            credits=1,
+            now=T0 + timedelta(seconds=5),
+        )
+        extract_fingerprint = state.research_request_fingerprint(
+            "extract",
+            {"urls": [researched_url]},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="extract",
+            request_fingerprint=extract_fingerprint,
+            now=T0 + timedelta(seconds=6),
+        )
+        self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="extract",
+            request_fingerprint=extract_fingerprint,
+            status="completed",
+            result_summary={
+                "submitted_urls": [researched_url],
+                "successful_urls": [researched_url],
+            },
+            credits=1,
+            now=T0 + timedelta(seconds=7),
+        )
+
+        self.assertEqual(
+            [legacy_url, researched_url],
+            self.store.allowed_evidence_urls(
+                lease.token,
+                now=T0 + timedelta(seconds=8),
+            ),
+        )
+
+    def test_started_research_action_becomes_uncertain_on_lease_expiry(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next(
+            "research-worker",
+            lease_seconds=10,
+            now=T0,
+        )
+        fingerprint = state.research_request_fingerprint(
+            "ai",
+            {"context_sha256": "a" * 64},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=fingerprint,
+            now=T0,
+        )
+
+        reopened = state.StateStore(self.path)
+        try:
+            replay = reopened.begin_research_action(
+                lease.token,
+                round_number=0,
+                action="search",
+                request_fingerprint=fingerprint,
+                now=T0 + timedelta(seconds=1),
+            )
+            self.assertFalse(replay.should_execute)
+            self.assertEqual("started", replay.record.status)
+            self.assertEqual(
+                1,
+                reopened.reclaim_expired_leases(
+                    now=T0 + timedelta(seconds=11)
+                ),
+            )
+            action = reopened.get_research_action(
+                lease.attempt_id,
+                0,
+                "search",
+            )
+            self.assertEqual("uncertain", action.status)
+            self.assertIsNotNone(action.finished_at)
+            self.assertIsNone(action.credits)
+            self.assertIn("lease expired", action.error)
+            with self.assertRaises(state.LeaseLostError):
+                reopened.begin_research_action(
+                    lease.token,
+                    round_number=0,
+                    action="search",
+                    request_fingerprint=fingerprint,
+                    now=T0 + timedelta(seconds=11),
+                )
+        finally:
+            reopened.close()
+
+    def test_abnormal_prior_attempt_uses_the_prior_actions_provider_scope(self):
+        self.store.upsert_product(product(), now=T0)
+        first = self.store.lease_next(
+            "research-worker-1",
+            lease_seconds=3600,
+            now=T0,
+        )
+        scopes = {
+            "search": "a" * 64,
+            "extract": "a" * 64,
+            "ai": "b" * 64,
+        }
+        fingerprint = state.research_request_fingerprint(
+            "search",
+            {"queries": ['"Panel" datasheet']},
+        )
+        started = self.store.begin_research_action(
+            first,
+            round_number=0,
+            action="ai",
+            request_fingerprint=fingerprint,
+            scope_fingerprint=scopes["ai"],
+            blocking_scope_fingerprints=scopes,
+            now=T0,
+        )
+        self.store.finish_research_action(
+            first,
+            round_number=0,
+            action="ai",
+            request_fingerprint=fingerprint,
+            status="uncertain",
+            error="response status is unknown",
+            now=T0 + timedelta(seconds=1),
+        )
+        self.store.record_outcome(
+            first,
+            "tavily_error",
+            error="network timeout",
+            now=T0 + timedelta(seconds=2),
+        )
+
+        second = self.store.lease_next(
+            "research-worker-2",
+            lease_seconds=3600,
+            now=T0 + timedelta(hours=2),
+        )
+        replay = self.store.begin_research_action(
+            second,
+            round_number=0,
+            action="search",
+            request_fingerprint=state.research_request_fingerprint(
+                "search",
+                {"queries": ['"Panel" datasheet']},
+            ),
+            scope_fingerprint="c" * 64,
+            blocking_scope_fingerprints={
+                **scopes,
+                "search": "c" * 64,
+                "extract": "c" * 64,
+            },
+            now=T0 + timedelta(hours=2),
+        )
+
+        self.assertFalse(replay.should_execute)
+        self.assertEqual(started.record.action_id, replay.record.action_id)
+        self.assertEqual(first.attempt_id, replay.record.attempt_id)
+        self.assertEqual("uncertain", replay.record.status)
+        self.assertEqual(
+            [],
+            self.store.research_action_history(attempt_id=second.attempt_id),
+        )
+        self.store.record_outcome(
+            second,
+            "research_uncertain",
+            now=T0 + timedelta(hours=2, seconds=1),
+        )
+
+        third = self.store.lease_next(
+            "research-worker-3",
+            lease_seconds=3600,
+            now=T0 + timedelta(days=31),
+        )
+        changed_ai_scope = self.store.begin_research_action(
+            third,
+            round_number=0,
+            action="search",
+            request_fingerprint=state.research_request_fingerprint(
+                "search",
+                {"queries": ['"Panel" datasheet']},
+            ),
+            scope_fingerprint="c" * 64,
+            blocking_scope_fingerprints={
+                "search": "c" * 64,
+                "extract": "c" * 64,
+                "ai": "d" * 64,
+            },
+            now=T0 + timedelta(days=31),
+        )
+        self.assertTrue(changed_ai_scope.should_execute)
+
+    def test_normal_finished_attempt_allows_intentional_future_refresh(self):
+        self.store.upsert_product(product(), now=T0)
+        first = self.store.lease_next("research-worker-1", now=T0)
+        fingerprint = state.research_request_fingerprint(
+            "search",
+            {"queries": ['"Panel" datasheet']},
+        )
+        self.store.begin_research_action(
+            first,
+            round_number=0,
+            action="search",
+            request_fingerprint=fingerprint,
+            now=T0,
+        )
+        self.store.finish_research_action(
+            first,
+            round_number=0,
+            action="search",
+            request_fingerprint=fingerprint,
+            status="completed",
+            result_summary={
+                "queries": ['"Panel" datasheet'],
+                "candidate_urls": [],
+            },
+            credits=1,
+            now=T0 + timedelta(seconds=1),
+        )
+        self.store.record_outcome(
+            first,
+            "no_datasheet",
+            now=T0 + timedelta(seconds=2),
+        )
+
+        second = self.store.lease_next(
+            "research-worker-2",
+            now=T0 + timedelta(days=31),
+        )
+        refreshed = self.store.begin_research_action(
+            second,
+            round_number=0,
+            action="search",
+            request_fingerprint=fingerprint,
+            now=T0 + timedelta(days=31),
+        )
+        self.assertTrue(refreshed.should_execute)
+        self.assertNotEqual(first.attempt_id, refreshed.record.attempt_id)
+
+    def test_counts_distinct_products_for_ai_output_circuit(self):
+        provider_fingerprint = "e" * 64
+        for index in range(2):
+            product_id = f"P-AI-{index}"
+            self.store.upsert_product(
+                product(product_id=product_id),
+                now=T0 + timedelta(seconds=index),
+            )
+            lease = self.store.lease_next(
+                f"worker-{index}",
+                now=T0 + timedelta(seconds=index),
+            )
+            fingerprint = state.research_request_fingerprint(
+                "ai",
+                {"product": product_id},
+            )
+            self.store.begin_research_action(
+                lease,
+                round_number=0,
+                action="ai",
+                request_fingerprint=fingerprint,
+                now=T0 + timedelta(seconds=index),
+            )
+            self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action="ai",
+                request_fingerprint=fingerprint,
+                status="uncertain",
+                result_summary={
+                    "provider_fingerprint": provider_fingerprint,
+                    "provider_requests": 2,
+                    "error_type": "AIInvalidOutputError",
+                },
+                error="invalid output after repair",
+                now=T0 + timedelta(seconds=index + 1),
+            )
+            self.store.record_outcome(
+                lease,
+                "ai_error",
+                error="invalid output after repair",
+                now=T0 + timedelta(seconds=index + 2),
+            )
+
+        self.assertEqual(
+            2,
+            self.store.recent_ai_provider_error_products(
+                provider_fingerprint,
+                error_types={"AIInvalidOutputError"},
+                within=timedelta(hours=1),
+                now=T0 + timedelta(minutes=1),
+            ),
+        )
+
+    def test_research_compiled_ceilings_include_legacy_audit(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("research-worker", now=T0)
+        legacy_urls = [
+            f"https://legacy.example/panel-{index}.pdf"
+            for index in range(5)
+        ]
+        researched_url = "https://manufacturer.example/panel.pdf"
+        self.store.begin_search(lease, now=T0)
+        self.store.finish_search(
+            lease,
+            [*legacy_urls, researched_url],
+            {"credits": 4},
+            now=T0 + timedelta(seconds=1),
+        )
+        self.store.begin_extract(
+            lease,
+            legacy_urls,
+            now=T0 + timedelta(seconds=2),
+        )
+        self.store.finish_extract(
+            lease,
+            legacy_urls,
+            {"credits": 0},
+            now=T0 + timedelta(seconds=3),
+        )
+
+        for round_number, queries, credits in (
+            (0, ["q0", "q1", "q2"], 90),
+            (1, ["q3"], 6),
+        ):
+            fingerprint = state.research_request_fingerprint(
+                "search",
+                {"queries": queries},
+            )
+            self.store.begin_research_action(
+                lease,
+                round_number=round_number,
+                action="search",
+                request_fingerprint=fingerprint,
+                now=T0 + timedelta(seconds=4 + round_number * 2),
+            )
+            self.store.finish_research_action(
+                lease,
+                round_number=round_number,
+                action="search",
+                request_fingerprint=fingerprint,
+                status="completed",
+                result_summary={
+                    "queries": queries,
+                    "candidate_urls": [researched_url],
+                },
+                credits=credits,
+                now=T0 + timedelta(seconds=5 + round_number * 2),
+            )
+
+        too_many_queries = state.research_request_fingerprint(
+            "search",
+            {"queries": ["q4"]},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=2,
+            action="search",
+            request_fingerprint=too_many_queries,
+            now=T0 + timedelta(seconds=8),
+        )
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "7-query ceiling",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=2,
+                action="search",
+                request_fingerprint=too_many_queries,
+                status="completed",
+                result_summary={
+                    "queries": ["q4"],
+                    "candidate_urls": [],
+                },
+                credits=0,
+                now=T0 + timedelta(seconds=9),
+            )
+
+        extract_fingerprint = state.research_request_fingerprint(
+            "extract",
+            {"urls": [researched_url]},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="extract",
+            request_fingerprint=extract_fingerprint,
+            now=T0 + timedelta(seconds=10),
+        )
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "5-URL ceiling",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action="extract",
+                request_fingerprint=extract_fingerprint,
+                status="completed",
+                result_summary={
+                    "submitted_urls": [researched_url],
+                    "successful_urls": [researched_url],
+                },
+                credits=0,
+                now=T0 + timedelta(seconds=11),
+            )
+
+        ai_fingerprint = state.research_request_fingerprint(
+            "ai",
+            {"round": 2},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=2,
+            action="ai",
+            request_fingerprint=ai_fingerprint,
+            now=T0 + timedelta(seconds=12),
+        )
+        with self.assertRaisesRegex(
+            state.AttemptBudgetError,
+            "100-credit ceiling",
+        ):
+            self.store.finish_research_action(
+                lease,
+                round_number=2,
+                action="ai",
+                request_fingerprint=ai_fingerprint,
+                status="completed",
+                result_summary={"action_type": "final"},
+                credits=1,
+                now=T0 + timedelta(seconds=13),
+            )
+
+        with self.assertRaisesRegex(ValueError, "one of"):
+            state.research_request_fingerprint(
+                "search_extra",
+                {"queries": ["bypass"]},
+            )
+        with self.assertRaisesRegex(ValueError, "between 0 and 2"):
+            self.store.begin_research_action(
+                lease,
+                round_number=3,
+                action="ai",
+                request_fingerprint=ai_fingerprint,
+                now=T0 + timedelta(seconds=14),
+            )
+
+    def test_finishing_attempt_seals_started_research_action_as_uncertain(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("research-worker", now=T0)
+        fingerprint = state.research_request_fingerprint(
+            "ai",
+            {"round": 0},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="ai",
+            request_fingerprint=fingerprint,
+            now=T0,
+        )
+
+        self.store.record_outcome(
+            lease,
+            "no_datasheet",
+            now=T0 + timedelta(seconds=1),
+        )
+
+        action = self.store.get_research_action(
+            lease.attempt_id,
+            0,
+            "ai",
+        )
+        self.assertEqual("uncertain", action.status)
+        self.assertIsNone(action.credits)
+        self.assertIn("attempt ended", action.error)
+
     def test_expired_lease_is_reclaimed_and_audited(self):
         self.store.upsert_product(product(), now=T0)
         expired = self.store.lease_next("dead-worker", lease_seconds=10, now=T0)
@@ -473,6 +1403,40 @@ class StateStoreTests(unittest.TestCase):
         )
         self.assertNotEqual(replacement.source_hash, lease.source_hash)
         self.assertEqual(replacement.payload["product_name"], "Panel revision B")
+
+    def test_changed_source_is_due_immediately_when_its_lease_expires(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next(
+            "dead-worker",
+            lease_seconds=10,
+            now=T0,
+        )
+        changed = product(
+            name="Panel revision B",
+            updated_at=T0 + timedelta(seconds=5),
+        )
+        self.store.upsert_product(changed, now=T0 + timedelta(seconds=5))
+
+        reclaimed_at = T0 + timedelta(seconds=11)
+        reclaimed = self.store.reclaim_expired_leases(now=reclaimed_at)
+
+        self.assertEqual(1, reclaimed)
+        current = self.store.get_product("P-1")
+        self.assertEqual("due", current.status)
+        self.assertEqual(0, current.consecutive_failures)
+        self.assertEqual(reclaimed_at, current.next_run_at)
+        self.assertEqual("stale_source", current.last_outcome)
+        history = self.store.attempt_history("P-1")
+        self.assertEqual("stale_source", history[0].outcome)
+        replacement = self.store.lease_next(
+            "worker-b",
+            now=reclaimed_at,
+        )
+        self.assertNotEqual(lease.source_hash, replacement.source_hash)
+        self.assertEqual(
+            "Panel revision B",
+            replacement.payload["product_name"],
+        )
 
     def test_two_store_instances_cannot_lease_the_same_task(self):
         self.store.upsert_product(product(), now=T0)
@@ -560,6 +1524,28 @@ class StateStoreTests(unittest.TestCase):
                         "PRAGMA table_info(attempts)"
                     )
                 }
+                tables = {
+                    row[0]
+                    for row in migrated_connection.execute(
+                        """
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE type = 'table'
+                        """
+                    )
+                }
+                research_indexes = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA index_list(research_actions)"
+                    )
+                }
+                research_columns = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA table_info(research_actions)"
+                    )
+                }
             finally:
                 migrated_connection.close()
             self.assertTrue(
@@ -573,6 +1559,25 @@ class StateStoreTests(unittest.TestCase):
                     "extract_usage_json",
                 }.issubset(columns)
             )
+            self.assertIn("research_actions", tables)
+            self.assertIn("research_actions_attempt_idx", research_indexes)
+            self.assertIn("research_actions_status_idx", research_indexes)
+            self.assertIn("research_actions_scope_idx", research_indexes)
+            self.assertIn("scope_fingerprint", research_columns)
+
+            fingerprint = state.research_request_fingerprint(
+                "search",
+                {"queries": ['"LEGACY" datasheet']},
+            )
+            started = migrated.begin_research_action(
+                "legacy-token",
+                round_number=0,
+                action="search",
+                request_fingerprint=fingerprint,
+                now=T0,
+            )
+            self.assertTrue(started.should_execute)
+            self.assertEqual("started", started.record.status)
         finally:
             migrated.close()
 

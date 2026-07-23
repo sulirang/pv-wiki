@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -15,7 +16,99 @@ class ConfigError(ValueError):
     """Raised when runtime configuration is missing or unsafe."""
 
 
+class TrustedSourceNotConfigured(LookupError):
+    """Raised only by the legacy strict single-brand lookup helper."""
+
+
 _PLACEHOLDER_PREFIXES = ("replace-me", "replace-with-", "<replace-")
+_COMMON_COUNTRY_PUBLIC_SUFFIX_LABELS = frozenset(
+    {"ac", "co", "com", "edu", "gov", "net", "org"}
+)
+_KNOWN_SHARED_HOST_SUFFIXES = frozenset(
+    {
+        "amazonaws.com",
+        "appspot.com",
+        "azurewebsites.net",
+        "azureedge.net",
+        "backblazeb2.com",
+        "blob.core.windows.net",
+        "blogspot.com",
+        "box.com",
+        "canva.site",
+        "carrd.co",
+        "cloudfront.net",
+        "cloudfunctions.net",
+        "digitaloceanspaces.com",
+        "docs.google.com",
+        "drive.google.com",
+        "dropbox.com",
+        "facebook.com",
+        "firebaseapp.com",
+        "ghost.io",
+        "github.io",
+        "githubusercontent.com",
+        "gitlab.io",
+        "groups.google.com",
+        "hashnode.dev",
+        "herokuapp.com",
+        "instagram.com",
+        "issuu.com",
+        "linkedin.com",
+        "linodeobjects.com",
+        "medium.com",
+        "myshopify.com",
+        "netlify.app",
+        "notion.site",
+        "notion.so",
+        "onrender.com",
+        "onedrive.live.com",
+        "pages.dev",
+        "r2.cloudflarestorage.com",
+        "r2.dev",
+        "readthedocs.io",
+        "reddit.com",
+        "run.app",
+        "scribd.com",
+        "sharepoint.com",
+        "sites.google.com",
+        "slideshare.net",
+        "storage.googleapis.com",
+        "substack.com",
+        "surge.sh",
+        "tumblr.com",
+        "twitter.com",
+        "vercel.app",
+        "wasabisys.com",
+        "web.app",
+        "weebly.com",
+        "wixsite.com",
+        "workers.dev",
+        "wordpress.com",
+        "x.com",
+        "youtube.com",
+        "youtu.be",
+    }
+)
+
+
+def is_shared_source_hostname(hostname: str) -> bool:
+    """Reject IP literals and hosts controlled by unrelated public tenants."""
+
+    if not isinstance(hostname, str):
+        return False
+    host = hostname.strip().rstrip(".").casefold()
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return True
+    return any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in _KNOWN_SHARED_HOST_SUFFIXES
+    )
 
 
 def is_placeholder_value(value: str) -> bool:
@@ -151,6 +244,45 @@ class WikiSettings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchSettings:
+    """Hard-bounded budgets for one product's inner research loop."""
+
+    max_rounds: int
+    max_queries: int
+    max_credits: int
+    max_seconds: float
+
+    @classmethod
+    def from_env(cls) -> "ResearchSettings":
+        return cls(
+            max_rounds=_int_env(
+                "PV_WIKI_RESEARCH_MAX_ROUNDS",
+                3,
+                1,
+                3,
+            ),
+            max_queries=_int_env(
+                "PV_WIKI_RESEARCH_MAX_QUERIES",
+                7,
+                3,
+                7,
+            ),
+            max_credits=_int_env(
+                "PV_WIKI_RESEARCH_MAX_CREDITS",
+                20,
+                3,
+                100,
+            ),
+            max_seconds=_float_env(
+                "PV_WIKI_RESEARCH_MAX_SECONDS",
+                600.0,
+                60.0,
+                1200.0,
+            ),
+        )
+
+
 def min_publish_confidence() -> float:
     return _float_env("PV_WIKI_AUTO_PUBLISH_MIN_CONFIDENCE", 0.85, 0.5, 1.0)
 
@@ -177,12 +309,19 @@ def _validated_source_domain(value: object) -> str:
             "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON values must be hostnames"
         )
     domain = value.strip().rstrip(".").casefold()
+    labels = domain.split(".")
+    is_public_suffix = is_shared_source_hostname(domain) or (
+        len(labels) == 2
+        and len(labels[-1]) == 2
+        and labels[0] in _COMMON_COUNTRY_PUBLIC_SUFFIX_LABELS
+    )
     if (
         not domain
         or len(domain) > 253
         or "://" in domain
         or "/" in domain
         or "*" in domain
+        or is_public_suffix
         or not re.fullmatch(
             r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
             r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
@@ -190,7 +329,8 @@ def _validated_source_domain(value: object) -> str:
         )
     ):
         raise ConfigError(
-            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON values must be hostnames"
+            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON values must be narrow hostnames, "
+            "not public or shared hosting suffixes"
         )
     return domain
 
@@ -207,23 +347,26 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def trusted_source_domain_map() -> dict[str, frozenset[str]]:
-    """Return operator-approved domains keyed by catalogue ``brand_code``."""
+    """Return optional overrides keyed by public manufacturer or legacy brand.
+
+    The map is a fast path for official hosts whose domain name does not
+    resemble the public manufacturer name.  It is deliberately optional:
+    ordinary manufacturer hosts can be verified from the current bounded
+    extract by the decision validator.
+    """
 
     raw = os.getenv("PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON", "").strip()
     if not raw:
-        raise ConfigError(
-            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON must map each catalogue "
-            "brand_code to approved source domains"
-        )
+        return {}
     try:
         value = json.loads(raw, object_pairs_hook=_unique_json_object)
     except (json.JSONDecodeError, RecursionError) as exc:
         raise ConfigError(
             "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON must be a JSON object"
         ) from exc
-    if not isinstance(value, dict) or not value:
+    if not isinstance(value, dict):
         raise ConfigError(
-            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON must be a non-empty JSON object"
+            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON must be a JSON object"
         )
     mapping: dict[str, frozenset[str]] = {}
     for raw_brand, raw_domains in value.items():
@@ -234,12 +377,13 @@ def trusted_source_domain_map() -> dict[str, frozenset[str]]:
             or any(ord(character) < 32 for character in raw_brand)
         ):
             raise ConfigError(
-                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON keys must be brand_code strings"
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON keys must be non-empty "
+                "brand code or manufacturer alias strings"
             )
         brand = raw_brand.strip().casefold()
         if brand in mapping:
             raise ConfigError(
-                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON has duplicate brand codes"
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON has duplicate identities"
             )
         if (
             not isinstance(raw_domains, list)
@@ -247,7 +391,7 @@ def trusted_source_domain_map() -> dict[str, frozenset[str]]:
             or len(raw_domains) > 50
         ):
             raise ConfigError(
-                "each trusted source brand must have 1-50 domain strings"
+                "each trusted source identity must have 1-50 domain strings"
             )
         mapping[brand] = frozenset(
             _validated_source_domain(domain) for domain in raw_domains
@@ -259,15 +403,39 @@ def trusted_source_domains(brand_code: str) -> frozenset[str]:
     """Resolve trusted domains for one exact catalogue brand code."""
 
     if not isinstance(brand_code, str) or not brand_code.strip():
-        raise ConfigError(
+        raise TrustedSourceNotConfigured(
             "a non-empty catalogue brand_code is required for trusted publishing"
         )
     domains = trusted_source_domain_map().get(brand_code.strip().casefold())
     if not domains:
-        raise ConfigError(
+        raise TrustedSourceNotConfigured(
             "no trusted source domains are configured for this catalogue brand_code"
         )
     return domains
+
+
+def trusted_source_domains_for_product(
+    brand_code: str | None,
+    discovered_manufacturer: str | None,
+) -> frozenset[str]:
+    """Return the override bound to the best available public identity.
+
+    The AI-discovered manufacturer takes precedence and is never unioned with
+    a possibly stale internal brand code.  The brand code is only a fallback
+    before a public manufacturer is available.  Missing entries are normal;
+    the decision validator can independently verify a manufacturer host from
+    current evidence, so this is not a per-brand approval queue.
+    """
+
+    mapping = trusted_source_domain_map()
+    brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
+    manufacturer = (
+        discovered_manufacturer.strip().casefold()
+        if isinstance(discovered_manufacturer, str)
+        else ""
+    )
+    identity = manufacturer or brand
+    return mapping.get(identity, frozenset()) if identity else frozenset()
 
 
 def missing_environment(names: list[str] | tuple[str, ...]) -> list[str]:
@@ -281,9 +449,12 @@ def missing_environment(names: list[str] | tuple[str, ...]) -> list[str]:
 
 __all__ = [
     "ConfigError",
+    "ResearchSettings",
+    "TrustedSourceNotConfigured",
     "WikiSettings",
     "allow_mirrors",
     "include_internal_search_hints",
+    "is_shared_source_hostname",
     "is_placeholder_value",
     "max_extract_chars",
     "min_fact_confidence",
@@ -293,4 +464,5 @@ __all__ = [
     "state_path",
     "trusted_source_domain_map",
     "trusted_source_domains",
+    "trusted_source_domains_for_product",
 ]

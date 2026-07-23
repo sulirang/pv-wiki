@@ -21,7 +21,13 @@
     "product_id": {"type": "string", "minLength": 1},
     "lease_token": {"type": "string", "minLength": 16},
     "outcome": {
-      "enum": ["publish", "no_datasheet", "ambiguous", "insufficient_identity"]
+      "enum": [
+        "publish",
+        "no_datasheet",
+        "ambiguous",
+        "insufficient_identity",
+        "out_of_scope"
+      ]
     },
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     "manufacturer": {"type": "string"},
@@ -33,6 +39,25 @@
       "type": "array",
       "maxItems": 5,
       "items": {"type": "string", "format": "uri"}
+    },
+    "classification_evidence_urls": {
+      "type": "array",
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {"type": "string", "format": "uri"}
+    },
+    "classification_evidence_quotes": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url", "quote"],
+        "properties": {
+          "url": {"type": "string", "format": "uri"},
+          "quote": {"type": "string", "minLength": 8, "maxLength": 500}
+        }
+      }
     },
     "decision_notes": {"type": "string", "minLength": 1, "maxLength": 1000},
     "datasheets": {
@@ -145,6 +170,30 @@
           "summary": {"minLength": 1},
           "datasheets": {"minItems": 1},
           "facts": {"minItems": 5}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"outcome": {"const": "out_of_scope"}},
+        "required": ["outcome"]
+      },
+      "then": {
+        "required": [
+          "product_category",
+          "summary",
+          "classification_evidence_urls",
+          "classification_evidence_quotes"
+        ],
+        "properties": {
+          "product_category": {"minLength": 1},
+          "summary": {"minLength": 1},
+          "classification_evidence_urls": {"minItems": 1},
+          "classification_evidence_quotes": {"minItems": 1},
+          "datasheets": {"maxItems": 0},
+          "sources": {"maxItems": 0},
+          "facts": {"maxItems": 0},
+          "conflicts": {"maxItems": 0}
         }
       }
     }

@@ -65,7 +65,7 @@ class BuildQueriesTests(unittest.TestCase):
         self.assertTrue(all('"Acme"' in query for query in queries))
         self.assertTrue(all('"PV-42"' in query for query in queries))
         self.assertIn("datasheet PDF", queries[0])
-        self.assertIn("review user experience", queries[2])
+        self.assertIn("manufacturer product type official", queries[2])
 
     def test_build_queries_requires_meaningful_identity(self) -> None:
         with self.assertRaises(ValueError):
@@ -73,6 +73,14 @@ class BuildQueriesTests(unittest.TestCase):
 
 
 class TavilyClientTests(unittest.TestCase):
+    def test_credential_scope_is_stable_when_key_order_changes(self) -> None:
+        first = tavily.TavilyClient(api_key=["key-b", "key-a"])
+        second = tavily.TavilyClient(api_key=["key-a", "key-b"])
+        self.assertEqual(
+            first.credential_fingerprint,
+            second.credential_fingerprint,
+        )
+
     def test_missing_api_key_is_clear_and_does_not_touch_network(self) -> None:
         opener = mock.Mock()
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -143,6 +151,119 @@ class TavilyClientTests(unittest.TestCase):
         self.assertEqual(3, bundle["usage"]["credits"])
         serialized = json.dumps(bundle)
         self.assertNotIn("tvly-test-secret", serialized)
+
+    def test_search_queries_runs_only_the_authorized_incremental_batch(self) -> None:
+        payloads: list[dict] = []
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            payload = json.loads(request.data.decode("utf-8"))
+            payloads.append(payload)
+            return FakeResponse(
+                {
+                    "results": [
+                        {
+                            "title": payload["query"],
+                            "url": f"https://example.com/{len(payloads)}",
+                            "content": "candidate",
+                            "score": 0.8,
+                        }
+                    ],
+                    "usage": {"credits": 1},
+                    "request_id": f"incremental-{len(payloads)}",
+                }
+            )
+
+        client = tavily.TavilyClient(
+            api_key="tvly-test",
+            opener=fake_urlopen,
+        )
+        bundle = client.search_queries(
+            ['"PV-42" Acme official', '"PV-42" independent specifications'],
+            max_results=4,
+        )
+
+        self.assertEqual(2, len(payloads))
+        self.assertEqual(
+            ['"PV-42" Acme official', '"PV-42" independent specifications'],
+            [payload["query"] for payload in payloads],
+        )
+        self.assertTrue(all(payload["max_results"] == 4 for payload in payloads))
+        self.assertEqual(2, bundle["usage"]["credits"])
+        self.assertEqual(2, len(bundle["results"]))
+
+    def test_search_queries_rejects_unsafe_or_unbounded_batches_before_network(self) -> None:
+        opener = mock.Mock()
+        client = tavily.TavilyClient(api_key="tvly-test", opener=opener)
+
+        invalid_batches = (
+            [],
+            ["one", "two", "three", "four"],
+            ["duplicate", " DUPLICATE "],
+            ["has\nnewline"],
+            ["x" * 401],
+        )
+        for queries in invalid_batches:
+            with self.subTest(queries=queries):
+                with self.assertRaises((TypeError, ValueError)):
+                    client.search_queries(queries)
+        opener.assert_not_called()
+
+    def test_ambiguous_paid_failures_are_never_replayed(self) -> None:
+        for failure in ("network", "server"):
+            calls = 0
+
+            def fake_urlopen(
+                _request: object,
+                *,
+                timeout: float,
+            ) -> FakeResponse:
+                nonlocal calls
+                del timeout
+                calls += 1
+                if failure == "network":
+                    raise urllib.error.URLError("connection reset")
+                raise urllib.error.HTTPError(
+                    "https://api.tavily.com/search",
+                    503,
+                    "Service Unavailable",
+                    Message(),
+                    io.BytesIO(b"{}"),
+                )
+
+            client = tavily.TavilyClient(
+                api_key=["tvly-first", "tvly-second"],
+                max_retries=3,
+                opener=fake_urlopen,
+            )
+            with self.subTest(failure=failure), self.assertRaises(
+                tavily.TavilyError
+            ):
+                client.search_queries(["PV-42 datasheet"])
+            self.assertEqual(1, calls)
+            self.assertEqual(1, client.last_operation_requests)
+            self.assertEqual(0, client.last_operation_completed_requests)
+
+    def test_missing_or_invalid_usage_credits_fail_closed(self) -> None:
+        invalid_payloads = (
+            {"results": []},
+            {"results": [], "usage": {}},
+            {"results": [], "usage": {"credits": "1"}},
+            {"results": [], "usage": {"credits": -1}},
+        )
+        for payload in invalid_payloads:
+            client = tavily.TavilyClient(
+                api_key="tvly-test",
+                opener=lambda _request, *, timeout, value=payload: FakeResponse(
+                    value
+                ),
+            )
+            with self.subTest(payload=payload), self.assertRaisesRegex(
+                tavily.TavilyResponseError,
+                "usage.credits",
+            ):
+                client.search_queries(["PV-42 datasheet"])
+            self.assertEqual(0, client.last_operation_completed_requests)
 
     def test_429_respects_retry_after_then_succeeds(self) -> None:
         calls = 0
@@ -322,6 +443,42 @@ class TavilyClientTests(unittest.TestCase):
             ["Bearer tvly-first", "Bearer tvly-second"],
             authorizations,
         )
+
+    def test_partial_search_quota_failure_exposes_known_completed_cost(self) -> None:
+        calls = 0
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            nonlocal calls
+            del timeout
+            calls += 1
+            if calls == 1:
+                return FakeResponse(
+                    {
+                        "results": [],
+                        "usage": {"credits": 1},
+                        "request_id": "completed-1",
+                    }
+                )
+            raise urllib.error.HTTPError(
+                request.full_url,
+                432,
+                "Plan Limit Exceeded",
+                Message(),
+                io.BytesIO(b"{}"),
+            )
+
+        client = tavily.TavilyClient(
+            api_key="tvly-test",
+            opener=fake_urlopen,
+        )
+        with self.assertRaises(tavily.TavilyQuotaExhaustedError):
+            client.search_queries(
+                ["PV-42 datasheet", "PV-42 specifications"]
+            )
+
+        self.assertEqual(2, client.last_operation_requests)
+        self.assertEqual(1, client.last_operation_completed_requests)
+        self.assertEqual(1, client.last_operation_known_credits)
 
     def test_extract_urls_validates_caps_and_uses_tavily_only(self) -> None:
         seen: list[tuple[object, dict]] = []

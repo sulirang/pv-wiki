@@ -81,10 +81,25 @@ class WorkerHTTPTests(unittest.TestCase):
         self.environment.start()
         self.token = "worker-token-" + ("x" * 32)
         self.calls = 0
+        self.sync_calls = 0
+        self.refresh_calls = 0
+        self.home_calls = 0
 
         def run() -> dict:
             self.calls += 1
             return {"ok": True, "processed": False}
+
+        def sync() -> dict:
+            self.sync_calls += 1
+            return {"ok": True, "source_records": 0}
+
+        def publish_home() -> dict:
+            self.home_calls += 1
+            return {"ok": True, "published": True}
+
+        def refresh() -> dict:
+            self.refresh_calls += 1
+            return {"ok": True, "source_records": 0}
 
         self.port = free_port()
         self.httpd = server.build_server(
@@ -93,7 +108,12 @@ class WorkerHTTPTests(unittest.TestCase):
                 host="127.0.0.1",
                 port=self.port,
             ),
-            operations={"/run-one": run},
+            operations={
+                "/run-one": run,
+                "/sync-catalogue": sync,
+                "/refresh-catalogue": refresh,
+                "/publish-home": publish_home,
+            },
         )
         self.thread = threading.Thread(
             target=self.httpd.serve_forever,
@@ -183,6 +203,74 @@ class WorkerHTTPTests(unittest.TestCase):
         )
         self.assertEqual(401, status)
         self.assertEqual("unauthorized", payload["error"])
+
+    def test_overlapping_run_one_stops_cleanly_without_a_false_failure(
+        self,
+    ) -> None:
+        self.assertTrue(server._RUN_LOCK.acquire(blocking=False))
+        try:
+            status, payload = self.request(
+                "POST",
+                "/run-one",
+                body="{}",
+                authorized=True,
+            )
+        finally:
+            server._RUN_LOCK.release()
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["processed"])
+        self.assertEqual("worker_busy", payload["reason"])
+        self.assertEqual(0, self.calls)
+
+    def test_catalogue_sync_can_run_while_product_research_is_active(
+        self,
+    ) -> None:
+        self.assertTrue(server._RUN_LOCK.acquire(blocking=False))
+        try:
+            status, payload = self.request(
+                "POST",
+                "/sync-catalogue",
+                body="{}",
+                authorized=True,
+            )
+        finally:
+            server._RUN_LOCK.release()
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(1, self.sync_calls)
+
+    def test_daily_catalogue_refresh_uses_the_catalogue_lane(self) -> None:
+        status, payload = self.request(
+            "POST",
+            "/refresh-catalogue",
+            body="{}",
+            authorized=True,
+        )
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(1, self.refresh_calls)
+
+    def test_homepage_refresh_can_run_while_product_research_is_active(
+        self,
+    ) -> None:
+        self.assertTrue(server._RUN_LOCK.acquire(blocking=False))
+        try:
+            status, payload = self.request(
+                "POST",
+                "/publish-home",
+                body="{}",
+                authorized=True,
+            )
+        finally:
+            server._RUN_LOCK.release()
+
+        self.assertEqual(200, status)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(1, self.home_calls)
 
 
 if __name__ == "__main__":

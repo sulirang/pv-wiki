@@ -7,6 +7,7 @@ URLs to Tavily Extract.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -27,7 +28,10 @@ from .render import validate_public_http_url
 API_BASE_URL = "https://api.tavily.com"
 DEFAULT_TIMEOUT = 20.0
 MAX_PRODUCT_QUERIES = 3
+MAX_SEARCH_QUERIES_PER_CALL = 3
 MAX_EXTRACT_URLS = 5
+BASIC_SEARCH_CREDITS_PER_QUERY = 1
+ADVANCED_EXTRACT_CREDITS_PER_BATCH = 2
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 MAX_RETRY_DELAY = 60.0
 _TRANSIENT_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
@@ -53,6 +57,15 @@ class TavilyConfigError(TavilyError):
 
 class TavilyHTTPError(TavilyError):
     """Raised for a non-retryable or exhausted Tavily HTTP response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        self.status_code = status_code
+        super().__init__(message)
 
 
 class TavilyQuotaExhaustedError(TavilyError):
@@ -162,13 +175,13 @@ def build_queries(product: Mapping[str, Any]) -> list[str]:
         f"{exact_identity} specifications technical manual",
     ]
 
-    review_context = ""
+    category_context = ""
     if category and category.casefold() not in {
         item.casefold() for item in identity
     }:
-        review_context = _quote(category)
+        category_context = _quote(category)
     candidates.append(
-        f"{exact_identity} {review_context} review user experience reliability".strip()
+        f"{exact_identity} {category_context} manufacturer product type official".strip()
     )
 
     queries: list[str] = []
@@ -182,6 +195,36 @@ def build_queries(product: Mapping[str, Any]) -> list[str]:
         if len(queries) == MAX_PRODUCT_QUERIES:
             break
     return queries
+
+
+def _validated_queries(queries: Sequence[str]) -> list[str]:
+    """Return a small, unambiguous set of caller-supplied search queries."""
+
+    if isinstance(queries, (str, bytes)) or not isinstance(queries, Sequence):
+        raise TypeError("queries must be a sequence of strings")
+    if not 1 <= len(queries) <= MAX_SEARCH_QUERIES_PER_CALL:
+        raise ValueError(
+            f"queries must contain 1-{MAX_SEARCH_QUERIES_PER_CALL} items"
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_query in queries:
+        if not isinstance(raw_query, str):
+            raise TypeError("queries must contain only strings")
+        if any(ord(character) < 32 or ord(character) == 127 for character in raw_query):
+            raise ValueError("queries must not contain control characters")
+        query = re.sub(r"\s+", " ", raw_query).strip()
+        if not query:
+            raise ValueError("queries must not contain empty strings")
+        if len(query) > 400:
+            raise ValueError("queries must not exceed 400 characters")
+        key = query.casefold()
+        if key in seen:
+            raise ValueError("queries must be unique")
+        seen.add(key)
+        normalized.append(query)
+    return normalized
 
 
 def _canonical_url(url: str, *, validate_public: bool) -> tuple[str, str]:
@@ -258,6 +301,27 @@ def _credit_value(value: Any) -> int | float:
     return int(number) if number.is_integer() else number
 
 
+def _required_response_credits(response: Mapping[str, Any]) -> int | float:
+    """Return provider-reported credits without treating bad audit data as zero."""
+
+    usage = response.get("usage")
+    if not isinstance(usage, Mapping) or "credits" not in usage:
+        raise TavilyResponseError(
+            "Tavily response is missing usage.credits"
+        )
+    value = usage["credits"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TavilyResponseError(
+            "Tavily response usage.credits must be a number"
+        )
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise TavilyResponseError(
+            "Tavily response usage.credits must be finite and non-negative"
+        )
+    return int(number) if number.is_integer() else number
+
+
 def _retry_after_seconds(error: urllib.error.HTTPError) -> float | None:
     raw = error.headers.get("Retry-After") if error.headers is not None else None
     if not raw:
@@ -322,7 +386,13 @@ class _QuotaExhaustedSignal(Exception):
 
 
 class TavilyClient:
-    """Tavily REST client with bounded retries, multi-key rotation, and no secret persistence."""
+    """Tavily REST client with safe 429/quota rotation and no secret persistence.
+
+    Paid POSTs are not replayed after a timeout, connection failure, 5xx, or
+    malformed response because the provider may already have consumed the
+    request. Only explicit 429 and exhausted-key responses are safe to rotate
+    or retry.
+    """
 
     def __init__(
         self,
@@ -348,6 +418,9 @@ class TavilyClient:
             raise TavilyConfigError("backoff_base must be finite and non-negative")
 
         self._keys: list[str] = keys
+        self.credential_fingerprint = hashlib.sha256(
+            "\0".join(sorted(set(keys))).encode("utf-8")
+        ).hexdigest()
         self._key_index: int = 0
         # Per-key rate-limit cooldown: key_str -> epoch_seconds when usable again.
         self._rate_limited_until: dict[str, float] = {}
@@ -359,6 +432,9 @@ class TavilyClient:
         self.backoff_base = float(backoff_base)
         self._sleep = sleep
         self._opener = opener or _NO_REDIRECT_OPENER.open
+        self.last_operation_requests = 0
+        self.last_operation_completed_requests = 0
+        self.last_operation_known_credits: int | float = 0
 
     # ------------------------------------------------------------------
     # Key management
@@ -473,12 +549,9 @@ class TavilyClient:
                     break
                 except TavilyHTTPError:
                     raise
-                except (TavilyNetworkError, TavilyResponseError) as exc:
-                    # _post_with_key already exhausted its bounded retries.
-                    # Try another usable key, if one exists.
-                    last_error = exc
-                    if self._advance_key():
-                        continue
+                except (TavilyNetworkError, TavilyResponseError):
+                    # The paid request may have reached Tavily. Never replay it
+                    # with this or another key when its result is uncertain.
                     raise
             if len(self._quota_exhausted_keys) == len(self._keys):
                 raise TavilyQuotaExhaustedError(
@@ -491,7 +564,8 @@ class TavilyClient:
                 raise TavilyNetworkError("All Tavily API keys exhausted")
             if rate_limit_round >= self.max_retries:
                 raise TavilyHTTPError(
-                    "Tavily API returned HTTP 429 after bounded retries"
+                    "Tavily API returned HTTP 429 after bounded retries",
+                    status_code=429,
                 )
 
             fallback = self.backoff_base * (2**rate_limit_round)
@@ -512,7 +586,7 @@ class TavilyClient:
     def _post_with_key(
         self, path: str, payload: Mapping[str, Any], api_key: str
     ) -> dict[str, Any]:
-        """Send a single request with the given key, retrying transient errors."""
+        """Send one paid request; ambiguous failures are never retried."""
 
         for attempt in range(self.max_retries + 1):
             request = urllib.request.Request(
@@ -551,18 +625,15 @@ class TavilyClient:
                     # Rate limited — signal key rotation instead of retrying.
                     retry_after = _retry_after_seconds(exc)
                     raise _RateLimitSignal(retry_after=retry_after) from None
-                if exc.code in _TRANSIENT_HTTP_CODES and attempt < self.max_retries:
-                    delay = self.backoff_base * (2**attempt)
-                    self._sleep(_bounded_retry_delay(delay))
-                    continue
-                raise TavilyHTTPError(f"Tavily API returned HTTP {exc.code}") from None
+                raise TavilyHTTPError(
+                    f"Tavily API returned HTTP {exc.code}",
+                    status_code=exc.code,
+                ) from None
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                if attempt < self.max_retries:
-                    self._sleep(
-                        _bounded_retry_delay(self.backoff_base * (2**attempt))
-                    )
-                    continue
-                raise TavilyNetworkError("Tavily API request failed after retries") from exc
+                raise TavilyNetworkError(
+                    "Tavily API request failed; ambiguous paid request was "
+                    "not replayed"
+                ) from exc
 
             try:
                 decoded = json.loads(body.decode("utf-8"))
@@ -589,17 +660,33 @@ class TavilyClient:
     ) -> dict[str, Any]:
         """Search a product with focused queries and return a deduplicated bundle."""
 
+        return self.search_queries(
+            build_queries(product),
+            max_results=max_results,
+        )
+
+    def search_queries(
+        self,
+        queries: Sequence[str],
+        max_results: int = 5,
+    ) -> dict[str, Any]:
+        """Run one bounded batch of already locally authorized queries."""
+
+        self.last_operation_requests = 0
+        self.last_operation_completed_requests = 0
+        self.last_operation_known_credits = 0
         if isinstance(max_results, bool) or not isinstance(max_results, int):
             raise TypeError("max_results must be an integer")
         if not 1 <= max_results <= 20:
             raise ValueError("max_results must be between 1 and 20")
 
-        queries = build_queries(product)
+        clean_queries = _validated_queries(queries)
         merged: dict[str, dict[str, Any]] = {}
         credits: int | float = 0
         request_ids: list[str] = []
 
-        for query in queries:
+        for query in clean_queries:
+            self.last_operation_requests += 1
             response = self._post(
                 "/search",
                 {
@@ -613,9 +700,10 @@ class TavilyClient:
                     "include_usage": True,
                 },
             )
-            usage = response.get("usage")
-            if isinstance(usage, Mapping):
-                credits += _credit_value(usage.get("credits"))
+            response_credits = _required_response_credits(response)
+            credits += response_credits
+            self.last_operation_known_credits = _credit_value(credits)
+            self.last_operation_completed_requests += 1
             request_id = response.get("request_id")
             if isinstance(request_id, str) and request_id:
                 request_ids.append(request_id)
@@ -654,7 +742,7 @@ class TavilyClient:
             merged.values(), key=lambda item: (-item["score"], item["url"])
         )[:max_results]
         return {
-            "queries": queries,
+            "queries": clean_queries,
             "search_depth": "basic",
             "max_results": max_results,
             "results": ranked,
@@ -665,6 +753,9 @@ class TavilyClient:
     def extract_urls(self, urls: Sequence[str], query: str) -> dict[str, Any]:
         """Ask Tavily to extract at most five validated public web URLs."""
 
+        self.last_operation_requests = 0
+        self.last_operation_completed_requests = 0
+        self.last_operation_known_credits = 0
         if isinstance(urls, (str, bytes)) or not isinstance(urls, Sequence):
             raise TypeError("urls must be a sequence of URL strings")
         clean_query = re.sub(r"\s+", " ", str(query or "")).strip()
@@ -685,6 +776,7 @@ class TavilyClient:
         if len(submitted) > MAX_EXTRACT_URLS:
             raise ValueError(f"at most {MAX_EXTRACT_URLS} unique URLs may be extracted")
 
+        self.last_operation_requests = 1
         response = self._post(
             "/extract",
             {
@@ -730,10 +822,9 @@ class TavilyClient:
                     }
                 )
 
-        usage = response.get("usage")
-        credit_count: int | float = 0
-        if isinstance(usage, Mapping):
-            credit_count = _credit_value(usage.get("credits"))
+        credit_count = _required_response_credits(response)
+        self.last_operation_known_credits = credit_count
+        self.last_operation_completed_requests = 1
         request_id = response.get("request_id")
         return {
             "query": clean_query,
@@ -757,6 +848,20 @@ def search_product(
     return (client or TavilyClient()).search_product(product, max_results=max_results)
 
 
+def search_queries(
+    queries: Sequence[str],
+    max_results: int = 5,
+    *,
+    client: TavilyClient | None = None,
+) -> dict[str, Any]:
+    """Module-level convenience wrapper for incremental research searches."""
+
+    return (client or TavilyClient()).search_queries(
+        queries,
+        max_results=max_results,
+    )
+
+
 def extract_urls(
     urls: Sequence[str],
     query: str,
@@ -769,6 +874,8 @@ def extract_urls(
 
 
 __all__ = [
+    "ADVANCED_EXTRACT_CREDITS_PER_BATCH",
+    "BASIC_SEARCH_CREDITS_PER_QUERY",
     "TavilyClient",
     "TavilyConfigError",
     "TavilyError",
@@ -778,4 +885,5 @@ __all__ = [
     "build_queries",
     "extract_urls",
     "search_product",
+    "search_queries",
 ]

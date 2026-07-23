@@ -151,9 +151,13 @@ class WorkflowTemplateTests(unittest.TestCase):
             node
             for path in paths
             for node in json.loads(path.read_text(encoding="utf-8"))["nodes"]
-            if node["name"] in {"Sync Catalogue", "Refresh Homepage"}
+            if node["name"] in {
+                "Sync Catalogue",
+                "Refresh Catalogue",
+                "Refresh Homepage",
+            }
         ]
-        self.assertEqual(2, len(idempotent_nodes))
+        self.assertEqual(3, len(idempotent_nodes))
         self.assertTrue(all(node["retryOnFail"] for node in idempotent_nodes))
         product = json.loads(
             (DEPLOY / "workflows" / "pv-wiki-product-cycle.json").read_text(
@@ -168,6 +172,41 @@ class WorkflowTemplateTests(unittest.TestCase):
         monthly_interval = monthly["parameters"]["rule"]["interval"][0]
         self.assertEqual("cronExpression", monthly_interval["field"])
         self.assertEqual("5 8 1 * *", monthly_interval["expression"])
+        hourly = next(
+            node
+            for node in product["nodes"]
+            if node["name"] == "Hourly Due Recovery"
+        )
+        hourly_interval = hourly["parameters"]["rule"]["interval"][0]
+        self.assertEqual("hours", hourly_interval["field"])
+        self.assertEqual(1, hourly_interval["hoursInterval"])
+        self.assertEqual(47, hourly_interval["triggerAtMinute"])
+        self.assertEqual(
+            "Run One Product",
+            product["connections"]["Hourly Due Recovery"]["main"][0][0][
+                "node"
+            ],
+        )
+        daily_catalogue = next(
+            node
+            for node in product["nodes"]
+            if node["name"] == "Daily Catalogue Recovery"
+        )
+        daily_interval = daily_catalogue["parameters"]["rule"]["interval"][0]
+        self.assertEqual("days", daily_interval["field"])
+        self.assertEqual(1, daily_interval["daysInterval"])
+        self.assertEqual(3, daily_interval["triggerAtHour"])
+        self.assertEqual(17, daily_interval["triggerAtMinute"])
+        self.assertEqual(
+            "Refresh Catalogue",
+            product["connections"]["Daily Catalogue Recovery"]["main"][0][0][
+                "node"
+            ],
+        )
+        self.assertEqual(
+            "Run One Product",
+            product["connections"]["Refresh Catalogue"]["main"][0][0]["node"],
+        )
 
         continue_node = next(
             node
@@ -184,7 +223,32 @@ class WorkflowTemplateTests(unittest.TestCase):
         run_one = next(
             node for node in product["nodes"] if node["name"] == "Run One Product"
         )
-        self.assertNotIn("retryOnFail", run_one)
+        sync_catalogue = next(
+            node for node in product["nodes"] if node["name"] == "Sync Catalogue"
+        )
+        refresh_catalogue = next(
+            node
+            for node in product["nodes"]
+            if node["name"] == "Refresh Catalogue"
+        )
+        for node in (sync_catalogue, refresh_catalogue):
+            self.assertEqual("POST", node["parameters"]["method"])
+            self.assertNotIn("sendBody", node["parameters"])
+            self.assertNotIn("bodyParameters", node["parameters"])
+            self.assertTrue(node["retryOnFail"])
+            self.assertEqual(3, node["maxTries"])
+            self.assertEqual(60_000, node["waitBetweenTries"])
+            self.assertGreaterEqual(
+                node["parameters"]["options"]["timeout"],
+                600_000,
+            )
+        self.assertTrue(run_one["retryOnFail"])
+        self.assertEqual(3, run_one["maxTries"])
+        self.assertEqual(60000, run_one["waitBetweenTries"])
+        self.assertGreaterEqual(
+            run_one["parameters"]["options"]["timeout"],
+            2_400_000,
+        )
 
 
 if __name__ == "__main__":

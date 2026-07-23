@@ -2,14 +2,14 @@
 
 PV Wiki turns a read-only PostgreSQL product catalogue into cited,
 reader-facing Wiki.js pages. n8n owns schedules, execution history, bounded
-retries for idempotent maintenance calls, and notifications. A separate
+retries for idempotent or lease-safe calls, and notifications. A separate
 `pv-wiki-worker` performs one bounded product cycle at a time and owns durable
 queue retry/backoff state:
 
 ```text
 PostgreSQL catalogue (read only)
-  → Tavily Search and Extract
-  → user-configured OpenAI-compatible model
+  → bounded Tavily Search and Extract
+  ↔ user-configured OpenAI-compatible research actions
   → strict local decision validation
   → Wiki.js GraphQL API
 ```
@@ -24,9 +24,9 @@ and must not create a Hermes cron job.
 | Component | Responsibility |
 | --- | --- |
 | Hermes skill | One-time discovery, installation, upgrade, repair, and removal guidance |
-| n8n | Schedule triggers, execution history, bounded idempotent-call retries, and operator-selected alerts |
-| PV Wiki worker | Product queue and backoff, Tavily calls, AI proposal, validation, and Wiki.js updates |
-| AI provider | Proposes structured facts from bounded evidence; never writes Wiki.js |
+| n8n | Schedule triggers, execution history, bounded retry-safe calls, and system/batch-level alerts |
+| PV Wiki worker | Product queue/backoff, bounded multi-round research, source validation, and Wiki.js updates |
+| AI provider | Proposes either a final decision or a bounded evidence-gap search; never writes Wiki.js |
 
 The model, API base URL, and API key are all operator supplied. The first
 release supports OpenAI-compatible Chat Completions and fixes the endpoint to
@@ -52,11 +52,33 @@ metadata; it does not replace any of the three application databases.
 - Reads the fixed `public.products` shape through an explicitly configured
   PostgreSQL transport and a read-only account.
 - Maintains durable and resumable leases in SQLite.
-- Uses no more than three Tavily searches and five extracted URLs per product.
-- Calls a user-selected OpenAI-compatible model with bounded public evidence.
-- Accepts trusted source status only from the configured domain map for the
-  catalogue brand, and requires the complete catalogue product name in the
-  extract as well as an exact proposed-model match.
+- Runs one initial research pass and at most two AI-requested supplemental
+  passes inside one `/run-one` call. Defaults cap the product at three AI
+  actions, seven basic search queries, five unique extract URLs, and a
+  20-credit Tavily admission budget. Before each call it reserves one credit
+  per basic Search query or two credits per advanced Extract batch; no new
+  research action starts after the 600-second deadline.
+- Calls a user-selected OpenAI-compatible model with bounded public discovery
+  hints and extracts so it can identify the manufacturer and product type.
+  The model may return only a final proposal or one of six fixed evidence gaps
+  with one or two locally validated, exact-model-bound supplemental queries.
+- Lets the model classify matching generic hardware such as screws, bolts,
+  nuts, and washers as out of scope, without using `family_code` for routing.
+  The local gate requires an exact contiguous quote tying the complete product
+  identity to an explicit hardware type. If an energy-product page merely
+  mentions an accessory bolt, the classification is rejected. A second local
+  gate also rejects any `publish` proposal whose model or public category
+  itself identifies generic hardware.
+- Uses `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` as an optional source-domain
+  override and fast path, not as a complete manufacturer registry.
+- When no mapping matches, automatically verifies only an HTTPS manufacturer
+  host whose name is consistent with the AI-discovered manufacturer and whose
+  extracted body contains both that manufacturer and the complete product
+  model. A second independent HTTPS extract must corroborate the identity, and
+  every published fact must have exact quotes from both domains. A failed check
+  becomes `source_unverified` and cannot publish.
+- Requires the complete catalogue product name in publication evidence as well
+  as an exact proposed-model match.
 - Allows multi-model series datasheets into analysis, while requiring every
   published fact to use a target-model-only span with no sibling/revision.
 - Keeps database IDs, family codes, lease tokens, and secrets out of the model
@@ -68,6 +90,16 @@ metadata; it does not replace any of the three application databases.
 - Builds a normal catalogue homepage with brand/category entry points, totals,
   per-brand counts, and recently updated products.
 - Creates new Wiki.js pages as private, unpublished drafts by default.
+- Records valid non-publish outcomes in SQLite and retries them automatically;
+  it does not create a per-product AI issue or manual-review queue.
+- Persists every Search, Extract, and AI action before execution. A current
+  attempt cannot replay an action slot, and any unresolved `started` or
+  `uncertain` action blocks later calls while its action-specific provider and
+  wire-contract scope is unchanged. Tavily and AI scopes are independent, and
+  legacy rows without a reliable scope block fail-closed. The queue records
+  `research_uncertain` instead of inventing a content conclusion; completed
+  calls may be repeated after a crash because response bodies are deliberately
+  not stored.
 
 It does not mirror full datasheets, expose an arbitrary command endpoint, mount
 the Docker socket, enable n8n Execute Command, or silently accept low-confidence
@@ -84,36 +116,88 @@ The production bundle is in [`deploy/n8n`](deploy/n8n/README.md). It includes:
 - two secret-free, inactive workflow templates:
   - `PV Wiki - Product Cycle` starts after the monthly Tavily credit refresh
     and serially processes products until the queue is empty or every
-    configured key has exhausted its credits;
+    configured key has exhausted its credits; a daily non-quota-waking
+    catalogue refresh recovers partial/failed source scans, and an hourly
+    trigger resumes due/backoff work without rerunning the catalogue sync;
   - `PV Wiki - Homepage Refresh` daily at 02:35 Asia/Shanghai.
 
-The installation flow is deliberately review-gated:
+The installation and rollout, rather than recurring product decisions, are
+deliberately review-gated:
 
 1. Copy and fill `deploy/n8n/.env.example` and
    `deploy/n8n/worker.env.example`; keep both actual files mode `0600`.
-2. Select `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL`, and the operator-verified
-   brand-to-domain map `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`.
+2. Select `AI_BASE_URL`, `AI_API_KEY`, and `AI_MODEL`. Optionally configure
+   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` with known public-manufacturer domain
+   overrides to speed up source verification. AI-discovered manufacturer names
+   take precedence over possibly stale internal brand codes.
 3. Start the Compose project or attach only the worker to an existing n8n
    network.
 4. Import the workflows while inactive.
 5. Create one n8n Header Auth credential for the internal worker and attach it
-   to the three HTTP Request nodes.
+   to the four HTTP Request nodes.
 6. Run `pv-wiki doctor --live`, then manually test one private/unpublished
    product at the final path prefix and the homepage.
 7. Let the user publish the schedules only after reviewing the output.
+
+After activation, `no_datasheet`, `ambiguous`, `insufficient_identity`,
+`out_of_scope`, `source_unverified`, and `research_uncertain` are normal
+machine-handled outcomes:
+they are silently audited and scheduled for an appropriate retry. They do not
+open issues. Notifications are reserved for failures that stop or materially
+impair a workflow batch, such as provider, configuration, database, or service
+outages. Five consecutive invalid decisions affecting distinct products inside
+30 minutes open one batch-level decision circuit before more products are
+leased. A recent AI 401/402/403/404 opens a six-hour
+provider-configuration circuit, and AI 429 opens a one-hour rate-limit circuit,
+so the loop stops before spending Tavily credits on more products through a
+known-bad AI path. Invalid AI output on three distinct products within the same
+one-hour provider scope opens the same pre-search batch stop. Configuration
+rejections and repeated invalid output return a service error after recording
+the product outcome, so n8n's bounded retries end in one batch-level alert.
+The 429 circuit is expected transient state and returns a clean automatic stop.
+If an explicit quota/4xx response follows an earlier completed subrequest, the
+known partial credits are audited and the action remains automatically
+retryable; only genuinely ambiguous paid requests are replay-suppressed.
+
+n8n remains the outer supervisor: it schedules batches and repeatedly calls
+the fixed `/run-one` endpoint. The worker owns the inner evidence feedback
+loop, leases, paid-call ledger, source trust, and final Wiki.js permission, so
+n8n does not need Tavily, AI, catalogue, or Wiki.js credentials.
+
+The example keeps new pages private and unpublished for the one-time rollout.
+After that acceptance, an unattended public catalogue can set
+`WIKIJS_NEW_PAGE_PRIVATE=false` and `WIKIJS_NEW_PAGE_PUBLISHED=true` once at the
+deployment level; this is not a per-product approval step.
 
 The worker exposes only:
 
 - `GET /healthz`
 - `POST /sync-catalogue`
+- `POST /refresh-catalogue`
 - `POST /run-one`
 - `POST /publish-home`
 
-All POST operations require the separate `PV_WIKI_WORKER_TOKEN`; concurrent
-operations are rejected. Tavily HTTP 432/433 responses rotate to the next key.
+All POST operations require the separate `PV_WIKI_WORKER_TOKEN`. An overlapping
+scheduled `/run-one` stops cleanly with `worker_busy`. Catalogue synchronization
+has its own serialized lock and may safely overlap research; source changes
+invalidate the leased snapshot and are rescheduled. A shared publication fence
+serializes only catalogue writes against the final source check, Wiki mutation,
+and durable outcome, preventing a locally applied source revision from being
+inserted midway through publication. Homepage publication also uses its own
+serialized lock because it targets a different Wiki path. This fence is
+process-local: the supported deployment runs exactly one worker replica, and
+scheduled mutations must use its authenticated HTTP endpoints rather than a
+concurrent direct CLI process. Other same-operation conflicts are rejected.
+Tavily HTTP 432/433 responses rotate to the next key.
 The product workflow stops cleanly only when no product is due or all configured
 keys are out of monthly credits; HTTP 429 remains a transient request-rate
 limit.
+
+Catalogue sync is intentionally history-preserving. A product absent from a
+later PostgreSQL snapshot is not automatically deleted, archived, or removed
+from the homepage; destructive retirement needs an explicit future policy so
+the worker never erases historical or human-maintained Wiki content by
+inference.
 
 ## Local CLI
 

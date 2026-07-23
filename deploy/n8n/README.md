@@ -24,9 +24,18 @@ Run these steps from `deploy/n8n` on the authorized VPS:
 3. Fill the user-owned Tavily, AI, Wiki.js, and read-only catalogue settings
    in `worker.env`. `AI_BASE_URL` is an OpenAI-compatible API base path such as
    `https://provider.example/v1`; choose `AI_MODEL` explicitly. Set
-   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` to a JSON object mapping each exact
-   catalogue `brand_code` to its narrow, operator-verified official,
-   regulatory, or authorized hostnames. Prefer `PGSSLMODE=verify-full`. For
+   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only when known public-manufacturer
+   domains should be supplied as explicit overrides or a verification fast
+   path. AI-discovered manufacturer names take precedence over internal brand
+   codes. The mapping is optional and need not enumerate the catalogue. Without
+   a matching entry, the worker may automatically verify an HTTPS manufacturer
+   host when its name is consistent with the AI-discovered manufacturer and the
+   extracted body contains both that manufacturer and the complete model. A
+   second independent HTTPS extract must corroborate that identity, and every
+   fact must have exact quotes from both domains. A failed check is recorded as
+   `source_unverified` and retried automatically;
+   it does not create a per-product issue or request manual review.
+   Prefer `PGSSLMODE=verify-full`. For
    `verify-ca` or `verify-full`, set `CATALOGUE_CA_PATH` in `.env` to the
    host's public CA bundle or a private CA PEM; it is mounted read-only and
    exposed to libpq through `PGSSLROOTCERT`. If the catalogue cannot use TLS,
@@ -71,8 +80,9 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    - Header name: `Authorization`
    - Header value: `Bearer <the PV_WIKI_WORKER_TOKEN from worker.env>`
 
-   Attach it to `Sync Catalogue`, `Run One Product`, and `Refresh Homepage`.
-   The workflow files intentionally contain no credential ID or secret.
+   Attach it to `Sync Catalogue`, `Refresh Catalogue`, `Run One Product`, and
+   `Refresh Homepage`. The workflow files intentionally contain no credential
+   ID or secret.
 
 8. Before enabling the loop, run one supervised acceptance cycle directly with
    `docker compose --env-file .env -f compose.yaml exec pv-wiki-worker pv-wiki
@@ -101,14 +111,20 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    After TLS is available, confirm
    `https://<N8N_DOMAIN>/healthz/readiness` before publishing schedules.
 
-10. Only after review, publish the two workflows. The product cycle starts at
+10. Only after rollout review, publish the two workflows. The product cycle starts at
     08:05 Asia/Shanghai on the first day of every month (00:05 UTC), then loops
     serially until no product is due or all configured Tavily keys return
-    plan/pay-as-you-go exhaustion. The homepage refresh runs daily at 02:35
-    Asia/Shanghai.
-11. Run the security audit, configure an n8n Error Workflow with the
-    operator's chosen notification channel, and record the deployed image tags
-    and workflow IDs:
+    plan/pay-as-you-go exhaustion. A daily 03:17 catalogue recovery refreshes
+    source rows without waking quota-paused products, and an hourly
+    due-recovery trigger enters directly at `Run One Product`, so retries and
+    backoff wakeups do not wait for another monthly sync. The homepage refresh
+    runs daily at 02:35 Asia/Shanghai. For unattended public pages, set
+    `WIKIJS_NEW_PAGE_PRIVATE=false` and `WIKIJS_NEW_PAGE_PUBLISHED=true` once in
+    `worker.env`; do not add a per-product publication review queue.
+11. Run the security audit, configure an n8n Error Workflow for system or
+    batch-level failures using the operator's chosen notification channel, and
+    record the deployed image tags and workflow IDs. Do not turn normal
+    non-publish product outcomes into alerts or issue-tracker tickets:
 
     ```bash
     docker compose --env-file .env -f compose.yaml exec -T n8n n8n audit
@@ -145,7 +161,7 @@ docker compose --env-file .env -f compose.systemd-n8n.yaml config --quiet
 docker compose --env-file .env -f compose.systemd-n8n.yaml up -d --build
 ```
 
-Before import, change the three HTTP Request node URLs from
+Before import, change the four HTTP Request node URLs from
 `http://pv-wiki-worker:8080/...` to `http://127.0.0.1:8080/...`. This loopback
 form is for a host n8n only; `127.0.0.1` inside an n8n container would address
 that container itself.
@@ -155,24 +171,82 @@ credential in the existing n8n, attach it, run a manual private/unpublished
 test, and let the user publish the schedules. Never discover n8n by scanning
 unrelated hosts; inspect only the user-authorized VPS and supplied URL.
 
-`Sync Catalogue` and `Refresh Homepage` have bounded retries because they are
-idempotent. `Run One Product` deliberately has no HTTP retry: if a long request
-times out, retrying it could claim a second product. A successful product result
-loops back to `Run One Product`; `no_due_product` and
+`Sync Catalogue`, `Refresh Catalogue`, and `Refresh Homepage` have bounded
+retries because they are idempotent. `Run One Product` also has three bounded
+retries as a batch-level
+circuit breaker and a 45-minute HTTP timeout covering the maximum supported
+research plus AI/Wiki tail. The worker lease and product-operation lock make a
+timed-out attempt safe: an overlapping `/run-one` returns the clean stop reason
+`worker_busy`, while a retry after completion may continue with the next due
+product. Catalogue sync uses a separate serialized lane, so the monthly refresh
+cannot be lost merely because a product batch is still running; a changed
+leased source is invalidated and rescheduled. A shared fence covers the final
+source check, Wiki mutation, and durable outcome; catalogue writes wait for
+that short publication tail instead of racing it. Both catalogue HTTP nodes
+therefore have a 15-minute timeout. Homepage publication has its own lane and
+targets a different Wiki path. Keep exactly one `pv-wiki-worker` replica and
+route all steady-state mutations through its HTTP endpoints; the publication
+fence is intentionally process-local and does not support concurrent mutating
+CLI commands or horizontal worker scaling. Three consecutive provider or system
+failures stop one workflow execution instead of opening one alert per product.
+A successful product result loops back to `Run One Product`; `no_due_product` and
 `tavily_quota_exhausted` stop the execution. Tavily 429 responses retain
 bounded request-rate retries, while 432/433 rotate keys and stop only after all
 configured keys are exhausted.
 
+`Refresh Catalogue` is the daily recovery path for incomplete source scans. It
+upserts current rows but deliberately does not wake products paused for monthly
+Tavily exhaustion. `Sync Catalogue` is reserved for the first-of-month or
+explicit new-key start and does wake those waits. Source disappearance is
+history-preserving: neither endpoint infers that an absent row should delete,
+archive, or remove an existing Wiki page from navigation.
+
+n8n is the outer supervisor only. One `/run-one` call may contain an initial
+research pass and up to two AI-requested supplemental passes inside the
+worker. Defaults are three AI actions, seven search queries, five unique
+extract URLs, a 20-credit admission budget with per-action credit reservation,
+and a 600-second new-action deadline. The worker persists a request fingerprint
+before every Search, Extract, and AI action. Any unresolved `started` or
+`uncertain` action suppresses later calls while its action-specific
+provider/wire scope still matches. Tavily Search, Tavily Extract, and AI scopes
+are independent; unrelated key and timeout changes cannot unlock a possibly
+charged request, while unknown legacy scopes block fail-closed. Suppression
+becomes the machine outcome `research_uncertain`; explicit non-executed
+quota/4xx failures remain retryable. If such a definitive response follows an
+earlier completed query or invalid AI response, the known partial work is
+audited and may be repeated by a later bounded attempt; it is not treated as
+an ambiguous replay. Keep Tavily, AI, catalogue, and Wiki.js credentials in
+`worker.env`, not in n8n or an AI Agent node.
+
+Valid non-publish results, including `no_datasheet`, `ambiguous`,
+`insufficient_identity`, `out_of_scope`, `source_unverified`, and
+`research_uncertain`, return a
+successful product-cycle response, are stored in the worker audit, and use
+automatic queue backoff. They do not create per-product AI issues. Reserve
+notifications for a failed workflow execution or a systemic condition that
+prevents the batch from progressing. Five consecutive `invalid_decision`
+results on distinct products within 30 minutes open the batch decision circuit
+before another product is leased. AI 401/402/403/404 opens a six-hour
+provider-configuration circuit and AI 429 opens a one-hour rate-limit circuit;
+three distinct products with invalid AI output inside one hour also open a
+provider-scoped output circuit. Later products stop before Tavily research
+while a circuit is open. Configuration and invalid-output circuits return HTTP
+503 after recording the product outcome, allowing n8n's bounded retries and
+Error Workflow to emit one systemic alert. The 429 circuit returns a clean
+successful stop because it is expected to recover automatically.
+
 After adding or replacing a Tavily key, update `TAVILY_API_KEYS`, recreate the
-worker so it receives the new environment, and manually run
-`PV Wiki - Product Cycle`:
+worker so it receives the new environment:
 
 ```bash
 docker compose --env-file .env -f compose.yaml up -d --no-deps --force-recreate pv-wiki-worker
 ```
 
-The next automatic restart is the first day of the next month. Product-level
-backoff remains stored by the worker.
+Run `Manual / New Key Start` once after the recreated worker is healthy to wake
+quota-paused products immediately and validate the replacement. Without that
+manual start, their existing first-of-next-UTC-month wake time remains intact
+and the hourly trigger resumes them then. Product-level backoff remains stored
+by the worker.
 
 ## Backups and removal
 

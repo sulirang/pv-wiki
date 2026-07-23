@@ -40,8 +40,40 @@ also forces the probe transaction read-only and fails if that transaction or
 the fixed product query cannot run; review the PostgreSQL role grants
 separately.
 
-External search sends only `product_name` by default. `family_code` always
-remains local and never becomes a public category or search term. `brand_code`
-is included only when the operator explicitly enables
-`PV_WIKI_TAVILY_INCLUDE_INTERNAL_HINTS`. `product_id` is never a Tavily or AI
-input.
+External search sends only `product_name` by default. Bounded search
+titles/snippets and successful extracts let AI discover the public manufacturer
+and product type. `family_code` always remains local and never becomes a range
+route, public category, search term, or AI input. `brand_code` is included only
+when the operator explicitly enables `PV_WIKI_TAVILY_INCLUDE_INTERNAL_HINTS`.
+`product_id` is never a Tavily or AI input.
+
+## Durable worker state
+
+The read-only PostgreSQL schema is unchanged. The worker separately owns a
+local SQLite schema (currently version 7):
+
+- `products` stores source hashes, due/backoff state, leases, and the latest
+  outcome;
+- `attempts` binds one immutable source snapshot to one finite lease and final
+  audit result;
+- `research_actions` records every bounded Search, Extract, and AI action as
+  `started`, `completed`, `failed`, or `uncertain`.
+
+`research_actions` uniquely constrains both `(attempt, round, action)` and an
+attempt-local `(action, request fingerprint)`. Version 7 also stores an
+action-specific scope fingerprint. Before any new provider call, the worker
+compares each earlier unresolved action against the current scope for that
+prior action: Search and Extract use separate Tavily wire scopes, while AI uses
+its endpoint/account/model/prompt scope. Changing an unrelated provider or a
+local timeout cannot unlock a possibly charged call. Legacy unresolved rows
+without a reliable scope block fail-closed. A blocked product records
+`research_uncertain` instead of being mislabeled as a content result.
+Completed Search summaries may store bounded queries, candidate URLs, request
+IDs, and physical request counts. Completed Extract summaries store the
+submitted URL set plus the exact-model successful subset.
+Extract bodies, model prompts, API responses, credentials, and catalogue
+metadata are never stored in this table. An attempt closing with a still
+`started` action changes that action to `uncertain`. Completed calls remain
+eligible for autonomous crash recovery because their response bodies are not
+persisted; a Wiki-only publish failure instead reuses the already validated
+decision and skips new research.

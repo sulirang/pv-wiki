@@ -10,6 +10,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from pv_wiki.decision import (  # noqa: E402
     DecisionError,
+    SourceVerificationError,
     text_contains_competing_identity,
     text_contains_exact_identity,
     validate_decision as _validate_decision,
@@ -561,7 +562,7 @@ class DecisionTests(unittest.TestCase):
             )
 
     def test_model_cannot_grant_trust_or_change_catalogue_identity(self) -> None:
-        with self.assertRaisesRegex(DecisionError, "not approved"):
+        with self.assertRaises(SourceVerificationError):
             _validate_decision(
                 valid_decision(),
                 expected_product_id="P-42",
@@ -586,6 +587,232 @@ class DecisionTests(unittest.TestCase):
                 expected_lease_token="1234567890abcdef",
             )
 
+    def test_matching_manufacturer_domain_is_verified_without_an_override(self) -> None:
+        item = valid_decision()
+        corroborating_url = "https://certifier.example/products/PV-42"
+        item["sources"] = [
+            {
+                "url": corroborating_url,
+                "title": "Independent PV-42 listing",
+                "source_type": "authorized",
+            }
+        ]
+        corroborating_rows = []
+        for fact in item["facts"]:
+            quote = fact["evidence_quotes"][0]["quote"]
+            fact["evidence_urls"].append(corroborating_url)
+            fact["evidence_quotes"].append(
+                {"url": corroborating_url, "quote": quote}
+            )
+            corroborating_rows.append(quote)
+        body = (
+            "Acme official product documentation\n"
+            "PV-42 Power 42 W\nPV-42 Input voltage 48 V\n"
+            "PV-42 Efficiency 98.5%\n"
+            "PV-42 Ingress protection IP65\nPV-42 Weight 12 kg"
+        )
+
+        result = _validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            trusted_source_domains=set(),
+            expected_product_name="PV-42",
+            evidence_text_by_url={
+                "https://acme.example/PV-42.pdf": body,
+                corroborating_url: "\n".join(
+                    ["Independent listing: Acme model PV-42.", *corroborating_rows]
+                ),
+            },
+        )
+
+        self.assertEqual("publish", result["outcome"])
+
+        single_source_item = valid_decision()
+        with self.assertRaises(SourceVerificationError):
+            _validate_decision(
+                single_source_item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                trusted_source_domains=set(),
+                expected_product_name="PV-42",
+                evidence_text_by_url={
+                    "https://acme.example/PV-42.pdf": body,
+                },
+            )
+
+    def test_manufacturer_named_subdomain_cannot_impersonate_official_domain(self) -> None:
+        for spoof_url in (
+            "https://acme.marketplace.example/PV-42.pdf",
+            "https://notacme.example/PV-42.pdf",
+        ):
+            item = valid_decision()
+            item["datasheets"][0]["url"] = spoof_url
+            for fact in item["facts"]:
+                fact["evidence_urls"] = [spoof_url]
+                fact["evidence_quotes"][0]["url"] = spoof_url
+
+            with self.subTest(spoof_url=spoof_url), self.assertRaises(
+                SourceVerificationError
+            ):
+                _validate_decision(
+                    item,
+                    expected_product_id="P-42",
+                    expected_lease_token="1234567890abcdef",
+                    trusted_source_domains=set(),
+                    expected_product_name="PV-42",
+                    evidence_text_by_url={
+                        spoof_url: (
+                            "Acme PV-42 Power 42 W\nPV-42 Input voltage 48 V\n"
+                            "PV-42 Efficiency 98.5%\n"
+                            "PV-42 Ingress protection IP65\nPV-42 Weight 12 kg"
+                        )
+                    },
+                )
+
+    def test_generic_manufacturer_words_cannot_authorize_a_domain(self) -> None:
+        for manufacturer, candidate_url in (
+            ("Energy", "https://energy.example/PV-42.pdf"),
+            ("Solar Acme", "https://solar.example/PV-42.pdf"),
+            ("The Solar Company", "https://the.example/PV-42.pdf"),
+            ("Global Energy Systems", "https://global.example/PV-42.pdf"),
+            ("New Power Technology", "https://new.example/PV-42.pdf"),
+        ):
+            item = valid_decision()
+            item["manufacturer"] = manufacturer
+            item["datasheets"][0]["url"] = candidate_url
+            corroborating_url = "https://certifier.example/products/PV-42"
+            item["sources"] = [
+                {
+                    "url": corroborating_url,
+                    "title": "Independent PV-42 listing",
+                    "source_type": "authorized",
+                }
+            ]
+            rows = []
+            for fact in item["facts"]:
+                quote = fact["evidence_quotes"][0]["quote"]
+                fact["evidence_urls"] = [candidate_url, corroborating_url]
+                fact["evidence_quotes"] = [
+                    {"url": candidate_url, "quote": quote},
+                    {"url": corroborating_url, "quote": quote},
+                ]
+                rows.append(quote)
+            evidence = "\n".join(
+                [f"{manufacturer} official model PV-42", *rows]
+            )
+
+            with self.subTest(manufacturer=manufacturer), self.assertRaises(
+                SourceVerificationError
+            ):
+                _validate_decision(
+                    item,
+                    expected_product_id="P-42",
+                    expected_lease_token="1234567890abcdef",
+                    trusted_source_domains=set(),
+                    expected_product_name="PV-42",
+                    evidence_text_by_url={
+                        candidate_url: evidence,
+                        corroborating_url: evidence,
+                    },
+                )
+
+    def test_auto_source_rejects_shared_ip_and_identity_mismatch(self) -> None:
+        cases = (
+            (
+                "GitHub",
+                "https://attacker.github.io/PV-42.pdf",
+                "https://certifier.example/products/PV-42",
+                "GitHub",
+            ),
+            (
+                "Acme",
+                "https://acme.example/PV-42.pdf",
+                "https://1.1.1.1/PV-42",
+                "Acme",
+            ),
+            (
+                "Acme",
+                "https://acme.example/PV-42.pdf",
+                "https://bucket.storage.googleapis.com/PV-42.html",
+                "Acme",
+            ),
+            (
+                "Acme",
+                "https://acme.example/PV-42.pdf",
+                "https://tenant.blob.core.windows.net/PV-42.html",
+                "Acme",
+            ),
+            (
+                "Acme",
+                "https://acme.example/PV-42.pdf",
+                "https://sites.google.com/view/acme-pv42",
+                "Acme",
+            ),
+            (
+                "Acme",
+                "https://acme.example/PV-42.pdf",
+                "https://docs.google.com/document/d/example",
+                "Acme",
+            ),
+            (
+                "Acme",
+                "https://acme.example/PV-42.pdf",
+                "https://acme.medium.com/pv-42",
+                "Acme",
+            ),
+            (
+                "Acme",
+                "https://ac-me.example/PV-42.pdf",
+                "https://certifier.example/products/PV-42",
+                "Acme",
+            ),
+            (
+                "Acme Evil",
+                "https://evil.example/PV-42.pdf",
+                "https://certifier.example/products/PV-42",
+                "Acme",
+            ),
+        )
+        for manufacturer, candidate_url, corroborating_url, body_name in cases:
+            item = valid_decision()
+            item["manufacturer"] = manufacturer
+            item["datasheets"][0]["url"] = candidate_url
+            item["sources"] = [
+                {
+                    "url": corroborating_url,
+                    "title": "Independent PV-42 listing",
+                    "source_type": "authorized",
+                }
+            ]
+            rows = []
+            for fact in item["facts"]:
+                quote = fact["evidence_quotes"][0]["quote"]
+                fact["evidence_urls"] = [candidate_url, corroborating_url]
+                fact["evidence_quotes"] = [
+                    {"url": candidate_url, "quote": quote},
+                    {"url": corroborating_url, "quote": quote},
+                ]
+                rows.append(quote)
+            evidence = "\n".join(
+                [f"{body_name} official model PV-42", *rows]
+            )
+
+            with self.subTest(candidate_url=candidate_url), self.assertRaises(
+                SourceVerificationError
+            ):
+                _validate_decision(
+                    item,
+                    expected_product_id="P-42",
+                    expected_lease_token="1234567890abcdef",
+                    trusted_source_domains=set(),
+                    expected_product_name="PV-42",
+                    evidence_text_by_url={
+                        candidate_url: evidence,
+                        corroborating_url: evidence,
+                    },
+                )
+
     def test_every_published_fact_needs_trusted_or_dual_mirror_evidence(self) -> None:
         item = valid_decision()
         mirror_url = "https://mirror.example/PV-42.pdf"
@@ -607,7 +834,7 @@ class DecisionTests(unittest.TestCase):
                     ).strip(),
                 }
             ]
-        with self.assertRaisesRegex(DecisionError, "trusted domain"):
+        with self.assertRaisesRegex(DecisionError, "verified manufacturer"):
             validate_decision(
                 item,
                 expected_product_id="P-42",
@@ -794,6 +1021,184 @@ class DecisionTests(unittest.TestCase):
         )
 
         self.assertEqual("ambiguous", result["outcome"])
+
+    def test_out_of_scope_requires_high_confidence_matching_extract_evidence(self) -> None:
+        url = "https://catalog.example/flange-nut-m8"
+        item = valid_decision()
+        item.update(
+            {
+                "outcome": "out_of_scope",
+                "confidence": 0.92,
+                "manufacturer": "",
+                "model": "flange nut m8",
+                "product_category": "紧固件",
+                "summary": "A generic M8 flange nut rather than energy equipment.",
+                "classification_evidence_urls": [url],
+                "classification_evidence_quotes": [
+                    {
+                        "url": url,
+                        "quote": (
+                            "Product: flange nut M8. Type: metric fastener."
+                        ),
+                    }
+                ],
+                "decision_notes": "The matching page identifies a commodity fastener.",
+                "datasheets": [],
+                "sources": [],
+                "facts": [],
+                "conflicts": [],
+            }
+        )
+
+        result = _validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            expected_product_name="flange nut m8",
+            allowed_evidence_urls=set(),
+            allowed_classification_urls={url},
+            classification_text_by_url={
+                url: "Product: flange nut M8. Type: metric fastener."
+            },
+        )
+
+        self.assertEqual("out_of_scope", result["outcome"])
+        self.assertEqual([url], result["classification_evidence_urls"])
+        self.assertEqual(
+            "Product: flange nut M8. Type: metric fastener.",
+            result["classification_evidence_quotes"][0]["quote"],
+        )
+
+        item["confidence"] = 0.5
+        with self.assertRaisesRegex(DecisionError, "confidence"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="flange nut m8",
+                allowed_classification_urls={url},
+                classification_text_by_url={url: "flange nut M8 fastener"},
+            )
+
+        item["confidence"] = 0.92
+        with self.assertRaisesRegex(DecisionError, "complete catalogue identity"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="flange nut m8",
+                allowed_classification_urls={url},
+                classification_text_by_url={url: "A different M10 fastener"},
+            )
+
+        item["classification_evidence_quotes"][0]["quote"] = (
+            "flange nut M8 high-efficiency solar module"
+        )
+        with self.assertRaisesRegex(DecisionError, "hardware-type quote"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="flange nut m8",
+                allowed_classification_urls={url},
+                classification_text_by_url={
+                    url: "flange nut M8 high-efficiency solar module"
+                },
+            )
+
+        item["classification_evidence_quotes"][0]["quote"] = (
+            "PV-42 solar module includes stainless mounting bolts."
+        )
+        with self.assertRaisesRegex(DecisionError, "hardware-type quote"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="PV-42",
+                allowed_classification_urls={url},
+                classification_text_by_url={
+                    url: (
+                        "PV-42 solar module includes stainless mounting bolts."
+                    )
+                },
+            )
+
+    def test_publish_cannot_override_an_explicit_generic_hardware_identity(
+        self,
+    ) -> None:
+        item = valid_decision()
+        item["model"] = "flange nut m8"
+        item["product_category"] = "Fastener"
+        item["summary"] = "A documented M8 flange nut."
+        for fact in item["facts"]:
+            fact["evidence_quotes"][0]["quote"] = (
+                fact["evidence_quotes"][0]["quote"].replace(
+                    "PV-42",
+                    "flange nut m8",
+                )
+            )
+        body = "\n".join(
+            quote["quote"]
+            for fact in item["facts"]
+            for quote in fact["evidence_quotes"]
+        )
+
+        with self.assertRaisesRegex(DecisionError, "generic hardware"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="flange nut m8",
+                trusted_source_domains={"acme.example"},
+                evidence_text_by_url={
+                    "https://acme.example/PV-42.pdf": body
+                },
+            )
+
+    def test_explicit_hardware_identity_can_mention_solar_mounting_use(
+        self,
+    ) -> None:
+        url = "https://catalog.example/flange-nut-m8"
+        item = valid_decision()
+        item.update(
+            {
+                "outcome": "out_of_scope",
+                "confidence": 0.92,
+                "manufacturer": "",
+                "model": "flange nut m8",
+                "product_category": "Fastener",
+                "summary": "A generic M8 flange nut.",
+                "classification_evidence_urls": [url],
+                "classification_evidence_quotes": [
+                    {
+                        "url": url,
+                        "quote": (
+                            "flange nut m8 is a nut used for solar panel "
+                            "mounting"
+                        ),
+                    }
+                ],
+                "decision_notes": "The matching item is commodity hardware.",
+                "datasheets": [],
+                "sources": [],
+                "facts": [],
+                "conflicts": [],
+            }
+        )
+
+        result = _validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            expected_product_name="flange nut m8",
+            allowed_classification_urls={url},
+            classification_text_by_url={
+                url: (
+                    "flange nut m8 is a nut used for solar panel mounting"
+                )
+            },
+        )
+        self.assertEqual("out_of_scope", result["outcome"])
 
     def test_nonfinite_fact_and_conflict_values_are_rejected(self) -> None:
         item = valid_decision()

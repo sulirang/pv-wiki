@@ -179,6 +179,7 @@ class PromptTests(unittest.TestCase):
         )
 
         self.assertEqual(["system", "user"], [item["role"] for item in messages])
+        self.assertIn("Never request a per-product issue", messages[0]["content"])
         prompt = json.loads(messages[1]["content"])
         self.assertNotIn("lease", prompt)
         self.assertNotIn("product_id", prompt["product"])
@@ -204,14 +205,35 @@ class PromptTests(unittest.TestCase):
             "https://maker.example/pv-42.pdf",
             prompt["tavily"]["extract"]["results"][0]["url"],
         )
-        self.assertNotIn("results", prompt["tavily"]["search"])
+        search_result = prompt["tavily"]["search"]["results"][0]
+        self.assertEqual("Result", search_result["title"])
+        self.assertEqual(
+            "https://search.example/pv-42",
+            search_result["url"],
+        )
+        self.assertEqual(1000, len(search_result["snippet"]))
         self.assertNotIn("failed_results", prompt["tavily"]["extract"])
-        self.assertNotIn("s" * 100, messages[1]["content"])
+        self.assertNotIn("s" * 1001, messages[1]["content"])
+        self.assertIn(
+            "out_of_scope",
+            prompt["output_contract"]["outcomes"],
+        )
+        self.assertIn(
+            "generic commodity hardware",
+            " ".join(prompt["source_policy"]),
+        )
+        self.assertIn(
+            "dual evidence is required",
+            " ".join(prompt["source_policy"]).casefold(),
+        )
         evidence_chars = len(
             prompt["tavily"]["extract"]["results"][0]["raw_content"]
         )
         self.assertEqual(3000, evidence_chars)
         self.assertTrue(prompt["tavily"]["extract"]["results"][0]["truncated"])
+        self.assertFalse(
+            prompt["tavily"]["extract"]["results"][0]["identity_verified"]
+        )
 
     def test_prompt_rejects_invalid_inputs(self) -> None:
         with self.assertRaises(TypeError):
@@ -223,6 +245,84 @@ class PromptTests(unittest.TestCase):
                 product={},
                 max_evidence_chars=999,
             )
+
+    def test_research_prompt_has_bounded_actions_and_safe_validation_feedback(
+        self,
+    ) -> None:
+        feedback = ai.ValidationFeedback(
+            ai.ResearchGap.INDEPENDENT_CORROBORATION,
+            "A second independent exact extract is still missing.",
+        )
+        messages = ai.build_research_messages(
+            product={"model": "PV-42"},
+            search={"queries": ['"PV-42" datasheet']},
+            candidate_manufacturer="Acme Solar",
+            previous_queries=['"PV-42" datasheet'],
+            validation_feedback=feedback,
+            max_evidence_chars=3000,
+        )
+
+        self.assertEqual(["system", "user"], [item["role"] for item in messages])
+        self.assertIn("never authorizes a domain", messages[0]["content"])
+        prompt = json.loads(messages[1]["content"])
+        self.assertEqual("choose_next_research_action", prompt["task"])
+        self.assertEqual(
+            ["PV-42", "Acme Solar"],
+            prompt["research_context"]["query_binding_terms"],
+        )
+        self.assertEqual(
+            ["PV-42"],
+            prompt["research_context"]["required_query_binding_terms"],
+        )
+        self.assertEqual(
+            {
+                "gap": "independent_corroboration",
+                "note": "A second independent exact extract is still missing.",
+            },
+            prompt["research_context"]["validation_feedback"],
+        )
+        gaps = prompt["action_contract"]["exact_top_level_shapes"][
+            "search_more"
+        ]["gap"]
+        self.assertEqual(
+            {
+                "manufacturer_identity",
+                "primary_datasheet",
+                "independent_corroboration",
+                "missing_exact_fact",
+                "conflict_resolution",
+                "scope_classification",
+            },
+            set(gaps),
+        )
+        rules = " ".join(prompt["action_contract"]["rules"])
+        self.assertIn("conservative final non-publish", rules)
+        self.assertIn("cannot name or authorize a source or domain", rules)
+
+    def test_validation_feedback_rejects_unbounded_or_unsafe_text(self) -> None:
+        fixed = ai.ValidationFeedback.for_gap(
+            ai.ResearchGap.INDEPENDENT_CORROBORATION
+        )
+        self.assertEqual(ai.ResearchGap.INDEPENDENT_CORROBORATION, fixed.gap)
+        self.assertIn("independent extract", fixed.note)
+        with self.assertRaises(TypeError):
+            ai.ValidationFeedback(  # type: ignore[arg-type]
+                "independent_corroboration",
+                "Missing evidence.",
+            )
+        for note in (
+            "See https://private.example/error",
+            "unsafe\ntrace",
+            "x" * (ai.MAX_VALIDATION_FEEDBACK_CHARS + 1),
+            "Raw exception includes an API key.",
+        ):
+            with self.subTest(note=note), self.assertRaises(ValueError):
+                ai.ValidationFeedback(
+                    ai.ResearchGap.INDEPENDENT_CORROBORATION,
+                    note,
+                )
+        with self.assertRaises(TypeError):
+            ai.build_research_messages(product=[])  # type: ignore[arg-type]
 
 
 class ParsingTests(unittest.TestCase):
@@ -249,6 +349,225 @@ class ParsingTests(unittest.TestCase):
                 ai.AIResponseError
             ):
                 ai.parse_decision_content(content)
+
+    def test_parses_typed_final_and_removes_model_owned_authorization(self) -> None:
+        action = ai.parse_research_action_content(
+            json.dumps(
+                {
+                    "action": "final",
+                    "decision": {
+                        "schema_version": "model-owned",
+                        "product_id": "model-owned",
+                        "lease_token": "model-owned",
+                        "outcome": "no_datasheet",
+                    },
+                }
+            ),
+            product={"model": "PV-42"},
+        )
+
+        self.assertIsInstance(action, ai.FinalAction)
+        self.assertEqual("final", action.action)
+        self.assertEqual({"outcome": "no_datasheet"}, action.decision)
+
+    def test_parses_search_more_and_deduplicates_queries(self) -> None:
+        action = ai.parse_research_action_content(
+            json.dumps(
+                {
+                    "action": "search_more",
+                    "gap": "primary_datasheet",
+                    "queries": [
+                        "PV-42 technical manual",
+                        "  pv-42   TECHNICAL manual  ",
+                    ],
+                }
+            ),
+            product={"model": "PV-42"},
+        )
+
+        self.assertIsInstance(action, ai.SearchMoreAction)
+        self.assertEqual(ai.ResearchGap.PRIMARY_DATASHEET, action.gap)
+        self.assertEqual(("PV-42 technical manual",), action.queries)
+
+    def test_search_query_may_bind_current_candidate_manufacturer(self) -> None:
+        action = ai.validate_research_action(
+            {
+                "action": "search_more",
+                "gap": "manufacturer_identity",
+                "queries": ["Acme Solar manufacturer catalogue"],
+            },
+            product={},
+            candidate_manufacturer="Acme Solar",
+        )
+
+        self.assertEqual(
+            ("Acme Solar manufacturer catalogue",),
+            action.queries,
+        )
+
+    def test_rejects_unsafe_unbound_or_non_novel_search_actions(self) -> None:
+        invalid_actions = (
+            {
+                "action": "search_more",
+                "gap": "not_a_gap",
+                "queries": ["PV-42 datasheet"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 https://maker.example/data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 maker.example data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 maker.example, data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 evil\u3002example data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 evil\uff61example data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 evil[.]example data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 例子.公司 data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 [2001:db8::1] data"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42\nmanual"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": [
+                    "PV-42 " + "x" * ai.MAX_RESEARCH_QUERY_CHARS
+                ],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["another product manual"],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": [
+                    "PV-42 one",
+                    "PV-42 two",
+                    "PV-42 three",
+                ],
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 manual"],
+                "source": "manufacturer",
+            },
+        )
+        for action in invalid_actions:
+            with self.subTest(action=action), self.assertRaises(
+                ai.AIInvalidOutputError
+            ):
+                ai.validate_research_action(
+                    action,
+                    product={"model": "PV-42"},
+                )
+
+        with self.assertRaisesRegex(ai.AIInvalidOutputError, "novel"):
+            ai.validate_research_action(
+                {
+                    "action": "search_more",
+                    "gap": "primary_datasheet",
+                    "queries": ["PV-42 manual"],
+                },
+                product={"model": "PV-42"},
+                previous_queries=["pv-42   MANUAL"],
+            )
+
+        for generic_manufacturer in ("official", "solar", "x"):
+            with self.subTest(
+                generic_manufacturer=generic_manufacturer
+            ), self.assertRaises(ai.AIInvalidOutputError):
+                ai.validate_research_action(
+                    {
+                        "action": "search_more",
+                        "gap": "manufacturer_identity",
+                        "queries": [
+                            f"{generic_manufacturer} technical manual"
+                        ],
+                    },
+                    product={},
+                    candidate_manufacturer=generic_manufacturer,
+                )
+
+    def test_product_model_is_required_even_with_candidate_manufacturer(self) -> None:
+        with self.assertRaisesRegex(ai.AIInvalidOutputError, "exact model"):
+            ai.validate_research_action(
+                {
+                    "action": "search_more",
+                    "gap": "manufacturer_identity",
+                    "queries": ["Acme Solar manufacturer catalogue"],
+                },
+                product={"model": "PV-42"},
+                candidate_manufacturer="Acme Solar",
+            )
+
+    def test_validation_feedback_constrains_the_next_action(self) -> None:
+        feedback = ai.ValidationFeedback(
+            ai.ResearchGap.MISSING_EXACT_FACT,
+            "One specification lacks an exact target-model quote.",
+        )
+        invalid_actions = (
+            {
+                "action": "final",
+                "decision": {"outcome": "publish"},
+            },
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 datasheet"],
+            },
+        )
+        for action in invalid_actions:
+            with self.subTest(action=action), self.assertRaises(
+                ai.AIInvalidOutputError
+            ):
+                ai.validate_research_action(
+                    action,
+                    product={"model": "PV-42"},
+                    validation_feedback=feedback,
+                )
+
+        conservative = ai.validate_research_action(
+            {
+                "action": "final",
+                "decision": {"outcome": "ambiguous"},
+            },
+            product={"model": "PV-42"},
+            validation_feedback=feedback,
+        )
+        self.assertEqual("ambiguous", conservative.decision["outcome"])
 
 
 class OpenAICompatibleClientTests(unittest.TestCase):
@@ -290,6 +609,180 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertEqual(2048, payload["max_tokens"])
         self.assertEqual(0, payload["temperature"])
         self.assertIs(payload["stream"], False)
+
+    def test_retries_one_empty_model_output_with_a_bounded_repair_prompt(self) -> None:
+        calls: list[dict] = []
+        responses = iter(
+            [
+                FakeResponse({"choices": [{"message": {"content": ""}}]}),
+                FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {"outcome": "no_datasheet"}
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return next(responses)
+
+        client = ai.OpenAICompatibleClient(settings(), opener=fake_open)
+        result = client.decide(product={"name": "PV-42"})
+
+        self.assertEqual({"outcome": "no_datasheet"}, result)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(2, len(calls[0]["messages"]))
+        self.assertEqual(3, len(calls[1]["messages"]))
+        self.assertIn("Retry once", calls[1]["messages"][-1]["content"])
+
+    def test_research_retries_one_structurally_invalid_action(self) -> None:
+        calls: list[dict] = []
+        responses = iter(
+            [
+                FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "action": "search_more",
+                                            "gap": "invented_gap",
+                                            "queries": ["PV-42 datasheet"],
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                ),
+                FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {
+                                            "action": "search_more",
+                                            "gap": "primary_datasheet",
+                                            "queries": [
+                                                "PV-42 official technical manual"
+                                            ],
+                                        }
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return next(responses)
+
+        client = ai.OpenAICompatibleClient(settings(), opener=fake_open)
+        action = client.next_research_action(product={"model": "PV-42"})
+
+        self.assertIsInstance(action, ai.SearchMoreAction)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(2, client.last_research_provider_requests)
+        self.assertIn(
+            "bounded action contract",
+            calls[1]["messages"][-1]["content"],
+        )
+
+    def test_research_never_repairs_invalid_structure_more_than_once(self) -> None:
+        calls = 0
+
+        def fake_open(_request: object, *, timeout: float) -> FakeResponse:
+            nonlocal calls
+            del timeout
+            calls += 1
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "action": "search_more",
+                                        "gap": "invalid",
+                                        "queries": ["PV-42 datasheet"],
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(settings(), opener=fake_open)
+        with self.assertRaises(ai.AIInvalidOutputError):
+            client.research(product={"model": "PV-42"})
+        self.assertEqual(2, calls)
+        self.assertEqual(2, client.last_research_provider_requests)
+
+    def test_validation_feedback_repairs_a_repeated_publish_into_search_more(
+        self,
+    ) -> None:
+        calls = 0
+        responses = iter(
+            [
+                {
+                    "action": "final",
+                    "decision": {"outcome": "publish"},
+                },
+                {
+                    "action": "search_more",
+                    "gap": "independent_corroboration",
+                    "queries": ["PV-42 independent test report"],
+                },
+            ]
+        )
+
+        def fake_open(_request: object, *, timeout: float) -> FakeResponse:
+            nonlocal calls
+            del timeout
+            calls += 1
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(next(responses))
+                            }
+                        }
+                    ]
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(settings(), opener=fake_open)
+        action = client.research(
+            product={"model": "PV-42"},
+            validation_feedback=ai.ValidationFeedback.for_gap(
+                ai.ResearchGap.INDEPENDENT_CORROBORATION
+            ),
+        )
+
+        self.assertIsInstance(action, ai.SearchMoreAction)
+        self.assertEqual(
+            ai.ResearchGap.INDEPENDENT_CORROBORATION,
+            action.gap,
+        )
+        self.assertEqual(2, calls)
 
     def test_redirects_are_disabled(self) -> None:
         self.assertTrue(

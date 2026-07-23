@@ -28,6 +28,8 @@ from .state import StateStore
 MAX_REQUEST_BYTES = 8 * 1024
 MAX_TOKEN_LENGTH = 512
 _RUN_LOCK = threading.Lock()
+_CATALOGUE_LOCK = threading.Lock()
+_HOMEPAGE_LOCK = threading.Lock()
 
 
 class WorkerConfigError(ValueError):
@@ -214,11 +216,29 @@ def _handler(
                     {"ok": False, "error": _safe_error(exc)},
                 )
                 return
-            if not _RUN_LOCK.acquire(blocking=False):
-                self._send(
-                    HTTPStatus.CONFLICT,
-                    {"ok": False, "error": "another PV Wiki operation is running"},
-                )
+            operation_lock = {
+                "/sync-catalogue": _CATALOGUE_LOCK,
+                "/refresh-catalogue": _CATALOGUE_LOCK,
+                "/publish-home": _HOMEPAGE_LOCK,
+            }.get(path, _RUN_LOCK)
+            if not operation_lock.acquire(blocking=False):
+                if path == "/run-one":
+                    self._send(
+                        HTTPStatus.OK,
+                        {
+                            "ok": True,
+                            "processed": False,
+                            "reason": "worker_busy",
+                        },
+                    )
+                else:
+                    self._send(
+                        HTTPStatus.CONFLICT,
+                        {
+                            "ok": False,
+                            "error": "another PV Wiki operation is running",
+                        },
+                    )
                 return
             try:
                 result = operation()
@@ -243,7 +263,7 @@ def _handler(
             else:
                 self._send(HTTPStatus.OK, result)
             finally:
-                _RUN_LOCK.release()
+                operation_lock.release()
 
     return Handler
 
@@ -255,11 +275,17 @@ def build_server(
 ) -> ThreadingHTTPServer:
     """Build the server, permitting injected operations for offline tests."""
 
-    from .cli import publish_home, run_one, sync_catalogue
+    from .cli import (
+        publish_home,
+        refresh_catalogue,
+        run_one,
+        sync_catalogue,
+    )
 
     active_settings = settings or WorkerSettings.from_env()
     active_operations = operations or {
         "/sync-catalogue": sync_catalogue,
+        "/refresh-catalogue": refresh_catalogue,
         "/run-one": run_one,
         "/publish-home": publish_home,
     }
