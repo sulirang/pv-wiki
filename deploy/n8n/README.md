@@ -21,7 +21,8 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    Set both files to mode `0600`.
 2. Generate separate random values for `N8N_DB_PASSWORD`,
    `N8N_ENCRYPTION_KEY`, and `PV_WIKI_WORKER_TOKEN`. Do not reuse API keys.
-3. Fill the user-owned Tavily, AI, Wiki.js, and read-only catalogue settings
+3. Fill the Exa key plus the user-owned AI,
+   Wiki.js, and read-only catalogue settings
    in `worker.env`. `AI_BASE_URL` is an OpenAI-compatible API base path such as
    `https://provider.example/v1`; choose `AI_MODEL` explicitly. Set
    `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only when known public-manufacturer
@@ -113,8 +114,8 @@ Run these steps from `deploy/n8n` on the authorized VPS:
 
 10. Only after rollout review, publish the two workflows. The product cycle starts at
     08:05 Asia/Shanghai on the first day of every month (00:05 UTC), then loops
-    serially until no product is due or all configured Tavily keys return
-    plan/pay-as-you-go exhaustion. A daily 03:17 catalogue recovery refreshes
+    serially until no product is due or all configured keys for the selected
+    search provider are exhausted. A daily 03:17 catalogue recovery refreshes
     source rows without waking quota-paused products, and an hourly
     due-recovery trigger enters directly at `Run One Product`, so retries and
     backoff wakeups do not wait for another monthly sync. The homepage refresh
@@ -189,14 +190,14 @@ route all steady-state mutations through its HTTP endpoints; the publication
 fence is intentionally process-local and does not support concurrent mutating
 CLI commands or horizontal worker scaling. Three consecutive provider or system
 failures stop one workflow execution instead of opening one alert per product.
-A successful product result loops back to `Run One Product`; `no_due_product` and
-`tavily_quota_exhausted` stop the execution. Tavily 429 responses retain
-bounded request-rate retries, while 432/433 rotate keys and stop only after all
+A successful product result loops back to `Run One Product`; `no_due_product`,
+`search_quota_exhausted` stops the execution. HTTP 429 responses retain bounded
+request-rate retries. Exa HTTP 402 rotates keys and stops only after all
 configured keys are exhausted.
 
 `Refresh Catalogue` is the daily recovery path for incomplete source scans. It
-upserts current rows but deliberately does not wake products paused for monthly
-Tavily exhaustion. `Sync Catalogue` is reserved for the first-of-month or
+upserts current rows but deliberately does not wake products paused for
+provider quota exhaustion. `Sync Catalogue` is reserved for the first-of-month or
 explicit new-key start and does wake those waits. Source disappearance is
 history-preserving: neither endpoint infers that an absent row should delete,
 archive, or remove an existing Wiki page from navigation.
@@ -204,18 +205,18 @@ archive, or remove an existing Wiki page from navigation.
 n8n is the outer supervisor only. One `/run-one` call may contain an initial
 research pass and up to two AI-requested supplemental passes inside the
 worker. Defaults are three AI actions, seven search queries, five unique
-extract URLs, a 20-credit admission budget with per-action credit reservation,
+extract URLs, a 20-unit admission budget with per-action reservation,
 and a 600-second new-action deadline. The worker persists a request fingerprint
 before every Search, Extract, and AI action. Any unresolved `started` or
 `uncertain` action suppresses later calls while its action-specific
-provider/wire scope still matches. Tavily Search, Tavily Extract, and AI scopes
+provider/wire scope still matches. Search, Extract, and AI scopes
 are independent; unrelated key and timeout changes cannot unlock a possibly
 charged request, while unknown legacy scopes block fail-closed. Suppression
 becomes the machine outcome `research_uncertain`; explicit non-executed
 quota/4xx failures remain retryable. If such a definitive response follows an
 earlier completed query or invalid AI response, the known partial work is
 audited and may be repeated by a later bounded attempt; it is not treated as
-an ambiguous replay. Keep Tavily, AI, catalogue, and Wiki.js credentials in
+an ambiguous replay. Keep Exa, AI, catalogue, and Wiki.js credentials in
 `worker.env`, not in n8n or an AI Agent node.
 
 Valid non-publish results, including `no_datasheet`, `ambiguous`,
@@ -229,13 +230,13 @@ results on distinct products within 30 minutes open the batch decision circuit
 before another product is leased. AI 401/402/403/404 opens a six-hour
 provider-configuration circuit and AI 429 opens a one-hour rate-limit circuit;
 three distinct products with invalid AI output inside one hour also open a
-provider-scoped output circuit. Later products stop before Tavily research
+provider-scoped output circuit. Later products stop before web research
 while a circuit is open. Configuration and invalid-output circuits return HTTP
 503 after recording the product outcome, allowing n8n's bounded retries and
 Error Workflow to emit one systemic alert. The 429 circuit returns a clean
 successful stop because it is expected to recover automatically.
 
-After adding or replacing a Tavily key, update `TAVILY_API_KEYS`, recreate the
+After adding or replacing an Exa key, update `EXA_API_KEYS`, then recreate the
 worker so it receives the new environment:
 
 ```bash

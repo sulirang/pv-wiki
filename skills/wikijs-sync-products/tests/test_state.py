@@ -222,7 +222,7 @@ class StateStoreTests(unittest.TestCase):
         self.store.upsert_product(product(), now=T0)
         current = T0
         outcomes = (
-            "tavily_error",
+            "search_error",
             "wikijs_error",
             "error",
             "invalid_decision",
@@ -259,7 +259,7 @@ class StateStoreTests(unittest.TestCase):
         ai_result = self.store.record_outcome(ai_lease, "ai_error", now=T0)
         self.assertEqual(T0 + timedelta(hours=1), ai_result.next_run_at)
 
-    def test_tavily_quota_exhaustion_waits_for_next_month_without_failure(self):
+    def test_legacy_quota_outcome_can_still_be_resumed(self):
         self.store.upsert_product(product(), now=T0)
         lease = self.store.lease_next("worker-quota", now=T0)
 
@@ -290,12 +290,35 @@ class StateStoreTests(unittest.TestCase):
         )
 
         resumed_at = datetime(2026, 1, 15, tzinfo=timezone.utc)
-        self.assertEqual(1, self.store.resume_tavily_quota_waits(now=resumed_at))
-        self.assertEqual(0, self.store.resume_tavily_quota_waits(now=resumed_at))
+        self.assertEqual(1, self.store.resume_search_quota_waits(now=resumed_at))
+        self.assertEqual(0, self.store.resume_search_quota_waits(now=resumed_at))
         current = self.store.get_product("P-1")
         self.assertEqual("due", current.status)
         self.assertEqual(0, current.consecutive_failures)
         self.assertTrue(self.store.is_due("P-1", now=resumed_at))
+
+    def test_generic_search_quota_uses_the_same_nonfailure_pause(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("worker-exa-quota", now=T0)
+
+        result = self.store.record_outcome(
+            lease,
+            "search_quota_exhausted",
+            error="provider spend budget exhausted",
+            now=T0,
+        )
+
+        self.assertEqual("backoff", result.status)
+        self.assertEqual(0, result.consecutive_failures)
+        self.assertEqual(
+            datetime(2026, 2, 1, tzinfo=timezone.utc),
+            result.next_attempt_at,
+        )
+        resumed_at = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        self.assertEqual(
+            1,
+            self.store.resume_search_quota_waits(now=resumed_at),
+        )
 
     def test_search_and_extract_audit_bind_completed_evidence(self):
         self.store.upsert_product(product(), now=T0)
@@ -999,7 +1022,7 @@ class StateStoreTests(unittest.TestCase):
         )
         self.store.record_outcome(
             first,
-            "tavily_error",
+            "search_error",
             error="network timeout",
             now=T0 + timedelta(seconds=2),
         )

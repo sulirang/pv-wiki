@@ -96,8 +96,8 @@ def _safe_error(error: BaseException) -> str:
         (
             "PV_WIKI_WORKER_TOKEN",
             "PGPASSWORD",
-            "TAVILY_API_KEY",
-            "TAVILY_API_KEYS",
+            "EXA_API_KEY",
+            "EXA_API_KEYS",
             "AI_API_KEY",
             "LLM_API_KEY",
             "OPENAI_API_KEY",

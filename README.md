@@ -8,7 +8,7 @@ queue retry/backoff state:
 
 ```text
 PostgreSQL catalogue (read only)
-  → bounded Tavily Search and Extract
+  → bounded Exa Search and Contents
   ↔ user-configured OpenAI-compatible research actions
   → strict local decision validation
   → Wiki.js GraphQL API
@@ -26,6 +26,7 @@ and must not create a Hermes cron job.
 | Hermes skill | One-time discovery, installation, upgrade, repair, and removal guidance |
 | n8n | Schedule triggers, execution history, bounded retry-safe calls, and system/batch-level alerts |
 | PV Wiki worker | Product queue/backoff, bounded multi-round research, source validation, and Wiki.js updates |
+| Exa | Bounded public-web discovery and content extraction; never writes Wiki.js |
 | AI provider | Proposes either a final decision or a bounded evidence-gap search; never writes Wiki.js |
 
 The model, API base URL, and API key are all operator supplied. The first
@@ -55,9 +56,13 @@ metadata; it does not replace any of the three application databases.
 - Runs one initial research pass and at most two AI-requested supplemental
   passes inside one `/run-one` call. Defaults cap the product at three AI
   actions, seven basic search queries, five unique extract URLs, and a
-  20-credit Tavily admission budget. Before each call it reserves one credit
-  per basic Search query or two credits per advanced Extract batch; no new
+  20-unit search admission budget. Before each call it reserves one normalized
+  unit per Search query or two units per Extract batch; Exa's reported dollar
+  cost is also retained in audit metadata. No new
   research action starts after the 600-second deadline.
+- Uses Exa as the sole bounded search and extraction provider. A retrieval
+  comparison supporting that decision is recorded in
+  [`docs/search-provider-benchmark-2026-07-26.md`](docs/search-provider-benchmark-2026-07-26.md).
 - Calls a user-selected OpenAI-compatible model with bounded public discovery
   hints and extracts so it can identify the manufacturer and product type.
   The model may return only a final proposal or one of six fixed evidence gaps
@@ -95,7 +100,7 @@ metadata; it does not replace any of the three application databases.
 - Persists every Search, Extract, and AI action before execution. A current
   attempt cannot replay an action slot, and any unresolved `started` or
   `uncertain` action blocks later calls while its action-specific provider and
-  wire-contract scope is unchanged. Tavily and AI scopes are independent, and
+  wire-contract scope is unchanged. Search-provider and AI scopes are independent, and
   legacy rows without a reliable scope block fail-closed. The queue records
   `research_uncertain` instead of inventing a content conclusion; completed
   calls may be repeated after a crash because response bodies are deliberately
@@ -114,7 +119,7 @@ The production bundle is in [`deploy/n8n`](deploy/n8n/README.md). It includes:
 - an internal-only authenticated worker;
 - an optional Caddy HTTPS overlay;
 - two secret-free, inactive workflow templates:
-  - `PV Wiki - Product Cycle` starts after the monthly Tavily credit refresh
+  - `PV Wiki - Product Cycle` starts on the existing monthly quota cadence
     and serially processes products until the queue is empty or every
     configured key has exhausted its credits; a daily non-quota-waking
     catalogue refresh recovers partial/failed source scans, and an hourly
@@ -126,7 +131,8 @@ deliberately review-gated:
 
 1. Copy and fill `deploy/n8n/.env.example` and
    `deploy/n8n/worker.env.example`; keep both actual files mode `0600`.
-2. Select `AI_BASE_URL`, `AI_API_KEY`, and `AI_MODEL`. Optionally configure
+2. Configure `EXA_API_KEYS` (or `EXA_API_KEY`), then select `AI_BASE_URL`,
+   `AI_API_KEY`, and `AI_MODEL`. Optionally configure
    `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` with known public-manufacturer domain
    overrides to speed up source verification. AI-discovered manufacturer names
    take precedence over possibly stale internal brand codes.
@@ -149,7 +155,7 @@ outages. Five consecutive invalid decisions affecting distinct products inside
 30 minutes open one batch-level decision circuit before more products are
 leased. A recent AI 401/402/403/404 opens a six-hour
 provider-configuration circuit, and AI 429 opens a one-hour rate-limit circuit,
-so the loop stops before spending Tavily credits on more products through a
+so the loop stops before spending search budget on more products through a
 known-bad AI path. Invalid AI output on three distinct products within the same
 one-hour provider scope opens the same pre-search batch stop. Configuration
 rejections and repeated invalid output return a service error after recording
@@ -162,7 +168,7 @@ retryable; only genuinely ambiguous paid requests are replay-suppressed.
 n8n remains the outer supervisor: it schedules batches and repeatedly calls
 the fixed `/run-one` endpoint. The worker owns the inner evidence feedback
 loop, leases, paid-call ledger, source trust, and final Wiki.js permission, so
-n8n does not need Tavily, AI, catalogue, or Wiki.js credentials.
+n8n does not need search, AI, catalogue, or Wiki.js credentials.
 
 The example keeps new pages private and unpublished for the one-time rollout.
 After that acceptance, an unattended public catalogue can set
@@ -188,7 +194,7 @@ serialized lock because it targets a different Wiki path. This fence is
 process-local: the supported deployment runs exactly one worker replica, and
 scheduled mutations must use its authenticated HTTP endpoints rather than a
 concurrent direct CLI process. Other same-operation conflicts are rejected.
-Tavily HTTP 432/433 responses rotate to the next key.
+Exa HTTP 402 responses rotate to the next configured key.
 The product workflow stops cleanly only when no product is due or all configured
 keys are out of monthly credits; HTTP 429 remains a transient request-rate
 limit.

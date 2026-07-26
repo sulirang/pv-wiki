@@ -134,7 +134,7 @@ def redact_environment_secrets(
         if not value:
             continue
         candidates.add(value)
-        if name == "TAVILY_API_KEYS":
+        if name == "EXA_API_KEYS":
             candidates.update(
                 part for part in re.split(r"[\s,]+", value) if part
             )
@@ -296,7 +296,7 @@ def allow_mirrors() -> bool:
 
 
 def include_internal_search_hints() -> bool:
-    return _bool_env("PV_WIKI_TAVILY_INCLUDE_INTERNAL_HINTS", False)
+    return _bool_env("PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS", False)
 
 
 def max_extract_chars() -> int:

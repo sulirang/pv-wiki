@@ -148,7 +148,7 @@ class CLITests(unittest.TestCase):
                 "PGUSER": "products_readonly",
                 "PGPASSWORD": "database-secret",
                 "PGSSLMODE": sslmode,
-                "TAVILY_API_KEY": "tavily-secret",
+                "EXA_API_KEY": "exa-secret",
                 "AI_BASE_URL": "https://ai.example.com/v1",
                 "AI_API_KEY": "ai-secret",
                 "AI_MODEL": "example-model",
@@ -183,7 +183,7 @@ class CLITests(unittest.TestCase):
         self.assertFalse(payload["checks"]["postgresql_tls"]["ok"])
         reader.assert_not_called()
 
-    def test_tavily_bundle_credits_fail_closed_when_usage_is_invalid(
+    def test_exa_bundle_credits_fail_closed_when_usage_is_invalid(
         self,
     ) -> None:
         for bundle in (
@@ -194,7 +194,7 @@ class CLITests(unittest.TestCase):
             {"usage": {"credits": float("nan")}},
         ):
             with self.subTest(bundle=bundle), self.assertRaises(
-                cli.TavilyResponseError
+                cli.ExaResponseError
             ):
                 cli._credits(bundle)
 
@@ -209,6 +209,34 @@ class CLITests(unittest.TestCase):
             "verify-full", payload["checks"]["postgresql_tls"]["sslmode"]
         )
         reader.assert_not_called()
+
+    def test_doctor_validates_exa_without_spending(self) -> None:
+        self.configure_required_environment(sslmode="verify-full")
+        with (
+            mock.patch.object(cli, "ProductReader") as reader,
+            mock.patch.object(cli, "ExaClient") as exa_client,
+        ):
+            code, payload, error = self.run_cli("doctor")
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(
+            "exa",
+            payload["checks"]["search_provider_config"]["provider"],
+        )
+        reader.assert_not_called()
+        exa_client.assert_not_called()
+
+    def test_search_client_factory_always_uses_exa(self) -> None:
+        sentinel = mock.Mock()
+        with mock.patch.object(
+            cli,
+            "ExaClient",
+            return_value=sentinel,
+        ) as factory:
+            result = cli._make_search_client(timeout=12.5)
+
+        self.assertIs(sentinel, result)
+        factory.assert_called_once_with(timeout=12.5)
 
     def test_live_doctor_accepts_explicit_prefer_mode_with_warning(self) -> None:
         self.configure_required_environment(sslmode="prefer")
@@ -255,7 +283,7 @@ class CLITests(unittest.TestCase):
             lease = store.lease_next("quota-worker", now=paused_at)
             store.record_outcome(
                 lease,
-                "tavily_quota_exhausted",
+                "search_quota_exhausted",
                 error="monthly quota exhausted",
                 now=paused_at,
             )
@@ -278,7 +306,7 @@ class CLITests(unittest.TestCase):
             lease = store.lease_next("quota-worker", now=paused_at)
             outcome = store.record_outcome(
                 lease,
-                "tavily_quota_exhausted",
+                "search_quota_exhausted",
                 error="monthly quota exhausted",
                 now=paused_at,
             )
@@ -354,7 +382,7 @@ class CLITests(unittest.TestCase):
             "results": [],
             "usage": {"credits": 3},
         }
-        with mock.patch.object(cli, "TavilyClient", return_value=client):
+        with mock.patch.object(cli, "ExaClient", return_value=client):
             code, payload, error = self.run_cli(
                 "search", "--lease-token", token, "--max-results", "5"
             )
@@ -374,7 +402,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("AttemptBudgetError", error)
 
     def test_internal_search_hints_never_treat_family_code_as_category(self) -> None:
-        os.environ["PV_WIKI_TAVILY_INCLUDE_INTERNAL_HINTS"] = "true"
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
 
         identity = cli._search_identity(product())
 
@@ -517,7 +545,7 @@ class CLITests(unittest.TestCase):
             "failed_results": [],
             "usage": {"credits": 1},
         }
-        with mock.patch.object(cli, "TavilyClient", return_value=client):
+        with mock.patch.object(cli, "ExaClient", return_value=client):
             code, payload, error = self.run_cli(
                 "extract",
                 "--lease-token",
@@ -557,7 +585,7 @@ class CLITests(unittest.TestCase):
             "failed_results": [],
             "usage": {"credits": 1},
         }
-        with mock.patch.object(cli, "TavilyClient", return_value=client):
+        with mock.patch.object(cli, "ExaClient", return_value=client):
             code, payload, error = self.run_cli(
                 "extract",
                 "--lease-token",
@@ -600,7 +628,7 @@ class CLITests(unittest.TestCase):
             "failed_results": [],
             "usage": {"credits": 1},
         }
-        with mock.patch.object(cli, "TavilyClient", return_value=client):
+        with mock.patch.object(cli, "ExaClient", return_value=client):
             code, _, error = self.run_cli(
                 "extract",
                 "--lease-token",
@@ -635,7 +663,7 @@ class CLITests(unittest.TestCase):
             "failed_results": [],
             "usage": {"credits": 1},
         }
-        with mock.patch.object(cli, "TavilyClient", return_value=client):
+        with mock.patch.object(cli, "ExaClient", return_value=client):
             code, _, error = self.run_cli(
                 "extract",
                 "--lease-token",
@@ -918,7 +946,7 @@ class CLITests(unittest.TestCase):
             store.record_outcome(lease, "synced")
 
         with (
-            mock.patch.object(cli, "TavilyClient") as tavily_client,
+            mock.patch.object(cli, "ExaClient") as search_client,
             mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
         ):
@@ -927,7 +955,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, code, error)
         self.assertFalse(payload["processed"])
         self.assertEqual("no_due_product", payload["reason"])
-        tavily_client.assert_not_called()
+        search_client.assert_not_called()
         ai_client.assert_not_called()
         wiki_client.assert_not_called()
 
@@ -941,12 +969,12 @@ class CLITests(unittest.TestCase):
         self.configure_worker_environment()
         settings = ai.AISettings.from_env()
         research = cli.ResearchSettings.from_env()
-        tavily_client = mock.Mock()
-        tavily_client.credential_fingerprint = "a" * 64
+        search_client = mock.Mock()
+        search_client.credential_fingerprint = "a" * 64
         baseline = cli._research_scope_fingerprints(
             product(),
             settings,
-            tavily_client,
+            search_client,
             max_results=5,
             research_settings=research,
         )
@@ -958,7 +986,7 @@ class CLITests(unittest.TestCase):
                 timeout=settings.timeout + 1,
                 max_response_bytes=settings.max_response_bytes + 1,
             ),
-            tavily_client,
+            search_client,
             max_results=5,
             research_settings=research,
         )
@@ -967,7 +995,7 @@ class CLITests(unittest.TestCase):
         changed_ai_key = cli._research_scope_fingerprints(
             product(),
             replace(settings, api_key="different-ai-key"),
-            tavily_client,
+            search_client,
             max_results=5,
             research_settings=research,
         )
@@ -975,29 +1003,29 @@ class CLITests(unittest.TestCase):
         self.assertEqual(baseline["extract"], changed_ai_key["extract"])
         self.assertNotEqual(baseline["ai"], changed_ai_key["ai"])
 
-        changed_tavily = mock.Mock()
-        changed_tavily.credential_fingerprint = "b" * 64
-        changed_tavily_scopes = cli._research_scope_fingerprints(
+        changed_exa = mock.Mock()
+        changed_exa.credential_fingerprint = "b" * 64
+        changed_exa_scopes = cli._research_scope_fingerprints(
             product(),
             settings,
-            changed_tavily,
+            changed_exa,
             max_results=5,
             research_settings=research,
         )
         self.assertNotEqual(
             baseline["search"],
-            changed_tavily_scopes["search"],
+            changed_exa_scopes["search"],
         )
         self.assertNotEqual(
             baseline["extract"],
-            changed_tavily_scopes["extract"],
+            changed_exa_scopes["extract"],
         )
-        self.assertEqual(baseline["ai"], changed_tavily_scopes["ai"])
+        self.assertEqual(baseline["ai"], changed_exa_scopes["ai"])
 
         changed_retrieval = cli._research_scope_fingerprints(
             product(),
             settings,
-            tavily_client,
+            search_client,
             max_results=4,
             research_settings=research,
         )
@@ -1006,21 +1034,21 @@ class CLITests(unittest.TestCase):
         self.assertNotEqual(baseline["ai"], changed_retrieval["ai"])
 
     def test_failure_status_distinguishes_definitive_from_partial_calls(self) -> None:
-        tavily_client = mock.Mock()
-        tavily_client.last_operation_completed_requests = 0
+        search_client = mock.Mock()
+        search_client.last_operation_completed_requests = 0
         self.assertEqual(
             "failed",
-            cli._tavily_failure_status(
-                cli.TavilyQuotaExhaustedError("quota"),
-                tavily_client,
+            cli._search_failure_status(
+                cli.ExaQuotaExhaustedError("quota"),
+                search_client,
             ),
         )
-        tavily_client.last_operation_completed_requests = 1
+        search_client.last_operation_completed_requests = 1
         self.assertEqual(
             "failed",
-            cli._tavily_failure_status(
-                cli.TavilyQuotaExhaustedError("quota after first query"),
-                tavily_client,
+            cli._search_failure_status(
+                cli.ExaQuotaExhaustedError("quota after first query"),
+                search_client,
             ),
         )
 
@@ -1054,7 +1082,7 @@ class CLITests(unittest.TestCase):
             ),
         )
 
-    def test_ai_provider_rejection_circuit_stops_before_tavily(self) -> None:
+    def test_ai_provider_rejection_circuit_stops_before_exa(self) -> None:
         self.configure_worker_environment()
         now = datetime.now(timezone.utc)
         settings = ai.AISettings.from_env()
@@ -1102,7 +1130,7 @@ class CLITests(unittest.TestCase):
             )
 
         with (
-            mock.patch.object(cli, "TavilyClient") as tavily_factory,
+            mock.patch.object(cli, "ExaClient") as exa_factory,
             mock.patch.object(
                 cli,
                 "OpenAICompatibleClient",
@@ -1114,13 +1142,13 @@ class CLITests(unittest.TestCase):
         self.assertEqual({}, payload)
         self.assertIn("AIError", error)
         self.assertIn("HTTP 401", error)
-        tavily_factory.assert_not_called()
+        exa_factory.assert_not_called()
         ai_factory.assert_not_called()
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-SECOND")
             self.assertEqual("ai_error", current.last_outcome)
 
-    def test_ai_rate_limit_circuit_stops_cleanly_before_tavily(self) -> None:
+    def test_ai_rate_limit_circuit_stops_cleanly_before_exa(self) -> None:
         self.configure_worker_environment()
         with (
             mock.patch.object(
@@ -1128,7 +1156,7 @@ class CLITests(unittest.TestCase):
                 "recent_ai_provider_rejection",
                 side_effect=[None, 429],
             ),
-            mock.patch.object(cli, "TavilyClient") as tavily_factory,
+            mock.patch.object(cli, "ExaClient") as exa_factory,
             mock.patch.object(
                 cli,
                 "OpenAICompatibleClient",
@@ -1139,10 +1167,10 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, code, error)
         self.assertFalse(payload["processed"])
         self.assertEqual("ai_provider_circuit_open", payload["reason"])
-        tavily_factory.assert_not_called()
+        exa_factory.assert_not_called()
         ai_factory.assert_not_called()
 
-    def test_ai_invalid_output_circuit_stops_before_tavily(self) -> None:
+    def test_ai_invalid_output_circuit_stops_before_exa(self) -> None:
         self.configure_worker_environment()
         with (
             mock.patch.object(
@@ -1150,7 +1178,7 @@ class CLITests(unittest.TestCase):
                 "recent_ai_provider_error_products",
                 return_value=3,
             ),
-            mock.patch.object(cli, "TavilyClient") as tavily_factory,
+            mock.patch.object(cli, "ExaClient") as exa_factory,
             mock.patch.object(
                 cli,
                 "OpenAICompatibleClient",
@@ -1162,7 +1190,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual({}, payload)
         self.assertIn("AIError", error)
         self.assertIn("invalid output", error)
-        tavily_factory.assert_not_called()
+        exa_factory.assert_not_called()
         ai_factory.assert_not_called()
 
     def test_wiki_failure_reuses_validated_decision_without_new_research(self) -> None:
@@ -1258,7 +1286,7 @@ class CLITests(unittest.TestCase):
                 )
 
         with (
-            mock.patch.object(cli, "TavilyClient") as tavily_client,
+            mock.patch.object(cli, "ExaClient") as search_client,
             mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
         ):
@@ -1266,19 +1294,19 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(2, code)
         self.assertIn("decision circuit is open", error)
-        tavily_client.assert_not_called()
+        search_client.assert_not_called()
         ai_client.assert_not_called()
         wiki_client.assert_not_called()
 
-    def test_run_one_stops_cleanly_when_all_tavily_quotas_are_exhausted(self) -> None:
+    def test_run_one_stops_cleanly_when_all_exa_quotas_are_exhausted(self) -> None:
         self.configure_worker_environment()
         search_client = mock.Mock()
         search_client.search_product.side_effect = (
-            cli.TavilyQuotaExhaustedError("monthly quota exhausted")
+            cli.ExaQuotaExhaustedError("monthly quota exhausted")
         )
 
         with (
-            mock.patch.object(cli, "TavilyClient", return_value=search_client),
+            mock.patch.object(cli, "ExaClient", return_value=search_client),
             mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
         ):
@@ -1287,7 +1315,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, code, error)
         self.assertFalse(payload["processed"])
         self.assertFalse(payload["published"])
-        self.assertEqual("tavily_quota_exhausted", payload["reason"])
+        self.assertEqual("search_quota_exhausted", payload["reason"])
         resume_at = datetime.fromisoformat(payload["resume_at"])
         self.assertEqual(1, resume_at.day)
         self.assertEqual((0, 0, 0), (resume_at.hour, resume_at.minute, resume_at.second))
@@ -1296,7 +1324,7 @@ class CLITests(unittest.TestCase):
 
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
-            self.assertEqual("tavily_quota_exhausted", current.last_outcome)
+            self.assertEqual("search_quota_exhausted", current.last_outcome)
             self.assertEqual(0, current.consecutive_failures)
             self.assertEqual(resume_at, current.next_run_at)
 
@@ -1310,7 +1338,7 @@ class CLITests(unittest.TestCase):
         search_client.last_operation_completed_requests = 1
         search_client.last_operation_known_credits = 1
         search_client.search_product.side_effect = (
-            cli.TavilyQuotaExhaustedError(
+            cli.ExaQuotaExhaustedError(
                 "monthly quota exhausted after one completed query"
             )
         )
@@ -1318,7 +1346,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(cli, "OpenAICompatibleClient"),
@@ -1326,7 +1354,7 @@ class CLITests(unittest.TestCase):
             code, payload, error = self.run_cli("run-one")
 
         self.assertEqual(0, code, error)
-        self.assertEqual("tavily_quota_exhausted", payload["reason"])
+        self.assertEqual("search_quota_exhausted", payload["reason"])
         with state.StateStore(self.state_path) as store:
             actions = store.research_action_history(product_id="P-42")
             self.assertEqual(1, len(actions))
@@ -1392,7 +1420,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(
@@ -1444,18 +1472,18 @@ class CLITests(unittest.TestCase):
             "PV-42 Ingress protection IP65\n"
             "PV-42 Weight 12 kg"
         )
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "results": [{"url": official_url, "score": 0.99}],
             "usage": {"credits": 3},
             "request_ids": ["initial-search"],
         }
-        tavily_client.search_queries.return_value = {
+        search_client.search_queries.return_value = {
             "results": [{"url": supplemental_url, "score": 0.91}],
             "usage": {"credits": 1},
             "request_ids": ["supplemental-search"],
         }
-        tavily_client.extract_urls.side_effect = [
+        search_client.extract_urls.side_effect = [
             {
                 "results": [
                     {"url": official_url, "raw_content": official_body}
@@ -1491,8 +1519,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -1509,11 +1537,11 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         self.assertTrue(payload["published"])
-        tavily_client.search_queries.assert_called_once_with(
+        search_client.search_queries.assert_called_once_with(
             ['"PV-42" independent specifications'],
             max_results=5,
         )
-        self.assertEqual(2, tavily_client.extract_urls.call_count)
+        self.assertEqual(2, search_client.extract_urls.call_count)
         self.assertEqual(2, ai_client.next_research_action.call_count)
         with state.StateStore(self.state_path) as store:
             actions = store.research_action_history(product_id="P-42")
@@ -1572,16 +1600,16 @@ class CLITests(unittest.TestCase):
                 {"url": independent_url, "quote": quote}
             )
 
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "results": [{"url": official_url, "score": 0.99}],
             "usage": {"credits": 3},
         }
-        tavily_client.search_queries.return_value = {
+        search_client.search_queries.return_value = {
             "results": [{"url": independent_url, "score": 0.95}],
             "usage": {"credits": 1},
         }
-        tavily_client.extract_urls.side_effect = [
+        search_client.extract_urls.side_effect = [
             {
                 "results": [
                     {"url": official_url, "raw_content": official_body}
@@ -1615,8 +1643,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -1664,15 +1692,15 @@ class CLITests(unittest.TestCase):
             "https://supplement-one.example.net/pv-42",
             "https://supplement-two.example.net/pv-42",
         ]
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "results": [
                 {"url": url, "score": 1 - index / 10}
                 for index, url in enumerate(initial_urls)
             ],
             "usage": {"credits": 3},
         }
-        tavily_client.search_queries.side_effect = [
+        search_client.search_queries.side_effect = [
             {
                 "results": [{"url": supplemental_urls[0], "score": 0.9}],
                 "usage": {"credits": 2},
@@ -1682,7 +1710,7 @@ class CLITests(unittest.TestCase):
                 "usage": {"credits": 2},
             },
         ]
-        tavily_client.extract_urls.side_effect = [
+        search_client.extract_urls.side_effect = [
             {
                 "results": [
                     {"url": url, "raw_content": f"PV-42 source {index}"}
@@ -1734,8 +1762,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -1749,11 +1777,11 @@ class CLITests(unittest.TestCase):
         self.assertEqual("no_datasheet", payload["outcome"])
         submitted = [
             call.args[0]
-            for call in tavily_client.extract_urls.call_args_list
+            for call in search_client.extract_urls.call_args_list
         ]
         self.assertEqual([3, 1, 1], [len(urls) for urls in submitted])
         self.assertEqual(5, len({url for urls in submitted for url in urls}))
-        self.assertEqual(2, tavily_client.search_queries.call_count)
+        self.assertEqual(2, search_client.search_queries.call_count)
         final_queries = ai_client.next_research_action.call_args.kwargs[
             "previous_queries"
         ]
@@ -1762,16 +1790,16 @@ class CLITests(unittest.TestCase):
             attempt = store.attempt_history("P-42")[-1]
             self.assertEqual(
                 7,
-                attempt.details["payload"]["automation"]["tavily"][
+                attempt.details["payload"]["automation"]["exa"][
                     "query_count"
                 ],
             )
 
-    def test_credit_budget_stops_before_another_tavily_action(self) -> None:
+    def test_credit_budget_stops_before_another_exa_action(self) -> None:
         self.configure_worker_environment()
         os.environ["PV_WIKI_RESEARCH_MAX_CREDITS"] = "3"
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "results": [],
             "usage": {"credits": 3},
         }
@@ -1784,8 +1812,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -1797,23 +1825,23 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         self.assertEqual("no_datasheet", payload["outcome"])
-        tavily_client.search_queries.assert_not_called()
-        tavily_client.extract_urls.assert_not_called()
+        search_client.search_queries.assert_not_called()
+        search_client.extract_urls.assert_not_called()
         with state.StateStore(self.state_path) as store:
             attempt = store.attempt_history("P-42")[-1]
             self.assertEqual(
-                "Tavily credit budget cannot reserve the next search",
+                "Search budget cannot reserve the next search",
                 attempt.details["payload"]["automation"]["research"][
                     "stop_reason"
                 ],
             )
 
-    def test_credit_budget_reserves_extract_cost_before_calling_tavily(self) -> None:
+    def test_credit_budget_reserves_extract_cost_before_calling_exa(self) -> None:
         self.configure_worker_environment()
         os.environ["PV_WIKI_RESEARCH_MAX_CREDITS"] = "4"
         url = "https://maker.example/pv-42"
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "queries": ["q1", "q2", "q3"],
             "results": [{"url": url, "score": 0.9}],
             "usage": {"credits": 3},
@@ -1842,8 +1870,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -1855,7 +1883,7 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         self.assertEqual("no_datasheet", payload["outcome"])
-        tavily_client.extract_urls.assert_not_called()
+        search_client.extract_urls.assert_not_called()
 
     def test_uncertain_prior_action_blocks_all_provider_replay(self) -> None:
         self.configure_worker_environment()
@@ -1906,13 +1934,13 @@ class CLITests(unittest.TestCase):
             )
             self.assertEqual("P-42", blocked.product_id)
 
-        tavily_client = mock.Mock()
+        search_client = mock.Mock()
         ai_client = mock.Mock()
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -1926,9 +1954,9 @@ class CLITests(unittest.TestCase):
         self.assertEqual("research_uncertain", payload["outcome"])
         self.assertEqual("P-REPLAY", payload["product_id"])
         self.assertIn("replay suppressed", payload["reason"])
-        tavily_client.search_product.assert_not_called()
-        tavily_client.search_queries.assert_not_called()
-        tavily_client.extract_urls.assert_not_called()
+        search_client.search_product.assert_not_called()
+        search_client.search_queries.assert_not_called()
+        search_client.extract_urls.assert_not_called()
         ai_client.next_research_action.assert_not_called()
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-REPLAY")
@@ -1938,12 +1966,12 @@ class CLITests(unittest.TestCase):
         self.configure_worker_environment()
         os.environ["PV_WIKI_RESEARCH_MAX_SECONDS"] = "60"
         new_url = "https://example.net/pv-42"
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "results": [],
             "usage": {"credits": 3},
         }
-        tavily_client.search_queries.return_value = {
+        search_client.search_queries.return_value = {
             "results": [{"url": new_url, "score": 0.9}],
             "usage": {"credits": 1},
         }
@@ -1956,8 +1984,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -1974,8 +2002,8 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         self.assertEqual("no_datasheet", payload["outcome"])
-        tavily_client.search_queries.assert_called_once()
-        tavily_client.extract_urls.assert_not_called()
+        search_client.search_queries.assert_called_once()
+        search_client.extract_urls.assert_not_called()
         with state.StateStore(self.state_path) as store:
             attempt = store.attempt_history("P-42")[-1]
             self.assertEqual(
@@ -1991,15 +2019,15 @@ class CLITests(unittest.TestCase):
             f"https://example.net/pv-42-{index}"
             for index in range(4)
         ]
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "results": [
                 {"url": url, "score": 1 - index / 10}
                 for index, url in enumerate(candidates)
             ],
             "usage": {"credits": 3},
         }
-        tavily_client.extract_urls.return_value = {
+        search_client.extract_urls.return_value = {
             "results": [
                 {
                     "url": candidates[3],
@@ -2013,8 +2041,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
@@ -2027,21 +2055,21 @@ class CLITests(unittest.TestCase):
         wiki_client.assert_not_called()
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
-            self.assertEqual("tavily_error", current.last_outcome)
+            self.assertEqual("search_error", current.last_outcome)
             attempt = store.attempt_history("P-42")[-1]
-            self.assertEqual("tavily_error", attempt.outcome)
+            self.assertEqual("search_error", attempt.outcome)
             actions = store.research_action_history(product_id="P-42")
             self.assertEqual("uncertain", actions[-1].status)
             self.assertEqual("extract", actions[-1].action)
 
     def test_supplemental_search_with_no_new_url_stops_as_normal_outcome(self) -> None:
         self.configure_worker_environment()
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "results": [],
             "usage": {"credits": 3},
         }
-        tavily_client.search_queries.return_value = {
+        search_client.search_queries.return_value = {
             "results": [],
             "usage": {"credits": 1},
         }
@@ -2054,8 +2082,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -2071,7 +2099,7 @@ class CLITests(unittest.TestCase):
         self.assertTrue(payload["processed"])
         self.assertFalse(payload["published"])
         self.assertEqual(1, ai_client.next_research_action.call_count)
-        tavily_client.extract_urls.assert_not_called()
+        search_client.extract_urls.assert_not_called()
         wiki_client.assert_not_called()
         with state.StateStore(self.state_path) as store:
             attempt = store.attempt_history("P-42")[-1]
@@ -2094,7 +2122,7 @@ class CLITests(unittest.TestCase):
             store.upsert_product(blank)
 
         with (
-            mock.patch.object(cli, "TavilyClient") as tavily_client,
+            mock.patch.object(cli, "ExaClient") as search_client,
             mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
         ):
@@ -2102,7 +2130,7 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         self.assertEqual("insufficient_identity", payload["outcome"])
-        tavily_client.assert_not_called()
+        search_client.assert_not_called()
         ai_client.assert_not_called()
         wiki_client.assert_not_called()
 
@@ -2119,7 +2147,7 @@ class CLITests(unittest.TestCase):
             decision("forged-token", "no_datasheet")
         )
         with (
-            mock.patch.object(cli, "TavilyClient", return_value=search_client),
+            mock.patch.object(cli, "ExaClient", return_value=search_client),
             mock.patch.object(
                 cli,
                 "OpenAICompatibleClient",
@@ -2131,6 +2159,51 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, code, error)
         self.assertEqual("no_datasheet", payload["outcome"])
         ai_instance.next_research_action.assert_called_once()
+
+    def test_run_one_uses_exa_and_records_provider_cost_in_audit(self) -> None:
+        self.configure_worker_environment()
+        os.environ["EXA_API_KEY"] = "exa-secret"
+        search_client = mock.Mock()
+        search_client.provider_name = "exa"
+        search_client.api_base_url = cli.EXA_API_BASE_URL
+        search_client.search_contract_version = cli.EXA_SEARCH_CONTRACT_VERSION
+        search_client.extract_contract_version = cli.EXA_EXTRACT_CONTRACT_VERSION
+        search_client.credential_fingerprint = "e" * 64
+        search_client.search_product.return_value = {
+            "provider": "exa",
+            "queries": ["PV-42 datasheet"],
+            "results": [],
+            "usage": {"credits": 3, "cost_dollars": 0.021},
+        }
+        ai_instance = mock.Mock()
+        ai_instance.next_research_action.return_value = ai.FinalAction(
+            decision("forged-token", "no_datasheet")
+        )
+
+        with (
+            mock.patch.object(
+                cli,
+                "ExaClient",
+                return_value=search_client,
+            ),
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+                return_value=ai_instance,
+            ),
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertEqual("no_datasheet", payload["outcome"])
+        with state.StateStore(self.state_path) as store:
+            attempt = store.attempt_history("P-42")[-1]
+        self.assertEqual(
+            0.021,
+            attempt.details["payload"]["automation"]["exa"][
+                "search_usage"
+            ]["cost_dollars"],
+        )
 
     def test_run_one_empty_extract_records_nonblocking_no_datasheet(self) -> None:
         self.configure_worker_environment()
@@ -2157,7 +2230,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(
@@ -2204,7 +2277,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(
@@ -2294,7 +2367,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(
@@ -2354,13 +2427,13 @@ class CLITests(unittest.TestCase):
             )
             evidence_lines.append(quote["quote"])
 
-        tavily_client = mock.Mock()
-        tavily_client.search_product.return_value = {
+        search_client = mock.Mock()
+        search_client.search_product.return_value = {
             "queries": ['"flange nut m8" official datasheet'],
             "results": [{"url": url, "score": 0.9}],
             "usage": {"credits": 3},
         }
-        tavily_client.extract_urls.return_value = {
+        search_client.extract_urls.return_value = {
             "results": [
                 {
                     "url": url,
@@ -2377,8 +2450,8 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
-                return_value=tavily_client,
+                "ExaClient",
+                return_value=search_client,
             ),
             mock.patch.object(
                 cli,
@@ -2427,7 +2500,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(
@@ -2487,7 +2560,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(
@@ -2535,7 +2608,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(
@@ -2587,7 +2660,7 @@ class CLITests(unittest.TestCase):
         with (
             mock.patch.object(
                 cli,
-                "TavilyClient",
+                "ExaClient",
                 return_value=search_client,
             ),
             mock.patch.object(

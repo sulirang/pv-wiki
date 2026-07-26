@@ -44,6 +44,16 @@ from .config import (
     trusted_source_domain_map,
     trusted_source_domains_for_product,
 )
+from .exa import (
+    API_BASE_URL as EXA_API_BASE_URL,
+    EXTRACT_CONTRACT_VERSION as EXA_EXTRACT_CONTRACT_VERSION,
+    SEARCH_CONTRACT_VERSION as EXA_SEARCH_CONTRACT_VERSION,
+    ExaClient,
+    ExaError,
+    ExaHTTPError,
+    ExaQuotaExhaustedError,
+    ExaResponseError,
+)
 from .db import DatabaseConfigurationError, ProductReader, validate_postgres_sslmode
 from .decision import (
     DecisionError,
@@ -63,15 +73,9 @@ from .state import (
     next_month_start,
     research_request_fingerprint,
 )
-from .tavily import (
-    ADVANCED_EXTRACT_CREDITS_PER_BATCH,
-    API_BASE_URL as TAVILY_API_BASE_URL,
-    BASIC_SEARCH_CREDITS_PER_QUERY,
-    TavilyClient,
-    TavilyError,
-    TavilyHTTPError,
-    TavilyQuotaExhaustedError,
-    TavilyResponseError,
+from .search import (
+    EXTRACT_BUDGET_UNITS_PER_BATCH,
+    SEARCH_BUDGET_UNITS_PER_QUERY,
     build_queries,
 )
 from .wikijs import WikiJSClient, WikiJSConflictError, WikiJSError
@@ -89,8 +93,8 @@ REQUIRED_ENVIRONMENT = (
 )
 SECRET_ENVIRONMENT = (
     "PGPASSWORD",
-    "TAVILY_API_KEY",
-    "TAVILY_API_KEYS",
+    "EXA_API_KEY",
+    "EXA_API_KEYS",
     "WIKIJS_TOKEN",
     "AI_API_KEY",
     "LLM_API_KEY",
@@ -107,15 +111,11 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
 VALIDATION_POLICY_VERSION = "2026-07-23.2"
-TAVILY_SEARCH_CONTRACT_VERSION = "2026-07-23.1"
-TAVILY_EXTRACT_CONTRACT_VERSION = "2026-07-23.1"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-23.1"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-26.2"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
-TAVILY_DEFINITIVE_REJECT_HTTP_STATUSES = (
-    DEFINITIVE_REJECT_HTTP_STATUSES | frozenset({432, 433})
-)
+EXA_DEFINITIVE_REJECT_HTTP_STATUSES = DEFINITIVE_REJECT_HTTP_STATUSES
 AI_PROVIDER_CIRCUIT_HTTP_STATUSES = frozenset({401, 402, 403, 404})
 AI_PROVIDER_CIRCUIT_WINDOW = timedelta(hours=6)
 AI_RATE_LIMIT_CIRCUIT_HTTP_STATUSES = frozenset({429})
@@ -241,12 +241,12 @@ def _require_lease(store: StateStore, token: str) -> Lease:
 
 
 def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
-    """Map the known catalogue columns to Tavily's generic identity aliases."""
+    """Map known catalogue columns to provider-neutral identity aliases."""
 
     public_name = str(product.get("product_name") or "").strip()
     if not public_name:
         raise CLIError(
-            "product_name is empty; record insufficient_identity without Tavily"
+            "product_name is empty; record insufficient_identity without search"
         )
     identity: dict[str, Any] = {"model": public_name, "product_name": public_name}
     if include_internal_search_hints():
@@ -256,30 +256,86 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def _make_search_client(*, timeout: float) -> ExaClient:
+    return ExaClient(timeout=timeout)
+
+
+def _client_provider(client: Any) -> str:
+    del client
+    return "exa"
+
+
+def _provider_quota_error(exc: BaseException) -> bool:
+    return isinstance(exc, ExaQuotaExhaustedError)
+
+
+def _provider_error(exc: BaseException) -> bool:
+    return isinstance(exc, ExaError)
+
+
+def _provider_outcome(exc: BaseException, client: Any) -> str:
+    del client
+    if _provider_quota_error(exc):
+        return "search_quota_exhausted"
+    if _provider_error(exc):
+        return "search_error"
+    return "error"
+
+
 def _credits(bundle: Mapping[str, Any]) -> float:
     usage = bundle.get("usage")
     if not isinstance(usage, Mapping) or "credits" not in usage:
-        raise TavilyResponseError(
-            "Tavily result is missing explicit usage.credits"
+        raise ExaResponseError(
+            "Exa result is missing explicit usage.credits"
         )
     raw = usage["credits"]
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        raise TavilyResponseError(
-            "Tavily result usage.credits must be a finite non-negative number"
+        raise ExaResponseError(
+            "Exa usage.credits must be a finite non-negative number"
         )
     value = float(raw)
     if not math.isfinite(value) or value < 0:
-        raise TavilyResponseError(
-            "Tavily result usage.credits must be a finite non-negative number"
+        raise ExaResponseError(
+            "Exa usage.credits must be a finite non-negative number"
         )
     return value
+
+
+def _usage_cost_dollars(bundle: Mapping[str, Any]) -> float:
+    usage = bundle.get("usage")
+    if not isinstance(usage, Mapping):
+        return 0.0
+    raw = usage.get("cost_dollars")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.0
+    value = float(raw)
+    return value if math.isfinite(value) and value >= 0 else 0.0
+
+
+def _merged_usage(
+    current: Mapping[str, Any] | None,
+    addition: Mapping[str, Any],
+) -> dict[str, int | float]:
+    usage: dict[str, int | float] = {
+        "credits": (
+            (0.0 if not current else _credits(current))
+            + _credits(addition)
+        )
+    }
+    cost_dollars = (
+        (0.0 if not current else _usage_cost_dollars(current))
+        + _usage_cost_dollars(addition)
+    )
+    if cost_dollars:
+        usage["cost_dollars"] = round(cost_dollars, 9)
+    return usage
 
 
 def _merge_search_bundles(
     current: Mapping[str, Any] | None,
     addition: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Merge bounded Tavily search batches without trusting snippets as evidence."""
+    """Merge bounded Exa search batches without trusting snippets as evidence."""
 
     queries: list[str] = []
     seen_queries: set[str] = set()
@@ -347,19 +403,20 @@ def _merge_search_bundles(
                     and request_id not in request_ids
                 ):
                     request_ids.append(request_id[:300])
+    provider = str(
+        addition.get("provider")
+        or (current or {}).get("provider")
+        or "exa"
+    )
     return {
+        "provider": provider,
         "queries": queries,
-        "search_depth": "basic",
+        "search_depth": str(addition.get("search_depth") or "basic")[:40],
         "results": [
             merged[url]
             for url in order[:MAX_RESEARCH_SEARCH_RESULTS]
         ],
-        "usage": {
-            "credits": (
-                (0.0 if not current else _credits(current))
-                + _credits(addition)
-            )
-        },
+        "usage": _merged_usage(current, addition),
         "request_ids": request_ids,
     }
 
@@ -411,19 +468,20 @@ def _merge_extract_bundles(
     query = addition.get("query")
     if not isinstance(query, str):
         query = (current or {}).get("query")
+    provider = str(
+        addition.get("provider")
+        or (current or {}).get("provider")
+        or "exa"
+    )
     return {
+        "provider": provider,
         "query": str(query or "")[:400],
         "results": [
             merged[url]
             for url in order[:MAX_RESEARCH_EVIDENCE_URLS]
         ],
         "failed_results": failed[:10],
-        "usage": {
-            "credits": (
-                (0.0 if not current else _credits(current))
-                + _credits(addition)
-            )
-        },
+        "usage": _merged_usage(current, addition),
     }
 
 
@@ -531,11 +589,15 @@ def _home_catalogue_product(item: Any, *, path_prefix: str) -> dict[str, Any]:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     missing = missing_environment(REQUIRED_ENVIRONMENT)
-    # Tavily keys: accept either TAVILY_API_KEYS (multi) or TAVILY_API_KEY (single).
-    tavily_keys = os.getenv("TAVILY_API_KEYS", "").strip()
-    tavily_single = os.getenv("TAVILY_API_KEY", "").strip()
-    if not tavily_keys and not tavily_single:
-        missing.append("TAVILY_API_KEYS or TAVILY_API_KEY")
+    provider_keys = os.getenv("EXA_API_KEYS", "").strip()
+    provider_single = os.getenv("EXA_API_KEY", "").strip()
+    if not provider_keys and not provider_single:
+        missing.append("EXA_API_KEYS or EXA_API_KEY")
+    provider_check = {
+        "ok": True,
+        "provider": "exa",
+        "note": "configuration only; doctor does not spend search credits",
+    }
     state = _store()
     checks: dict[str, Any] = {
         "state": {
@@ -544,6 +606,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             "schema_version": state.schema_version,
         },
         "environment": {"ok": not missing, "missing": missing},
+        "search_provider_config": provider_check,
         "live": bool(args.live),
     }
     state.close()
@@ -649,8 +712,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             else:
                 raise
         checks["wikijs"] = {"ok": True, "read_probe": probe_path}
-        checks["tavily"] = {
+        checks["search_provider"] = {
             "ok": True,
+            "provider": "exa",
             "note": "key configured; no credits spent by doctor",
         }
 
@@ -690,7 +754,7 @@ def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
                     store.upsert_products(products[offset : offset + 100])
                 )
             quota_resumed = (
-                store.resume_tavily_quota_waits()
+                store.resume_search_quota_waits()
                 if resume_quota
                 else 0
             )
@@ -707,7 +771,7 @@ def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
 
 
 def refresh_catalogue() -> dict[str, Any]:
-    """Refresh source rows without waking still-exhausted Tavily waits."""
+    """Refresh source rows without waking still-exhausted Exa waits."""
 
     return sync_catalogue(resume_quota=False)
 
@@ -758,7 +822,7 @@ def _run_search(
 ) -> dict[str, Any]:
     store.begin_search(lease)
     try:
-        client = TavilyClient(timeout=timeout)
+        client = _make_search_client(timeout=timeout)
         bundle = client.search_product(
             _search_identity(lease.payload), max_results=max_results
         )
@@ -775,11 +839,7 @@ def _run_search(
         try:
             store.record_outcome(
                 lease,
-                (
-                    "tavily_quota_exhausted"
-                    if isinstance(exc, TavilyQuotaExhaustedError)
-                    else "tavily_error"
-                ),
+                _provider_outcome(exc, locals().get("client")),
                 error=_safe_error(exc),
             )
         except StateError:
@@ -822,7 +882,7 @@ def _run_extract(
 ) -> dict[str, Any]:
     submitted = store.begin_extract(lease, urls)
     try:
-        client = TavilyClient(timeout=timeout)
+        client = _make_search_client(timeout=timeout)
         bundle = client.extract_urls(submitted, query)
         limit = max_extract_chars()
         for result in bundle.get("results", []):
@@ -855,11 +915,7 @@ def _run_extract(
         try:
             store.record_outcome(
                 lease,
-                (
-                    "tavily_quota_exhausted"
-                    if isinstance(exc, TavilyQuotaExhaustedError)
-                    else "tavily_error"
-                ),
+                _provider_outcome(exc, locals().get("client")),
                 error=_safe_error(exc),
             )
         except StateError:
@@ -938,21 +994,44 @@ def _reserve_research_action(
 def _research_scope_fingerprints(
     product: dict[str, Any],
     ai_settings: AISettings,
-    tavily_client: TavilyClient,
+    search_client: ExaClient,
     *,
     max_results: int,
     research_settings: ResearchSettings,
 ) -> dict[str, str]:
-    tavily_credential = getattr(
-        tavily_client,
+    provider_credential = getattr(
+        search_client,
         "credential_fingerprint",
         "",
     )
     if (
-        not isinstance(tavily_credential, str)
-        or not re.fullmatch(r"[0-9a-f]{64}", tavily_credential)
+        not isinstance(provider_credential, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", provider_credential)
     ):
-        tavily_credential = "unavailable"
+        provider_credential = "unavailable"
+    provider_endpoint = getattr(
+        search_client,
+        "api_base_url",
+        EXA_API_BASE_URL,
+    )
+    if not isinstance(provider_endpoint, str) or not provider_endpoint.startswith(
+        "https://"
+    ):
+        provider_endpoint = EXA_API_BASE_URL
+    search_contract = getattr(
+        search_client,
+        "search_contract_version",
+        EXA_SEARCH_CONTRACT_VERSION,
+    )
+    if not isinstance(search_contract, str) or not search_contract:
+        search_contract = EXA_SEARCH_CONTRACT_VERSION
+    extract_contract = getattr(
+        search_client,
+        "extract_contract_version",
+        EXA_EXTRACT_CONTRACT_VERSION,
+    )
+    if not isinstance(extract_contract, str) or not extract_contract:
+        extract_contract = EXA_EXTRACT_CONTRACT_VERSION
     search_identity = _search_identity(product)
 
     def digest(payload: Mapping[str, Any]) -> str:
@@ -966,24 +1045,24 @@ def _research_scope_fingerprints(
             ).encode("utf-8")
         ).hexdigest()
 
-    tavily_provider_scope = {
-        "provider": "tavily",
-        "endpoint": TAVILY_API_BASE_URL,
+    search_provider_scope = {
+        "provider": "exa",
+        "endpoint": provider_endpoint,
         "search_identity": search_identity,
-        "credential_fingerprint": tavily_credential,
+        "credential_fingerprint": provider_credential,
     }
     search_scope = digest(
         {
-            **tavily_provider_scope,
-            "version": TAVILY_SEARCH_CONTRACT_VERSION,
+            **search_provider_scope,
+            "version": search_contract,
             "action": "search",
             "max_results": max_results,
         }
     )
     extract_scope = digest(
         {
-            **tavily_provider_scope,
-            "version": TAVILY_EXTRACT_CONTRACT_VERSION,
+            **search_provider_scope,
+            "version": extract_contract,
             "action": "extract",
         }
     )
@@ -1062,18 +1141,18 @@ def _known_provider_credits(client: Any) -> int | float:
     return int(number) if number.is_integer() else number
 
 
-def _tavily_failure_status(exc: BaseException, client: Any) -> str:
+def _search_failure_status(exc: BaseException, client: Any) -> str:
     del client
-    if isinstance(exc, TavilyQuotaExhaustedError):
+    if _provider_quota_error(exc):
         # A multi-query action may have completed earlier requests, but the
         # quota response definitively proves the current request did not run.
         # Known partial credits are audited and the action may retry after the
         # monthly wake instead of becoming permanently replay-suppressed.
         return "failed"
     if (
-        isinstance(exc, TavilyHTTPError)
+        isinstance(exc, ExaHTTPError)
         and isinstance(exc.status_code, int)
-        and exc.status_code in TAVILY_DEFINITIVE_REJECT_HTTP_STATUSES
+        and exc.status_code in EXA_DEFINITIVE_REJECT_HTTP_STATUSES
     ):
         return "failed"
     return "uncertain"
@@ -1128,7 +1207,7 @@ def _record_research_service_failure(
 def _run_research_search(
     store: StateStore,
     lease: Lease,
-    client: TavilyClient,
+    client: ExaClient,
     *,
     round_number: int,
     max_results: int,
@@ -1161,7 +1240,7 @@ def _run_research_search(
             else client.search_product(identity, max_results=max_results)
         )
         if not isinstance(raw_bundle, dict):
-            raise TavilyError("Tavily search result must be an object")
+            raise ExaResponseError("Exa search result must be an object")
         bundle = dict(raw_bundle)
         bundle["queries"] = planned_queries
         candidate_urls = [
@@ -1204,16 +1283,8 @@ def _run_research_search(
             action="search",
             fingerprint=fingerprint,
             error=exc,
-            outcome=(
-                "tavily_quota_exhausted"
-                if isinstance(exc, TavilyQuotaExhaustedError)
-                else (
-                    "tavily_error"
-                    if isinstance(exc, TavilyError)
-                    else "error"
-                )
-            ),
-            status=_tavily_failure_status(exc, client),
+            outcome=_provider_outcome(exc, client),
+            status=_search_failure_status(exc, client),
             known_credits=(
                 _known_provider_credits(client)
                 if _known_provider_credits(client) > 0
@@ -1243,7 +1314,7 @@ def _run_research_search(
 def _run_research_extract(
     store: StateStore,
     lease: Lease,
-    client: TavilyClient,
+    client: ExaClient,
     *,
     round_number: int,
     scope_fingerprints: Mapping[str, str],
@@ -1262,7 +1333,7 @@ def _run_research_extract(
     try:
         raw_bundle = client.extract_urls(urls, query)
         if not isinstance(raw_bundle, dict):
-            raise TavilyError("Tavily extract result must be an object")
+            raise ExaResponseError("Exa extract result must be an object")
         bundle = dict(raw_bundle)
         limit = max_extract_chars()
         expected_identity = str(lease.payload.get("product_name") or "")
@@ -1277,8 +1348,8 @@ def _run_research_extract(
                 and result["url"] not in submitted_url_set
                 for result in results
             ):
-                raise TavilyResponseError(
-                    "Tavily extract returned a URL outside this action's "
+                raise ExaResponseError(
+                    "Exa extract returned a URL outside this action's "
                     "submitted set"
                 )
             for result in results:
@@ -1337,16 +1408,8 @@ def _run_research_extract(
             action="extract",
             fingerprint=fingerprint,
             error=exc,
-            outcome=(
-                "tavily_quota_exhausted"
-                if isinstance(exc, TavilyQuotaExhaustedError)
-                else (
-                    "tavily_error"
-                    if isinstance(exc, TavilyError)
-                    else "error"
-                )
-            ),
-            status=_tavily_failure_status(exc, client),
+            outcome=_provider_outcome(exc, client),
+            status=_search_failure_status(exc, client),
             known_credits=(
                 _known_provider_credits(client)
                 if _known_provider_credits(client) > 0
@@ -2004,7 +2067,7 @@ def _research_audit(
             "gaps": gaps,
             "stop_reason": stop_reason,
         },
-        "tavily": {
+        "exa": {
             "search_usage": search.get("usage", {}),
             "extract_usage": extract.get("usage", {}),
             "query_count": len(search.get("queries", []))
@@ -2072,7 +2135,7 @@ def run_one(
     worker_id: str | None = None,
     lease_seconds: int = 3600,
     max_results: int = 5,
-    tavily_timeout: float = 30.0,
+    search_timeout: float = 30.0,
 ) -> dict[str, Any]:
     """Run one product through a bounded, durable research feedback loop."""
 
@@ -2089,11 +2152,11 @@ def run_one(
     ):
         raise CLIError("run-one lease_seconds must be between 300 and 7200")
     if (
-        isinstance(tavily_timeout, bool)
-        or not isinstance(tavily_timeout, (int, float))
-        or not 1 <= float(tavily_timeout) <= 120
+        isinstance(search_timeout, bool)
+        or not isinstance(search_timeout, (int, float))
+        or not 1 <= float(search_timeout) <= 120
     ):
-        raise CLIError("run-one tavily_timeout must be between 1 and 120 seconds")
+        raise CLIError("run-one search timeout must be between 1 and 120 seconds")
 
     research_settings = ResearchSettings.from_env()
     required_lease_seconds = math.ceil(
@@ -2239,14 +2302,19 @@ def run_one(
                 _record_active_failure(store, lease, "ai_error", exc)
                 raise
             try:
-                tavily_client = TavilyClient(timeout=tavily_timeout)
-            except TavilyError as exc:
-                _record_active_failure(store, lease, "tavily_error", exc)
+                search_client = _make_search_client(timeout=search_timeout)
+            except ExaError as exc:
+                _record_active_failure(
+                    store,
+                    lease,
+                    _provider_outcome(exc, locals().get("search_client")),
+                    exc,
+                )
                 raise
             research_scope_fingerprints = _research_scope_fingerprints(
                 lease.payload,
                 ai_settings,
-                tavily_client,
+                search_client,
                 max_results=max_results,
                 research_settings=research_settings,
             )
@@ -2273,21 +2341,21 @@ def run_one(
             pending_queries: tuple[str, ...] | None = None
             validation_feedback: ValidationFeedback | None = None
             candidate_manufacturer: str | None = None
-            tavily_budget_credits = 0.0
+            search_budget_units = 0.0
 
             initial_search = _run_research_search(
                 store,
                 lease,
-                tavily_client,
+                search_client,
                 round_number=0,
                 max_results=max_results,
                 scope_fingerprints=research_scope_fingerprints,
             )
             search = _merge_search_bundles(search, initial_search)
             query_history.extend(initial_search.get("queries", []))
-            tavily_budget_credits += max(
+            search_budget_units += max(
                 _credits(initial_search),
-                BASIC_SEARCH_CREDITS_PER_QUERY
+                SEARCH_BUDGET_UNITS_PER_QUERY
                 * len(initial_search.get("queries", [])),
             )
 
@@ -2309,8 +2377,8 @@ def run_one(
             if (
                 initial_urls
                 and (
-                    tavily_budget_credits
-                    + ADVANCED_EXTRACT_CREDITS_PER_BATCH
+                    search_budget_units
+                    + EXTRACT_BUDGET_UNITS_PER_BATCH
                     <= research_settings.max_credits
                 )
                 and time.monotonic() - started < research_settings.max_seconds
@@ -2319,16 +2387,16 @@ def run_one(
                 initial_extract = _run_research_extract(
                     store,
                     lease,
-                    tavily_client,
+                    search_client,
                     round_number=0,
                     scope_fingerprints=research_scope_fingerprints,
                     urls=initial_urls,
                     query=_research_extract_query(product_name, None),
                 )
                 extract = _merge_extract_bundles(extract, initial_extract)
-                tavily_budget_credits += max(
+                search_budget_units += max(
                     _credits(initial_extract),
-                    ADVANCED_EXTRACT_CREDITS_PER_BATCH,
+                    EXTRACT_BUDGET_UNITS_PER_BATCH,
                 )
 
             round_number = 0
@@ -2341,15 +2409,15 @@ def run_one(
                     ):
                         stop_reason = "query budget exhausted"
                     elif (
-                        tavily_budget_credits
+                        search_budget_units
                         + (
-                            BASIC_SEARCH_CREDITS_PER_QUERY
+                            SEARCH_BUDGET_UNITS_PER_QUERY
                             * len(pending_queries)
                         )
                         > research_settings.max_credits
                     ):
                         stop_reason = (
-                            "Tavily credit budget cannot reserve the next search"
+                            "Search budget cannot reserve the next search"
                         )
                     elif (
                         time.monotonic() - started
@@ -2377,7 +2445,7 @@ def run_one(
                     supplemental_search = _run_research_search(
                         store,
                         lease,
-                        tavily_client,
+                        search_client,
                         round_number=round_number,
                         max_results=max_results,
                         scope_fingerprints=research_scope_fingerprints,
@@ -2387,9 +2455,9 @@ def run_one(
                         search,
                         supplemental_search,
                     )
-                    tavily_budget_credits += max(
+                    search_budget_units += max(
                         _credits(supplemental_search),
-                        BASIC_SEARCH_CREDITS_PER_QUERY
+                        SEARCH_BUDGET_UNITS_PER_QUERY
                         * len(pending_queries),
                     )
                     query_history.extend(pending_queries)
@@ -2466,12 +2534,12 @@ def run_one(
                             audit=audit,
                         )
                     if (
-                        tavily_budget_credits
-                        + ADVANCED_EXTRACT_CREDITS_PER_BATCH
+                        search_budget_units
+                        + EXTRACT_BUDGET_UNITS_PER_BATCH
                         > research_settings.max_credits
                     ):
                         stop_reason = (
-                            "Tavily credit budget cannot reserve the next extract"
+                            "Search budget cannot reserve the next extract"
                         )
                         audit = _research_audit(
                             model=ai_settings.model,
@@ -2510,7 +2578,7 @@ def run_one(
                     supplemental_extract = _run_research_extract(
                         store,
                         lease,
-                        tavily_client,
+                        search_client,
                         round_number=round_number,
                         scope_fingerprints=research_scope_fingerprints,
                         urls=supplemental_urls,
@@ -2523,9 +2591,9 @@ def run_one(
                         extract,
                         supplemental_extract,
                     )
-                    tavily_budget_credits += max(
+                    search_budget_units += max(
                         _credits(supplemental_extract),
-                        ADVANCED_EXTRACT_CREDITS_PER_BATCH,
+                        EXTRACT_BUDGET_UNITS_PER_BATCH,
                     )
                     new_content = [
                         item
@@ -2784,12 +2852,13 @@ def run_one(
                 "next_attempt_at": outcome.next_attempt_at,
                 "reason": "uncertain paid request replay suppressed",
             }
-        except TavilyQuotaExhaustedError:
+        except ExaQuotaExhaustedError:
             return {
                 "ok": True,
                 "processed": False,
                 "published": False,
-                "reason": "tavily_quota_exhausted",
+                "reason": "search_quota_exhausted",
+                "provider": "exa",
                 "resume_at": next_month_start().isoformat(),
             }
 
@@ -2801,7 +2870,7 @@ def run_one(
             ConfigError,
             DecisionError,
             StateError,
-            TavilyError,
+            ExaError,
             WikiJSError,
             CLIError,
         ) as exc:
@@ -2818,7 +2887,7 @@ def _cmd_run_one(args: argparse.Namespace) -> int:
             worker_id=args.worker_id,
             lease_seconds=args.lease_seconds,
             max_results=args.max_results,
-            tavily_timeout=args.tavily_timeout,
+            search_timeout=args.search_timeout,
         )
     )
     return 0
@@ -2951,13 +3020,19 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--lease-seconds", type=int, default=3600)
     claim.set_defaults(func=_cmd_claim)
 
-    search = subparsers.add_parser("search", help="perform bounded Tavily searches")
+    search = subparsers.add_parser(
+        "search",
+        help="perform bounded searches with the configured provider",
+    )
     search.add_argument("--lease-token", required=True)
     search.add_argument("--max-results", type=int, default=5)
     search.add_argument("--timeout", type=float, default=30.0)
     search.set_defaults(func=_cmd_search)
 
-    extract = subparsers.add_parser("extract", help="extract selected URLs through Tavily")
+    extract = subparsers.add_parser(
+        "extract",
+        help="extract selected URLs through the configured provider",
+    )
     extract.add_argument("--lease-token", required=True)
     extract.add_argument("--request-file", required=True)
     extract.add_argument("--timeout", type=float, default=30.0)
@@ -2967,18 +3042,23 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--decision-file", required=True)
     publish.add_argument(
         "--evidence-file",
-        help="Tavily extract JSON required when the decision outcome is publish",
+        help="provider extract JSON required when the decision outcome is publish",
     )
     publish.set_defaults(func=_cmd_publish)
 
     run_one_parser = subparsers.add_parser(
         "run-one",
-        help="process one due product with Tavily, configured AI, and Wiki.js",
+        help="process one due product with web search, configured AI, and Wiki.js",
     )
     run_one_parser.add_argument("--worker-id")
     run_one_parser.add_argument("--lease-seconds", type=int, default=3600)
     run_one_parser.add_argument("--max-results", type=int, default=5)
-    run_one_parser.add_argument("--tavily-timeout", type=float, default=30.0)
+    run_one_parser.add_argument(
+        "--search-timeout",
+        dest="search_timeout",
+        type=float,
+        default=30.0,
+    )
     run_one_parser.set_defaults(func=_cmd_run_one)
 
     serve_parser = subparsers.add_parser(
@@ -3018,7 +3098,7 @@ def main(argv: list[str] | None = None) -> int:
         DecisionError,
         LeaseLostError,
         StateError,
-        TavilyError,
+        ExaError,
         WorkerConfigError,
         WikiJSError,
         ValueError,

@@ -89,7 +89,8 @@ _RESEARCH_AI_OUTCOMES = frozenset(
 )
 TRANSIENT_OUTCOMES = frozenset(
     {
-        "tavily_error",
+        "tavily_error",  # Legacy persisted value from pre-Exa workers.
+        "search_error",
         "ai_error",
         "wikijs_error",
         "error",
@@ -1073,7 +1074,7 @@ class StateStore:
                 connection.execute("PRAGMA user_version = 3")
                 current = 3
             if current < 4:
-                # Only URLs that Tavily actually extracted may become evidence.
+                # Only URLs the search provider extracted may become evidence.
                 # Existing active attempts fail closed because their successful
                 # subset cannot be reconstructed from the v3 audit record.
                 connection.execute(
@@ -1292,8 +1293,8 @@ class StateStore:
             ).fetchone()
         return self._product_state(row) if row is not None else None
 
-    def resume_tavily_quota_waits(self, *, now: datetime | None = None) -> int:
-        """Make quota-paused products due after a monthly reset or key change."""
+    def resume_search_quota_waits(self, *, now: datetime | None = None) -> int:
+        """Make Exa-quota-paused products due after a key or budget change."""
 
         now_text = _time_text(_utc(now))
         with self._write_transaction() as connection:
@@ -1302,7 +1303,10 @@ class StateStore:
                 UPDATE products
                 SET status = 'due', next_run_at = ?, updated_at = ?
                 WHERE status = 'backoff'
-                  AND last_outcome = 'tavily_quota_exhausted'
+                  AND last_outcome IN (
+                      'tavily_quota_exhausted', -- Legacy persisted value.
+                      'search_quota_exhausted'
+                  )
                   AND lease_token IS NULL
                 """,
                 (now_text, now_text),
@@ -1354,7 +1358,7 @@ class StateStore:
         """Check due state or validate a lease immediately before web work.
 
         Passing a :class:`Lease` automatically checks its token and source hash.
-        This inexpensive check should be made before spending a Tavily request.
+        This inexpensive check should be made before spending an Exa request.
         """
 
         if isinstance(product, Lease):
@@ -1611,7 +1615,7 @@ class StateStore:
         *,
         now: datetime | None = None,
     ) -> datetime:
-        """Atomically consume this lease's single Tavily search allowance."""
+        """Atomically consume this lease's single Exa search allowance."""
 
         timestamp = _utc(now)
         with self._write_transaction() as connection:
@@ -2900,7 +2904,10 @@ class StateStore:
                 next_run = timestamp + timedelta(days=SYNC_REFRESH_DAYS)
                 last_error = None
                 last_success = now_text
-            elif stored_outcome == "tavily_quota_exhausted":
+            elif stored_outcome in {
+                "tavily_quota_exhausted",
+                "search_quota_exhausted",
+            }:
                 failures = int(row["consecutive_failures"])
                 status = "backoff"
                 next_run = next_month_start(timestamp)

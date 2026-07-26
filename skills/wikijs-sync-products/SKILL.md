@@ -1,6 +1,6 @@
 ---
 name: wikijs-sync-products
-description: Install, upgrade, repair, or remove the PV Wiki n8n automation on a user-authorized VPS. Discover an existing n8n or deploy a dedicated instance, deploy the internal PV Wiki worker, collect user-selected Tavily/AI/Wiki/database settings, import inactive workflows, and run acceptance checks. Do not use this skill as the recurring product updater and do not create a Hermes cron job.
+description: Install, upgrade, repair, or remove the PV Wiki n8n automation on a user-authorized VPS. Discover an existing n8n or deploy a dedicated instance, deploy the internal PV Wiki worker, collect user-selected search/AI/Wiki/database settings, import inactive workflows, and run acceptance checks. Do not use this skill as the recurring product updater and do not create a Hermes cron job.
 version: 0.2.0
 author: sulirang
 license: MIT
@@ -15,7 +15,7 @@ metadata:
       - n8n
       - wikijs
       - postgresql
-      - tavily
+      - exa
       - knowledge-base
     requires_toolsets:
       - terminal
@@ -44,7 +44,7 @@ Before changing a server, read:
 - Never create a Hermes cron, heartbeat, background loop, or recurring task.
 - Do not enable n8n Execute Command, mount the Docker socket, or expose an
   arbitrary shell/API operation.
-- Do not put Tavily, AI, PostgreSQL, Wiki.js, or worker secrets in workflow
+- Do not put Exa, AI, PostgreSQL, Wiki.js, or worker secrets in workflow
   JSON, Git, command-line arguments, or logs.
 - Do not make the source catalogue writable. n8n, Wiki.js, and the product
   catalogue must not share application tables or database users.
@@ -67,7 +67,7 @@ into chat:
 - backup location and retention;
 - user-selected OpenAI-compatible `AI_BASE_URL`, `AI_MODEL`, and a secure way
   to install `AI_API_KEY`;
-- user-owned Tavily keys, read-only catalogue settings, and restricted Wiki.js
+- Exa keys, read-only catalogue settings, and restricted Wiki.js
   API token.
 
 If the host, instance owner, or allowed deployment boundary is ambiguous, stop
@@ -150,7 +150,7 @@ The user chooses every external provider. Install these values in
 `worker.env`, never in n8n workflow JSON:
 
 ```dotenv
-TAVILY_API_KEYS=...
+EXA_API_KEYS=...
 AI_BASE_URL=https://provider.example/v1
 AI_API_KEY=...
 AI_MODEL=...
@@ -209,8 +209,8 @@ revision inside that span. Record ambiguous multi-model table rows as a normal
 non-publish outcome and retry them automatically; do not open a review issue.
 
 Run `pv-wiki doctor` before any live probes, then `pv-wiki doctor --live`. The
-doctor validates AI configuration but intentionally spends no AI or Tavily
-credits.
+doctor validates AI and search-provider configuration but intentionally spends
+no AI or Exa credits.
 
 ## 5. Import n8n workflows inactive
 
@@ -250,7 +250,7 @@ Daily Catalogue Recovery
 ```
 
 The monthly product trigger runs at 08:05 Asia/Shanghai (00:05 UTC) on day 1,
-shortly after Tavily's first-day credit reset. A daily 03:17 refresh retries
+preserving the first-day quota-reset cadence. A daily 03:17 refresh retries
 catalogue ingestion without waking quota-paused products. The hourly trigger
 resumes due and backoff work without rerunning the catalogue sync. The homepage workflow calls
 `POST /publish-home` daily at 02:35 Asia/Shanghai. Catalogue/home calls use
@@ -269,7 +269,7 @@ serialized lock and targets a different Wiki path. This is a single-process
 fence: keep exactly one worker replica and do not run mutating CLI commands
 concurrently with the scheduled HTTP worker.
 The queue loops only when the response says `processed=true`. A no-due result
-or exhaustion of every configured Tavily key ends the loop. There is no shell
+or exhaustion of every configured selected-provider key ends the loop. There is no shell
 node and no arbitrary request body.
 
 Legal non-publish results, including `no_datasheet`, `ambiguous`,
@@ -278,12 +278,13 @@ silently stored in the audit and retried by the queue. They do not require a
 person to review one issue per product. Provider, configuration, database, or
 service failures that stop the workflow remain batch-level alerts.
 
-When the user adds or replaces a Tavily key, update `TAVILY_API_KEYS`, recreate
-the worker so it receives the new environment, then run
+When the user adds or replaces an Exa key, update `EXA_API_KEYS`, recreate the
+worker so it receives the new
+environment, then run
 `Manual / New Key Start` once to wake quota-paused products immediately and
 validate the key. Otherwise their first-of-next-UTC-month wake time remains.
-HTTP 429 is a transient request-rate limit; Tavily plan/pay-as-you-go
-exhaustion uses HTTP 432/433 and rotates to the next key. Known partial work
+HTTP 429 is a transient request-rate limit. Exa budget exhaustion uses HTTP
+402 and rotates to the next configured key. Known partial work
 before an explicit quota/4xx response is audited and remains retryable; only
 ambiguous paid requests are replay-suppressed.
 

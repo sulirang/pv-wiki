@@ -44,8 +44,8 @@ External search sends only `product_name` by default. Bounded search
 titles/snippets and successful extracts let AI discover the public manufacturer
 and product type. `family_code` always remains local and never becomes a range
 route, public category, search term, or AI input. `brand_code` is included only
-when the operator explicitly enables `PV_WIKI_TAVILY_INCLUDE_INTERNAL_HINTS`.
-`product_id` is never a Tavily or AI input.
+when the operator explicitly enables `PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS`.
+`product_id` is never a search-provider or AI input.
 
 ## Durable worker state
 
@@ -63,7 +63,7 @@ local SQLite schema (currently version 7):
 attempt-local `(action, request fingerprint)`. Version 7 also stores an
 action-specific scope fingerprint. Before any new provider call, the worker
 compares each earlier unresolved action against the current scope for that
-prior action: Search and Extract use separate Tavily wire scopes, while AI uses
+prior action: Search and Extract use separate provider wire scopes, while AI uses
 its endpoint/account/model/prompt scope. Changing an unrelated provider or a
 local timeout cannot unlock a possibly charged call. Legacy unresolved rows
 without a reliable scope block fail-closed. A blocked product records

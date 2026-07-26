@@ -939,7 +939,7 @@ def build_decision_messages(
     request = {
         "task": "propose_product_decision",
         "product": _public_product(product),
-        "tavily": {
+        "retrieval": {
             "search": _normalized_search(search or {}, evidence_budget),
             "extract": _normalized_extract(extract or {}, evidence_budget),
         },
@@ -1023,7 +1023,7 @@ def build_decision_messages(
             ],
         },
         "source_policy": [
-            "Cite only URLs present in tavily.extract.results.",
+            "Cite only URLs present in retrieval.extract.results.",
             "A publish decision needs a primary datasheet from a manufacturer, "
             "regulator, or authorized source and at least five cited facts.",
             "Infer the public manufacturer, model, and product category from "

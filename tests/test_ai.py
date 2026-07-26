@@ -203,16 +203,16 @@ class PromptTests(unittest.TestCase):
         )
         self.assertEqual(
             "https://maker.example/pv-42.pdf",
-            prompt["tavily"]["extract"]["results"][0]["url"],
+            prompt["retrieval"]["extract"]["results"][0]["url"],
         )
-        search_result = prompt["tavily"]["search"]["results"][0]
+        search_result = prompt["retrieval"]["search"]["results"][0]
         self.assertEqual("Result", search_result["title"])
         self.assertEqual(
             "https://search.example/pv-42",
             search_result["url"],
         )
         self.assertEqual(1000, len(search_result["snippet"]))
-        self.assertNotIn("failed_results", prompt["tavily"]["extract"])
+        self.assertNotIn("failed_results", prompt["retrieval"]["extract"])
         self.assertNotIn("s" * 1001, messages[1]["content"])
         self.assertIn(
             "out_of_scope",
@@ -227,12 +227,12 @@ class PromptTests(unittest.TestCase):
             " ".join(prompt["source_policy"]).casefold(),
         )
         evidence_chars = len(
-            prompt["tavily"]["extract"]["results"][0]["raw_content"]
+            prompt["retrieval"]["extract"]["results"][0]["raw_content"]
         )
         self.assertEqual(3000, evidence_chars)
-        self.assertTrue(prompt["tavily"]["extract"]["results"][0]["truncated"])
+        self.assertTrue(prompt["retrieval"]["extract"]["results"][0]["truncated"])
         self.assertFalse(
-            prompt["tavily"]["extract"]["results"][0]["identity_verified"]
+            prompt["retrieval"]["extract"]["results"][0]["identity_verified"]
         )
 
     def test_prompt_rejects_invalid_inputs(self) -> None:

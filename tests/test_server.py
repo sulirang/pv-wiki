@@ -54,14 +54,14 @@ class WorkerSettingsTests(unittest.TestCase):
         self.assertEqual(9090, settings.port)
         self.assertNotIn("t" * 40, repr(settings))
 
-    def test_safe_error_redacts_each_rotated_tavily_key(self) -> None:
+    def test_safe_error_redacts_each_rotated_exa_key(self) -> None:
         with mock.patch.dict(
             os.environ,
-            {"TAVILY_API_KEYS": "key-one-long,key-two-long"},
+            {"EXA_API_KEYS": "exa-key-one,exa-key-two"},
             clear=True,
         ):
             message = server._safe_error(
-                RuntimeError("failed key-one-long then key-two-long")
+                RuntimeError("failed exa-key-one then exa-key-two")
             )
         self.assertEqual("failed [REDACTED] then [REDACTED]", message)
 

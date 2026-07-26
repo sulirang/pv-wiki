@@ -3,10 +3,10 @@
 ## Runtime ownership
 
 n8n is the only recurring scheduler. `PV Wiki - Product Cycle` starts at
-08:05 Asia/Shanghai (00:05 UTC) on the first day of every month, shortly after
-Tavily's documented first-day credit reset. It calls the worker serially until
-no product is due or every configured Tavily key has exhausted its monthly
-plan/pay-as-you-go allowance. A separate hourly trigger enters directly at
+08:05 Asia/Shanghai (00:05 UTC) on the first day of every month, preserving the
+first-day quota cadence. It calls the worker serially until no product is due
+or every configured Exa key has exhausted its
+allowance. A separate hourly trigger enters directly at
 `Run One Product`, so due/backoff work resumes without waiting for another
 catalogue sync or a person. A daily 03:17 catalogue recovery calls
 `Refresh Catalogue`, which retries source ingestion without waking
@@ -37,9 +37,9 @@ mounted.
 One product cycle starts with a fixed search/extract pass. The AI may then
 return either a final proposal or one of six fixed evidence gaps with one or
 two supplemental queries. The default budgets allow at most three AI actions,
-seven basic search queries, five unique extract URLs, and a 20-credit Tavily
-admission budget. Before a call starts, the worker reserves one credit per
-basic Search query or two credits per advanced Extract batch. No new research
+seven search queries, five unique extract URLs, and a 20-unit provider-neutral
+admission budget. Before a call starts, the worker reserves one unit per Search
+query or two units per Extract batch. No new research
 action starts after 600 seconds. Configure these with
 `PV_WIKI_RESEARCH_MAX_ROUNDS`, `PV_WIKI_RESEARCH_MAX_QUERIES`,
 `PV_WIKI_RESEARCH_MAX_CREDITS`, and `PV_WIKI_RESEARCH_MAX_SECONDS`; their
@@ -48,16 +48,16 @@ also cover the research deadline plus the bounded AI repair and Wiki mutation
 tail; an incompatible short lease is rejected before a product is leased.
 
 The default workflow immediately starts the next due product after a completed
-cycle, consuming the available monthly Tavily credits as quickly as the
+cycle, consuming the available search budget as quickly as the
 bounded inner research loop permits. It stops without an n8n error when the
 queue is empty or all keys are out of credits. The Run One HTTP timeout is 45
 minutes, covering the maximum allowed 20-minute research admission window plus
 the bounded AI-repair and duplicate-create-safe Wiki mutation tail. Set
-provider-side Tavily and AI monthly alerts before activating the workflow.
+provider-side search and AI spend alerts before activating the workflow.
 
-Tavily HTTP 429 is a short request-rate limit and retains bounded Retry-After
-handling. HTTP 432 (plan limit) and 433 (pay-as-you-go limit) permanently skip
-that key for the current worker call; another configured key is tried
+HTTP 429 is a short request-rate limit and retains bounded Retry-After
+handling. Exa HTTP 402 permanently skips that key for
+the current worker call; another configured key is tried
 immediately. When every key is exhausted, the active product is scheduled for
 the first instant of the next UTC month without increasing its failure count,
 and the n8n loop ends. The next monthly catalogue sync, or a manual sync after
@@ -66,7 +66,8 @@ an earlier query in the same action completed before the explicit quota
 response, its known credits are audited and the action remains retryable after
 the wake; only an ambiguous network/provider result is replay-suppressed.
 
-Do not enable Tavily Research or automatically increase URL/token limits. The
+Do not enable provider deep-research/agent endpoints or automatically increase
+URL/token limits. The
 AI can propose search text but cannot provide a domain allowlist, grant source
 trust, call Wiki.js, or change a budget. No new URL/evidence, a local
 validation gap at the round limit, or any exhausted budget ends the attempt as
@@ -102,7 +103,7 @@ responses that are not a single JSON object. A trusted private HTTP endpoint req
 not included in errors.
 
 The model is an untrusted proposer. It receives only reader-facing product
-fields, bounded Tavily search titles/snippets as discovery hints, and successful
+fields, bounded search-provider titles/snippets as discovery hints, and successful
 bounded extracts; failed-extract errors are withheld. It discovers the public
 manufacturer and product type without receiving or routing on `family_code`.
 The runtime strips/overwrites model attempts to
@@ -126,7 +127,7 @@ private/unpublished product at the final prefix and re-review quality before
 continuing a published schedule. Use a separate state volume for a different
 staging prefix. Rotate the key independently of all other credentials. A
 definitive AI 401/402/403/404 opens a provider-global circuit for six hours,
-and AI 429 opens one for an hour. Matching later products stop before Tavily
+and AI 429 opens one for an hour. Matching later products stop before web
 research instead of repeatedly spending credits against a known-bad AI path;
 three distinct products with invalid AI output in one hour also open a
 provider-scoped output circuit. Changing endpoint, account key, or model
@@ -150,8 +151,9 @@ read-only transaction. n8n uses its own PostgreSQL database/user and Wiki.js
 uses its own database; neither shares product tables or credentials.
 
 Run `pv-wiki doctor` for configuration-only checks and `pv-wiki doctor --live`
-for a read-only catalogue probe and Wiki.js read probe. Doctor validates AI
-configuration but intentionally spends no Tavily credits or AI tokens.
+for a read-only catalogue probe and Wiki.js read probe. Doctor validates AI and
+search-provider configuration but intentionally spends no search credits or AI
+tokens.
 
 ## State and retries
 
@@ -204,7 +206,7 @@ last attempts.
 
 Retry behavior:
 
-- all Tavily keys out of monthly credits: first instant of the next UTC month,
+- all selected-provider keys out of budget: first instant of the next UTC month,
   without increasing the product failure count;
 - no datasheet, ambiguity, or insufficient identity: about 30, 90, then 180
   days;
@@ -214,7 +216,7 @@ Retry behavior:
 - source verification failure: about 7, 30, 90, then 365 days;
 - matching generic hardware or another out-of-scope item: recheck after 365
   days;
-- Tavily, AI, Wiki.js, or another transient service error: about 1, 6, then 24
+- search provider, AI, Wiki.js, or another transient service error: about 1, 6, then 24
   hours for the same outcome;
 - invalid AI decision contract: about 24 hours, 3 days, 7 days, then 30 days;
 - Wiki.js edit conflict: about 24 hours;
@@ -241,7 +243,7 @@ unchanged. A detected edit conflict fails the current attempt instead of
 knowingly overwriting a newer human revision.
 
 Homepage refresh reads already successful publications from SQLite. It does no
-Tavily or catalogue work. A product remains in homepage counts after a later
+search-provider or catalogue work. A product remains in homepage counts after a later
 source change or temporary retry because the last successful Wiki page still
 exists.
 

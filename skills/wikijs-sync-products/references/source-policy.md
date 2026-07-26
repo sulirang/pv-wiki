@@ -98,9 +98,9 @@ short quote must be an exact span from the cited bounded extract and contain
 the full target model, field label, and selected value, without a sibling
 model or revision in that span; translated labels belong in surrounding prose,
 not the verified fact name. Extract the complete target-specific row or cell
-context; do not infer a missing value from a nearby model column. If Tavily's
-flattened text cannot preserve an unambiguous target-model span, return
-`ambiguous`. Capture detailed official specifications across
+context; do not infer a missing value from a nearby model column. If the search
+provider's flattened text cannot preserve an unambiguous target-model span,
+return `ambiguous`. Capture detailed official specifications across
 efficiency, input, output, storage, protection, communication, and physical or
 environmental sections when present. Publication requires at least five cited
 specification facts. If sources conflict, add a `conflicts` entry and omit the
@@ -108,7 +108,7 @@ disputed fact from the summary table unless clearly marked. Fact names are
 normalized for uniqueness, and conflict names use the same normalization.
 
 Put datasheet documents in `datasheets` and other evidence pages in `sources`.
-Every cited URL must have been successfully selected for Tavily Extract during
+Every cited URL must have been successfully selected for provider Extract during
 the same lease. Verified facts below the configured fact confidence threshold
 or fields also listed in `conflicts` are rejected from automatic publication.
 
