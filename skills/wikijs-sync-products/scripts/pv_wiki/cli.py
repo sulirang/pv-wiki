@@ -885,6 +885,7 @@ def _run_extract(
         client = _make_search_client(timeout=timeout)
         bundle = client.extract_urls(submitted, query)
         limit = max_extract_chars()
+        expected_identity = str(lease.payload.get("product_name") or "")
         for result in bundle.get("results", []):
             content = result.get("raw_content")
             if isinstance(content, str) and len(content) > limit:
@@ -893,7 +894,12 @@ def _run_extract(
                 ).hexdigest()
                 result["raw_content"] = content[:limit]
                 result["truncated"] = True
-        expected_identity = str(lease.payload.get("product_name") or "")
+                content = result["raw_content"]
+            result["identity_verified"] = (
+                isinstance(content, str)
+                and bool(content.strip())
+                and text_contains_exact_identity(expected_identity, content)
+            )
         successful_urls = [
             item["url"]
             for item in bundle.get("results", [])
@@ -901,10 +907,6 @@ def _run_extract(
             and isinstance(item.get("url"), str)
             and isinstance(item.get("raw_content"), str)
             and item["raw_content"].strip()
-            and text_contains_exact_identity(
-                expected_identity,
-                item["raw_content"],
-            )
         ]
         store.finish_extract(
             lease,
@@ -1373,7 +1375,8 @@ def _run_research_extract(
                 )
                 result["identity_verified"] = identity_verified
                 if (
-                    identity_verified
+                    isinstance(content, str)
+                    and bool(content.strip())
                     and isinstance(result.get("url"), str)
                     and result["url"] not in successful_url_set
                 ):
@@ -2010,7 +2013,7 @@ def _research_evidence_context(
     set[str],
     dict[str, str],
 ]:
-    identity_urls = set(store.allowed_evidence_urls(lease.token))
+    successful_extract_urls = set(store.allowed_evidence_urls(lease.token))
     evidence_text_by_url: dict[str, str] = {}
     classification_text_by_url: dict[str, str] = {}
     results = extract.get("results")
@@ -2027,7 +2030,7 @@ def _research_evidence_context(
             ):
                 continue
             classification_text_by_url[url] = content
-            if url in identity_urls:
+            if url in successful_extract_urls:
                 evidence_text_by_url[url] = content
     return (
         evidence_text_by_url,

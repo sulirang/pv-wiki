@@ -185,6 +185,7 @@ class RenderTests(unittest.TestCase):
         self.assertTrue(left.startswith(render.AUTO_BEGIN + "\n"))
         self.assertTrue(left.endswith(render.AUTO_END + "\n"))
         self.assertIn(r"PV\|42 &lt;module&gt;", left)
+        self.assertIn("| 产品 ID | 42 |", left)
         self.assertIn(r"Voltage\|input", left)
         self.assertNotIn("Hermes 自动维护", left)
         self.assertNotIn("SO003", left)

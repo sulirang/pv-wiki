@@ -562,13 +562,20 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             self.assertEqual([url], store.allowed_evidence_urls(token))
 
-    def test_extract_identity_must_match_inside_the_bounded_ai_text(self) -> None:
+    def test_extract_success_is_separate_from_identity_verification(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            store.upsert_product(
+                {
+                    **product(),
+                    "product_name": "DC-BAT cable 3000mm",
+                }
+            )
         token = self.claim()
-        url = "https://acme.example/wrong-variant.pdf"
+        url = "https://acme.example/dc-cable.pdf"
         self.prepare_search(token, url)
         request = self.write_json(
-            "extract-wrong.json",
-            {"urls": [url], "query": "PV-42 specifications"},
+            "extract-descriptive-name.json",
+            {"urls": [url], "query": "DC-BAT cable 3000mm specifications"},
         )
         client = mock.Mock()
         client.extract_urls.return_value = {
@@ -576,9 +583,8 @@ class CLITests(unittest.TestCase):
                 {
                     "url": url,
                     "raw_content": (
-                        "PV-420 wrong variant "
-                        + ("x" * 31_000)
-                        + " PV-42 related products"
+                        "LOW VOLTAGE DC CABLE 3000mm. "
+                        "Model: DC.CAB.2700.0300"
                     ),
                 }
             ],
@@ -595,12 +601,9 @@ class CLITests(unittest.TestCase):
             )
 
         self.assertEqual(0, code, error)
-        self.assertNotIn(
-            "PV-42 related products",
-            payload["extract"]["results"][0]["raw_content"],
-        )
+        self.assertFalse(payload["extract"]["results"][0]["identity_verified"])
         with state.StateStore(self.state_path) as store:
-            self.assertEqual([], store.allowed_evidence_urls(token))
+            self.assertEqual([url], store.allowed_evidence_urls(token))
 
     def test_extract_allows_series_datasheet_with_target_and_siblings(self) -> None:
         target = "SUN2000-8KTL-M1"
@@ -2299,6 +2302,15 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
             self.assertEqual("insufficient_identity", current.last_outcome)
+            extract_actions = [
+                item
+                for item in store.research_action_history(product_id="P-42")
+                if item.action == "extract"
+            ]
+            self.assertEqual(
+                [url],
+                extract_actions[0].result_summary["successful_urls"],
+            )
 
     def test_run_one_uses_ai_to_skip_matching_generic_hardware(self) -> None:
         item = {

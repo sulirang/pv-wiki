@@ -2609,7 +2609,7 @@ class StateStore:
         *,
         now: datetime | None = None,
     ) -> list[str]:
-        """Return only this active lease's successfully completed extract set."""
+        """Return this active lease's URLs with successfully extracted content."""
 
         timestamp = _utc(now)
         with self._connection() as connection:
