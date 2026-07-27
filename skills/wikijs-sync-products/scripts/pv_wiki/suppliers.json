@@ -107,7 +107,11 @@
       "kind": "manufacturer",
       "manufacturer": "JinkoSolar",
       "domains": [
-        {"host": "jinkosolar.com", "role": "global_product"}
+        {"host": "jinkosolar.com", "role": "global_product_downloads"},
+        {
+          "host": "jinkosolarcdn.shwebspace.com",
+          "role": "official_product_cdn"
+        }
       ]
     },
     "JUSHI": {

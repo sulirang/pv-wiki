@@ -63,6 +63,15 @@ class ConfigTests(unittest.TestCase):
                 frozenset({"jasolar.com"}),
                 trusted_source_domains_for_product("JA", "JA Solar"),
             )
+            self.assertEqual(
+                frozenset(
+                    {
+                        "jinkosolar.com",
+                        "jinkosolarcdn.shwebspace.com",
+                    }
+                ),
+                trusted_source_domains_for_product("JK", "JinkoSolar"),
+            )
             self.assertIn(
                 "scribd.com",
                 supplier_search_excluded_domains(),
