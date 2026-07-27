@@ -2622,8 +2622,21 @@ class CLITests(unittest.TestCase):
                 "classification_evidence_urls": [],
                 "classification_evidence_quotes": [],
                 "decision_notes": "No extract was admitted by the credit budget.",
-                "datasheets": [],
-                "sources": [],
+                "datasheets": [
+                    {
+                        "url": url,
+                        "title": "Contradictory primary datasheet",
+                        "source_type": "manufacturer",
+                        "is_primary": True,
+                    }
+                ],
+                "sources": [
+                    {
+                        "url": "https://community.example/pv-42",
+                        "title": "Community listing",
+                        "source_type": "community",
+                    }
+                ],
                 "facts": [],
                 "conflicts": [],
             }
@@ -2646,6 +2659,11 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, code, error)
         self.assertEqual("no_datasheet", payload["outcome"])
         search_client.extract_urls.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            attempt = store.attempt_history("P-42")[-1]
+            recorded = attempt.details["payload"]["decision"]
+            self.assertEqual([], recorded["datasheets"])
+            self.assertEqual([], recorded["sources"])
 
     def test_uncertain_prior_action_blocks_all_provider_replay(self) -> None:
         self.configure_worker_environment()

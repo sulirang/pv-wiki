@@ -121,7 +121,7 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
-VALIDATION_POLICY_VERSION = "2026-07-27.4"
+VALIDATION_POLICY_VERSION = "2026-07-27.5"
 AI_RESEARCH_PROMPT_VERSION = "2026-07-27.4"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
@@ -3267,12 +3267,31 @@ def run_one(
                     and proposed_manufacturer.strip()
                 ):
                     candidate_manufacturer = proposed_manufacturer.strip()[:300]
-                raw = {
-                    **proposal,
-                    "schema_version": "1",
-                    "product_id": lease.product_id,
-                    "lease_token": lease.token,
-                }
+                proposed_outcome = proposal.get("outcome")
+                if proposed_outcome in {
+                    "no_datasheet",
+                    "ambiguous",
+                    "insufficient_identity",
+                }:
+                    # These outcomes cannot publish anything. Build their
+                    # payload locally so contradictory model-authored primary
+                    # datasheets, community sources, or facts cannot turn a
+                    # safe negative conclusion into invalid_decision.
+                    raw = _nonpublish_decision(
+                        lease,
+                        proposed_outcome,
+                        (
+                            "AI returned a conservative non-publish decision; "
+                            "runtime discarded all publication fields."
+                        ),
+                    )
+                else:
+                    raw = {
+                        **proposal,
+                        "schema_version": "1",
+                        "product_id": lease.product_id,
+                        "lease_token": lease.token,
+                    }
                 (
                     evidence_text_by_url,
                     allowed_classification_urls,

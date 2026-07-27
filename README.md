@@ -209,7 +209,12 @@ machine-handled outcomes:
 they are silently audited and scheduled for an appropriate retry. They do not
 open issues. Notifications are reserved for failures that stop or materially
 impair a workflow batch, such as provider, configuration, database, or service
-outages. Five consecutive invalid decisions affecting distinct products inside
+outages. For the first three conservative outcomes, the runtime discards all
+model-authored publication fields and records a fixed empty non-publish
+decision, so a contradictory primary/source/fact field cannot escalate a safe
+negative conclusion into a publication attempt or provider failure.
+
+Five consecutive invalid decisions affecting distinct products inside
 30 minutes open one batch-level decision circuit before more paid research. A
 recent AI 401/402/403/404 or Exa 401/403/404 opens a six-hour provider circuit,
 either provider's 429 opens a one-hour rate-limit circuit, and exhausted Exa
