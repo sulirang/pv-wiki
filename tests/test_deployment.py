@@ -20,6 +20,7 @@ class ComposeTests(unittest.TestCase):
         )
         services = compose["services"]
         self.assertEqual({"n8n", "n8n-db", "pv-wiki-worker"}, set(services))
+        self.assertIs(services["pv-wiki-worker"]["init"], True)
         self.assertNotIn("ports", services["pv-wiki-worker"])
         self.assertEqual(
             ["127.0.0.1:${N8N_PORT:-5678}:5678"],
@@ -90,6 +91,7 @@ class ComposeTests(unittest.TestCase):
             set(existing["services"]),
         )
         self.assertTrue(existing["networks"]["existing_n8n"]["external"])
+        self.assertIs(existing["services"]["pv-wiki-worker"]["init"], True)
         self.assertNotIn("ports", existing["services"]["pv-wiki-worker"])
 
         systemd = yaml.safe_load(
@@ -99,6 +101,7 @@ class ComposeTests(unittest.TestCase):
             ["127.0.0.1:8080:8080"],
             systemd["services"]["pv-wiki-worker"]["ports"],
         )
+        self.assertIs(systemd["services"]["pv-wiki-worker"]["init"], True)
 
 
 class WorkflowTemplateTests(unittest.TestCase):

@@ -5,6 +5,7 @@ services:
     build:
       context: ../..
       dockerfile: Dockerfile
+    init: true
     restart: unless-stopped
     env_file:
       - worker.env

@@ -204,7 +204,9 @@ therefore have a 15-minute timeout. Homepage publication has its own lane and
 targets a different Wiki path. Keep exactly one `pv-wiki-worker` replica and
 route all steady-state mutations through its HTTP endpoints; the publication
 fence is intentionally process-local and does not support concurrent mutating
-CLI commands or horizontal worker scaling. The workflow makes at most 15 calls
+CLI commands or horizontal worker scaling. Docker init is enabled for the
+worker so stop/restart signals reach Python instead of requiring a forced kill.
+The workflow makes at most 15 calls
 and stops starting calls after 45 minutes; one already-running call is allowed
 to finish. A successful processed result loops back to `Run One Product`; any
 clean `processed=false` response, including `no_due_product`, global
