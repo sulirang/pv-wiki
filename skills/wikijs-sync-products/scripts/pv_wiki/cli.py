@@ -3521,6 +3521,24 @@ def run_one(
             if current is not None:
                 result["next_attempt_at"] = current.next_run_at
             return result
+        except AIInvalidOutputError as exc:
+            # The client has already exhausted its bounded repair/continuation
+            # attempts and _run_research_ai has audited the failed action. This
+            # is product-scoped model output, not a worker-wide outage: back
+            # the product off and allow n8n to continue the remaining batch.
+            _record_active_failure(store, lease, "ai_error", exc)
+            current = store.get_product(lease.product_id)
+            result = {
+                "ok": True,
+                "processed": True,
+                "published": False,
+                "product_id": lease.product_id,
+                "outcome": "ai_error",
+                "reason": f"ai_{exc.category.value}",
+            }
+            if current is not None:
+                result["next_attempt_at"] = current.next_run_at
+            return result
         except LeaseLostError as exc:
             _record_active_failure(store, lease, "error", exc)
             raise
