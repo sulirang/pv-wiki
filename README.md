@@ -38,24 +38,26 @@ default so other compatible providers retain their native behavior.
 
 ## Database boundaries
 
-There are three independent data roles:
+There are four independent data roles:
 
 - the existing product catalogue PostgreSQL database is queried with a
   read-only transaction;
 - n8n uses its own PostgreSQL database/user for workflows, encrypted
   credentials, and executions;
+- PV Wiki uses a dedicated PostgreSQL database/user for queue state, leases,
+  evidence URLs, and audit metadata;
 - Wiki.js owns and connects to its own application database.
 
 PV Wiki never creates tables in the product catalogue or the Wiki.js database.
 It writes Wiki.js content only through the restricted GraphQL API token. Its
-local SQLite file stores orchestration state, leases, evidence URLs, and audit
-metadata; it does not replace any of the three application databases.
+state database is separate from the catalogue, n8n, and Wiki.js databases.
 
 ## What it does
 
 - Reads the fixed `public.products` shape through an explicitly configured
   PostgreSQL transport and a read-only account.
-- Maintains durable and resumable leases in SQLite.
+- Maintains durable and resumable leases in its dedicated PostgreSQL state
+  database.
 - Runs one initial research pass and at most two AI-requested supplemental
   passes inside one `/run-one` call. Defaults cap the product at three AI
   actions, seven basic search queries, five unique extract URLs, and a
@@ -115,7 +117,8 @@ metadata; it does not replace any of the three application databases.
 - Builds a normal catalogue homepage with brand/category entry points, totals,
   per-brand counts, and recently updated products.
 - Creates new Wiki.js pages as private, unpublished drafts by default.
-- Records valid non-publish outcomes in SQLite and retries them automatically;
+- Records valid non-publish outcomes in PostgreSQL and retries them
+  automatically;
   it does not create a per-product AI issue or manual-review queue.
 - Selects eligible `due` and matured `backoff` products with an approximately
   4:1 weighted preference, falling back to the other class when one is empty.
@@ -150,7 +153,7 @@ AI output.
 The production bundle is in [`deploy/n8n`](deploy/n8n/README.md). It includes:
 
 - a dedicated n8n PostgreSQL service;
-- persistent n8n and PV Wiki volumes;
+- persistent n8n storage and a dedicated PV Wiki PostgreSQL state database;
 - an internal-only authenticated worker;
 - an optional Caddy HTTPS overlay;
 - two secret-free, inactive workflow templates:
@@ -286,7 +289,8 @@ The low-level `claim`, `search`, `extract`, and `publish` commands remain
 available for supervised diagnosis. n8n should call the fixed HTTP worker
 operations instead. A low-level publish decision requires the corresponding
 bounded extract JSON through `publish --evidence-file ...`; source bodies are
-used in memory for quote verification and are not added to the SQLite audit.
+used in memory for quote verification and are not added to the PostgreSQL
+audit.
 
 ## Safe rollout and migration
 

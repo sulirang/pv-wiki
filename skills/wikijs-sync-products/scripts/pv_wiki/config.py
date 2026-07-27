@@ -9,7 +9,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 class ConfigError(ValueError):
@@ -186,6 +186,37 @@ def state_path() -> Path:
     if not path.name:
         raise ConfigError("PV_WIKI_STATE_PATH must name a file")
     return path
+
+
+def state_target() -> str | Path:
+    """Return the configured PostgreSQL DSN or legacy SQLite path."""
+
+    database_url = os.getenv("PV_WIKI_STATE_DATABASE_URL", "").strip()
+    if not database_url:
+        return state_path()
+    parsed = urlsplit(database_url)
+    if (
+        parsed.scheme not in {"postgres", "postgresql"}
+        or not parsed.hostname
+        or not parsed.username
+        or not parsed.password
+        or not unquote(parsed.path).strip("/")
+    ):
+        raise ConfigError(
+            "PV_WIKI_STATE_DATABASE_URL must be a PostgreSQL URL with "
+            "host, database, username, and password"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError(
+            "PV_WIKI_STATE_DATABASE_URL has an invalid port"
+        ) from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError(
+            "PV_WIKI_STATE_DATABASE_URL has an invalid port"
+        )
+    return database_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,6 +612,7 @@ __all__ = [
     "public_brand_alias_map",
     "redact_environment_secrets",
     "state_path",
+    "state_target",
     "trusted_source_domain_map",
     "trusted_source_domains",
     "trusted_source_domains_for_product",

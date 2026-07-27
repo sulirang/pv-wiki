@@ -324,8 +324,8 @@ Run these checks in order:
    confirm the human text remains byte-for-byte intact.
 7. Run the homepage workflow and confirm brand/category indexes, total count,
    per-brand counts, and recent products.
-8. Inspect the n8n execution and SQLite audit. They must not contain API keys or
-   full extracted documents.
+8. Inspect the n8n execution and PostgreSQL audit. They must not contain API
+   keys or full extracted documents.
 9. Run `docker compose --env-file .env -f compose.yaml exec -T n8n n8n audit`
    (or the equivalent command for the discovered instance) and confirm
    Execute Command remains unavailable.
@@ -357,8 +357,8 @@ n8n release notes, change one pinned image/runtime revision at a time, import
 workflows inactive if they must be replaced, and repeat acceptance before
 reactivation.
 
-For repair, diagnose before changing. Preserve active leases and the SQLite
-state; do not “fix” a queue by deleting it.
+For repair, diagnose before changing. Preserve active leases and the
+PostgreSQL state; do not “fix” a queue by deleting it.
 
 For removal on a shared n8n, deactivate/export/remove only the PV Wiki
 workflows and revoke their worker credential. Do not stop shared services. For

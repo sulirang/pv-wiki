@@ -96,7 +96,8 @@ per-product issues; reserve notification for a systemic condition that
 prevents the batch from progressing.
 
 Extracted content is bounded before it reaches the model and the full body is
-never returned by the worker HTTP response or saved in SQLite audit details.
+never returned by the worker HTTP response or saved in PostgreSQL audit
+details.
 The audit stores source URLs, usage counters, selected model name, decision
 metadata (including each required supporting quote, capped at 500 characters),
 and the Wiki path.
@@ -199,11 +200,13 @@ tokens.
 
 ## State and retries
 
-The default local state is
-`~/.local/state/pv-wiki/state.sqlite3`; the container uses
-`/data/state.sqlite3` on the `pv_wiki_state` volume. Back it up. New/changed
-catalogue rows become due, claims have finite leases, and expired claims are
-audited.
+Production state uses the dedicated database configured by
+`PV_WIKI_STATE_DATABASE_URL`. The database account must be a non-superuser
+dedicated to PV Wiki, and the worker should reach it only over a private Docker
+network. Back it up with a consistent `pg_dump`. New/changed catalogue rows
+become due, claims have finite leases, and expired claims are audited. A local
+SQLite path remains a compatibility option for tests and legacy recovery, not
+the production deployment.
 
 Each attempt has a schema-v9 `research_actions` ledger. Before every Search,
 Extract, or AI action, the worker stores its round, action name, and request
@@ -281,12 +284,13 @@ Retry behavior:
 - source changed during a lease: immediately due again.
 
 Inspect queue/audit metadata with `pv-wiki status` and n8n execution history.
-Do not delete the state file to force a retry. Let the state-aware schedule run
-or correct the source record when catalogue data itself is wrong.
+Do not delete or truncate state tables to force a retry. Let the state-aware
+schedule run or correct the source record when catalogue data itself is wrong.
 
 Every valid non-publish result is a normal machine-handled outcome. The worker
-stores it in SQLite, returns a successful product-cycle response, and schedules
-the next attempt. It does not create an AI issue or a manual-review task.
+stores it in PostgreSQL, returns a successful product-cycle response, and
+schedules the next attempt. It does not create an AI issue or a manual-review
+task.
 
 ## Wiki.js visibility and homepage
 
@@ -299,10 +303,10 @@ The worker replaces only `PV-WIKI-AUTO`. It also recognizes one legacy
 unchanged. A detected edit conflict fails the current attempt instead of
 knowingly overwriting a newer human revision.
 
-Homepage refresh reads already successful publications from SQLite. It does no
-search-provider or catalogue work. A product remains in homepage counts after a later
-source change or temporary retry because the last successful Wiki page still
-exists.
+Homepage refresh reads already successful publications from PostgreSQL. It
+does no search-provider or catalogue work. A product remains in homepage counts
+after a later source change or temporary retry because the last successful Wiki
+page still exists.
 
 ## n8n monitoring
 
@@ -337,7 +341,7 @@ Back up:
 
 - n8n PostgreSQL data;
 - `/home/node/.n8n`, including the encryption key/local assets;
-- PV Wiki SQLite state;
+- PV Wiki PostgreSQL state;
 - current workflow exports;
 - the deployment manifest and pinned image/source revisions.
 

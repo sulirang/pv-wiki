@@ -23,6 +23,7 @@ from pv_wiki.config import (  # noqa: E402
     public_brand_alias,
     public_brand_alias_map,
     state_path,
+    state_target,
     trusted_source_domain_map,
     trusted_source_domains,
     trusted_source_domains_for_product,
@@ -45,6 +46,39 @@ class ConfigTests(unittest.TestCase):
                 )
             )
             self.assertFalse(allow_mirrors())
+
+    def test_state_target_prefers_valid_postgresql_url(self) -> None:
+        database_url = (
+            "postgresql://pv_wiki_app:p%40ss@state-db:5432/pv_wiki_state"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PV_WIKI_STATE_DATABASE_URL": database_url,
+                "PV_WIKI_STATE_PATH": "/ignored/state.sqlite3",
+            },
+            clear=True,
+        ):
+            self.assertEqual(database_url, state_target())
+
+    def test_state_target_rejects_incomplete_or_non_postgresql_urls(
+        self,
+    ) -> None:
+        invalid_urls = (
+            "sqlite:////tmp/state.sqlite3",
+            "postgresql://state-db/pv_wiki_state",
+            "postgresql://user:password@state-db/",
+            "postgresql://user:password@:5432/pv_wiki_state",
+            "postgresql://user:password@state-db:99999/pv_wiki_state",
+        )
+        for database_url in invalid_urls:
+            with self.subTest(database_url=database_url), mock.patch.dict(
+                os.environ,
+                {"PV_WIKI_STATE_DATABASE_URL": database_url},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    state_target()
 
     def test_wiki_settings_require_https_origin(self) -> None:
         values = {"WIKIJS_URL": "https://wiki.example.com", "WIKIJS_TOKEN": "secret"}

@@ -20,7 +20,7 @@ from .config import (
     ConfigError,
     is_placeholder_value,
     redact_environment_secrets,
-    state_path,
+    state_target,
 )
 from .exa import ExaConfigError
 from .state import StateStore
@@ -111,7 +111,7 @@ def _safe_error(error: BaseException) -> str:
 def health() -> dict[str, Any]:
     """Return local process/state health without probing paid dependencies."""
 
-    with StateStore(state_path()) as store:
+    with StateStore(state_target()) as store:
         schema_version = store.schema_version
     return {
         "ok": True,
@@ -153,7 +153,7 @@ def status() -> dict[str, Any]:
     from .state import next_month_start
 
     readiness_issues: list[dict[str, Any]] = []
-    with StateStore(state_path()) as store:
+    with StateStore(state_target()) as store:
         counts = store.status_counts()
         due_now = store.due_count()
         invalid_decisions = store.recent_distinct_outcome_streak(

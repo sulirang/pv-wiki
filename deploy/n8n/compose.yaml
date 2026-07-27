@@ -27,7 +27,6 @@ services:
     env_file:
       - worker.env
     volumes:
-      - pv_wiki_state:/data
       - type: bind
         source: ${CATALOGUE_CA_PATH:?set CATALOGUE_CA_PATH in .env}
         target: /run/pv-wiki/catalogue-ca.pem
@@ -48,6 +47,7 @@ services:
       start_period: 10s
     networks:
       - automation
+      - state_database
 
   n8n:
     image: ${N8N_IMAGE:?set N8N_IMAGE in .env}
@@ -106,8 +106,10 @@ networks:
   automation:
   database:
     internal: true
+  state_database:
+    external: true
+    name: ${PV_WIKI_STATE_NETWORK:?set PV_WIKI_STATE_NETWORK in .env}
 
 volumes:
   n8n_db_data:
   n8n_data:
-  pv_wiki_state:

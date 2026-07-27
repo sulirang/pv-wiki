@@ -47,7 +47,7 @@ from .config import (
     public_brand_alias,
     public_brand_alias_map,
     redact_environment_secrets,
-    state_path,
+    state_target,
     trusted_source_domain_map,
     trusted_source_domains_for_product,
 )
@@ -273,7 +273,7 @@ def _read_evidence_texts(path_value: str) -> dict[str, str]:
 
 
 def _store() -> StateStore:
-    return StateStore(state_path())
+    return StateStore(state_target())
 
 
 def _require_lease(store: StateStore, token: str) -> Lease:
@@ -670,7 +670,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     checks: dict[str, Any] = {
         "state": {
             "ok": True,
-            "path": str(Path(state.path)),
+            "backend": state.backend,
+            "location": state.location,
             "schema_version": state.schema_version,
         },
         "environment": {"ok": not missing, "missing": missing},
@@ -3453,7 +3454,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
     with _store() as store:
         result: dict[str, Any] = {
             "ok": True,
-            "state_path": str(Path(store.path)),
+            "state_backend": store.backend,
+            "state_location": store.location,
             "schema_version": store.schema_version,
             "counts": store.status_counts(),
             "outcomes": store.outcome_counts(),

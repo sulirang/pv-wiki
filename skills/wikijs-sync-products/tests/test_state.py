@@ -32,6 +32,21 @@ def product(product_id="P-1", *, name="Panel", updated_at=T0):
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_postgres_placeholder_translation_skips_literals_and_functions(
+        self,
+    ) -> None:
+        sql = (
+            "SELECT ?, '?', \"?\", $function$ ? $function$ "
+            "FROM attempts WHERE product_id = ?"
+        )
+        self.assertEqual(
+            (
+                "SELECT %s, '?', \"?\", $function$ ? $function$ "
+                "FROM attempts WHERE product_id = %s"
+            ),
+            state._postgres_placeholders(sql),
+        )
+
     def test_creates_missing_parent_for_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             existing = Path(directory) / "existing"

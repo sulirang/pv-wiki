@@ -46,9 +46,14 @@ class ComposeTests(unittest.TestCase):
             {"automation", "database"},
             set(services["n8n"]["networks"]),
         )
-        self.assertEqual(["automation"], services["pv-wiki-worker"]["networks"])
+        self.assertEqual(
+            {"automation", "state_database"},
+            set(services["pv-wiki-worker"]["networks"]),
+        )
         self.assertTrue(compose["networks"]["database"]["internal"])
+        self.assertTrue(compose["networks"]["state_database"]["external"])
         worker_mounts = services["pv-wiki-worker"]["volumes"]
+        self.assertNotIn("/data", json.dumps(worker_mounts))
         self.assertTrue(
             any(
                 isinstance(item, dict)
@@ -91,6 +96,7 @@ class ComposeTests(unittest.TestCase):
             set(existing["services"]),
         )
         self.assertTrue(existing["networks"]["existing_n8n"]["external"])
+        self.assertTrue(existing["networks"]["state_database"]["external"])
         self.assertIs(existing["services"]["pv-wiki-worker"]["init"], True)
         self.assertNotIn("ports", existing["services"]["pv-wiki-worker"])
 
@@ -102,6 +108,7 @@ class ComposeTests(unittest.TestCase):
             systemd["services"]["pv-wiki-worker"]["ports"],
         )
         self.assertIs(systemd["services"]["pv-wiki-worker"]["init"], True)
+        self.assertTrue(systemd["networks"]["state_database"]["external"])
 
 
 class WorkflowTemplateTests(unittest.TestCase):
@@ -290,6 +297,9 @@ class BackupDeploymentTests(unittest.TestCase):
             text=True,
         )
         body = script.read_text(encoding="utf-8")
+        self.assertIn("pg_dump", body)
+        self.assertIn("pg_restore --list", body)
+        self.assertIn("pv-wiki-state.pgdump", body)
         self.assertIn("source.backup(destination)", body)
         self.assertIn("PRAGMA quick_check", body)
         self.assertIn("n8n export:workflow --all", body)

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Consistent local recovery backup for the PV Wiki worker and its shared n8n
-# supervisor. Override these paths in /etc/default/pv-wiki-backup when the
-# deployment layout differs.
+# Consistent local recovery backup for the PV Wiki PostgreSQL state and its
+# shared n8n supervisor. Override these values in
+# /etc/default/pv-wiki-backup when the deployment layout differs.
 BACKUP_ROOT="${PV_WIKI_BACKUP_ROOT:-/var/backups/pv-wiki}"
-PV_WIKI_STATE_FILE="${PV_WIKI_STATE_FILE:-/var/lib/docker/volumes/pv-wiki-worker_pv_wiki_state/_data/state.sqlite3}"
+PV_WIKI_POSTGRES_CONTAINER="${PV_WIKI_POSTGRES_CONTAINER:-1Panel-postgresql-IicB}"
+PV_WIKI_POSTGRES_DATABASE="${PV_WIKI_POSTGRES_DATABASE:-pv_wiki_state}"
 N8N_DATA_DIR="${N8N_DATA_DIR:-/opt/ai-agents/n8n/data}"
 N8N_CONTAINER="${N8N_CONTAINER:-n8n}"
 
@@ -18,14 +19,18 @@ if [[ "${BACKUP_ROOT}" == "/" || "${BACKUP_ROOT}" == "/root" ]]; then
   echo "PV_WIKI_BACKUP_ROOT is too broad" >&2
   exit 2
 fi
-case "${PV_WIKI_STATE_FILE}" in
-  /*) ;;
-  *) echo "PV_WIKI_STATE_FILE must be an absolute path" >&2; exit 2 ;;
-esac
 case "${N8N_DATA_DIR}" in
   /*) ;;
   *) echo "N8N_DATA_DIR must be an absolute path" >&2; exit 2 ;;
 esac
+if [[ ! "${PV_WIKI_POSTGRES_CONTAINER}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+  echo "PV_WIKI_POSTGRES_CONTAINER is invalid" >&2
+  exit 2
+fi
+if [[ ! "${PV_WIKI_POSTGRES_DATABASE}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  echo "PV_WIKI_POSTGRES_DATABASE is invalid" >&2
+  exit 2
+fi
 
 install -d -m 0700 "${BACKUP_ROOT}"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -54,7 +59,16 @@ PY
   chmod 0600 "${destination_path}"
 }
 
-sqlite_backup "${PV_WIKI_STATE_FILE}" "${snapshot_dir}/pv-wiki-state.sqlite3"
+docker exec \
+  -e "PV_WIKI_DUMP_DATABASE=${PV_WIKI_POSTGRES_DATABASE}" \
+  "${PV_WIKI_POSTGRES_CONTAINER}" \
+  sh -lc \
+  'exec pg_dump -U "$POSTGRES_USER" -d "$PV_WIKI_DUMP_DATABASE" --format=custom --no-owner --no-acl' \
+  > "${snapshot_dir}/pv-wiki-state.pgdump"
+docker exec -i "${PV_WIKI_POSTGRES_CONTAINER}" \
+  pg_restore --list < "${snapshot_dir}/pv-wiki-state.pgdump" >/dev/null
+chmod 0600 "${snapshot_dir}/pv-wiki-state.pgdump"
+
 sqlite_backup "${N8N_DATA_DIR}/database.sqlite" "${snapshot_dir}/n8n-database.sqlite"
 install -m 0600 "${N8N_DATA_DIR}/config" "${snapshot_dir}/n8n-config"
 
@@ -78,7 +92,7 @@ chmod 0600 "${snapshot_dir}/n8n-workflows.json"
     n8n-config \
     n8n-database.sqlite \
     n8n-workflows.json \
-    pv-wiki-state.sqlite3 > SHA256SUMS
+    pv-wiki-state.pgdump > SHA256SUMS
 )
 chmod 0600 "${snapshot_dir}/SHA256SUMS"
 

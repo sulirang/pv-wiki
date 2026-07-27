@@ -4,11 +4,12 @@ This directory deploys two separate applications:
 
 - n8n, with its own PostgreSQL database and persistent `/home/node/.n8n`
   volume;
-- `pv-wiki-worker`, with its own persistent SQLite orchestration state.
+- `pv-wiki-worker`, with its own dedicated PostgreSQL orchestration database
+  and least-privileged login role.
 
 The product catalogue PostgreSQL account remains read-only. Wiki.js continues
-to own its own database. Neither n8n nor PV Wiki writes tables into either of
-those databases.
+to own its own database. PV Wiki's state tables are created only in its
+dedicated database.
 
 ## New dedicated n8n instance
 
@@ -19,8 +20,12 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    commit in the install manifest. Copy `.env.example` to `.env` and
    `worker.env.example` to `worker.env`.
    Set both files to mode `0600`.
-2. Generate separate random values for `N8N_DB_PASSWORD`,
-   `N8N_ENCRYPTION_KEY`, and `PV_WIKI_WORKER_TOKEN`. Do not reuse API keys.
+2. Create a dedicated PV Wiki PostgreSQL database and non-superuser login,
+   attach the worker to that server's private Docker network through
+   `PV_WIKI_STATE_NETWORK`, and put its URL only in
+   `PV_WIKI_STATE_DATABASE_URL`. Generate separate random values for that
+   role, `N8N_DB_PASSWORD`, `N8N_ENCRYPTION_KEY`, and
+   `PV_WIKI_WORKER_TOKEN`. Do not reuse API keys.
 3. Fill the Exa key plus the user-owned AI,
    Wiki.js, and read-only catalogue settings
    in `worker.env`. `AI_BASE_URL` is an OpenAI-compatible API base path such as
@@ -106,8 +111,8 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    run-one --worker-id manual-acceptance`. Keep the final Wiki.js path prefix
    private/unpublished and inspect the exact model match, citations,
    specifications, preserved human text, and worker audit. Use a separate state
-   volume if a truly separate staging prefix is required. Then manually run the
-   homepage workflow.
+   database if a truly separate staging prefix is required. Then manually run
+   the homepage workflow.
 9. Point `N8N_DOMAIN` DNS at the VPS. If an HTTPS reverse proxy already exists,
    remove the bootstrap overlay and proxy to `127.0.0.1:N8N_PORT` only after
    the owner account exists. Recreate n8n without the bootstrap environment:
@@ -312,17 +317,16 @@ Back up all three persistent stores:
 
 - `n8n_db_data` for workflows, credentials, and executions;
 - `n8n_data` for the n8n encryption material and local assets;
-- `pv_wiki_state` for product leases, evidence audit, and publication history.
+- the `pv_wiki_state` PostgreSQL database for product leases, evidence audit,
+  and publication history.
 
 The included `deploy/backup/pv-wiki-backup` defaults are intentionally specific
 to the current VPS layout: a shared n8n using
-`/opt/ai-agents/n8n/data/database.sqlite` plus the existing PV Wiki Docker
-volume. It is not a generic backup for this directory's dedicated Compose
-topology. A dedicated n8n deployment here uses PostgreSQL and must add a
-consistent `pg_dump` of `n8n-db` (plus `n8n_data`, worker SQLite, encryption
-configuration, and workflow exports), or replace/override the installed backup
-service with an equivalent deployment-specific command. Do not run the
-SQLite-only defaults and assume the dedicated n8n database was captured.
+`/opt/ai-agents/n8n/data/database.sqlite` plus a `pg_dump` of the dedicated PV
+Wiki state database. It is not a generic backup for this directory's dedicated
+Compose topology. A dedicated n8n deployment here must additionally capture
+`n8n-db` and `n8n_data`, or replace/override the installed backup service with
+an equivalent deployment-specific command.
 
 On a shared n8n, removal means deactivating/exporting/removing only the two PV
 Wiki workflows and revoking their Header Auth credential. Do not stop the

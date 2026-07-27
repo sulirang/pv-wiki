@@ -59,8 +59,8 @@ cannot select, union, or replace either operator mapping.
 
 ## Durable worker state
 
-The read-only PostgreSQL schema is unchanged. The worker separately owns a
-local SQLite schema (currently version 9):
+The read-only catalogue PostgreSQL schema is unchanged. The worker separately
+owns a dedicated PostgreSQL state schema (currently version 9):
 
 - `products` stores source hashes, due/backoff state, leases, the exact
   pre-lease queue snapshot needed for penalty-free system deferral, and the

@@ -10,7 +10,6 @@ services:
     env_file:
       - worker.env
     volumes:
-      - pv_wiki_state:/data
       - type: bind
         source: ${CATALOGUE_CA_PATH:?set CATALOGUE_CA_PATH in .env}
         target: /run/pv-wiki/catalogue-ca.pem
@@ -31,11 +30,12 @@ services:
       start_period: 10s
     networks:
       - existing_n8n
+      - state_database
 
 networks:
   existing_n8n:
     external: true
     name: ${N8N_EXTERNAL_NETWORK:?set N8N_EXTERNAL_NETWORK in .env}
-
-volumes:
-  pv_wiki_state:
+  state_database:
+    external: true
+    name: ${PV_WIKI_STATE_NETWORK:?set PV_WIKI_STATE_NETWORK in .env}

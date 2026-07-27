@@ -1,18 +1,19 @@
 # PV Wiki recovery backups
 
 `pv-wiki-backup` is tailored to the current VPS's existing shared n8n layout.
-It makes online SQLite backups of the worker and shared n8n databases,
-verifies them with `PRAGMA quick_check`, and stores the n8n encryption config
-plus a workflow export. Its defaults assume n8n SQLite at
-`/opt/ai-agents/n8n/data/database.sqlite` and the existing PV Wiki Docker
-volume. All output is mode `0600` below a mode `0700` snapshot directory.
+It makes a consistent custom-format `pg_dump` of the PV Wiki state database,
+an online SQLite backup of shared n8n, and stores the n8n encryption config
+plus a workflow export. The PostgreSQL archive is validated with
+`pg_restore --list`; SQLite is validated with `PRAGMA quick_check`. Defaults
+assume the 1Panel PostgreSQL container/database used by the current deployment
+and n8n SQLite at `/opt/ai-agents/n8n/data/database.sqlite`. All output is mode
+`0600` below a mode `0700` snapshot directory.
 
 This is not a generic backup for the dedicated Compose stack in
 `deploy/n8n/compose.yaml`, where n8n uses PostgreSQL. For that topology, replace
 or override the installed backup service so it also performs a consistent
-`pg_dump` of `n8n-db` and captures the dedicated `n8n_data` and
-`pv_wiki_state` volumes. Do not use this script unchanged and assume the n8n
-PostgreSQL database is protected.
+`pg_dump` of `n8n-db` and captures the dedicated `n8n_data` volume. Do not use
+this script unchanged and assume the n8n PostgreSQL database is protected.
 
 Install on the VPS:
 

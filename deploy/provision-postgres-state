@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Provision a dedicated PV Wiki database/login in an existing PostgreSQL
+# container and atomically write the URL to the worker's mode-0600 env file.
+# The generated password is never printed or passed as a process argument.
+
+POSTGRES_CONTAINER="${PV_WIKI_POSTGRES_CONTAINER:-1Panel-postgresql-IicB}"
+STATE_DATABASE="${PV_WIKI_POSTGRES_DATABASE:-pv_wiki_state}"
+STATE_ROLE="${PV_WIKI_POSTGRES_ROLE:-pv_wiki_app}"
+STATE_HOST="${PV_WIKI_POSTGRES_HOST:-1Panel-postgresql-IicB}"
+WORKER_ENV="${PV_WIKI_WORKER_ENV:-/opt/ai-agents/pv-wiki/worker.env}"
+
+for value in "${POSTGRES_CONTAINER}" "${STATE_HOST}"; do
+  if [[ ! "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    echo "PostgreSQL container/host name is invalid" >&2
+    exit 2
+  fi
+done
+for value in "${STATE_DATABASE}" "${STATE_ROLE}"; do
+  if [[ ! "${value}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "PostgreSQL database/role name is invalid" >&2
+    exit 2
+  fi
+done
+case "${WORKER_ENV}" in
+  /*) ;;
+  *) echo "PV_WIKI_WORKER_ENV must be an absolute path" >&2; exit 2 ;;
+esac
+if [[ ! -f "${WORKER_ENV}" ]]; then
+  echo "Worker environment file does not exist: ${WORKER_ENV}" >&2
+  exit 2
+fi
+if grep -q '^PV_WIKI_STATE_DATABASE_URL=' "${WORKER_ENV}"; then
+  echo "PV_WIKI_STATE_DATABASE_URL is already configured; refusing implicit credential rotation" >&2
+  exit 3
+fi
+
+password="$(openssl rand -hex 32)"
+role_exists="$(
+  docker exec \
+    -e "PV_WIKI_ROLE=${STATE_ROLE}" \
+    "${POSTGRES_CONTAINER}" \
+    sh -lc \
+    'psql -X -Atq -U "$POSTGRES_USER" -d "${POSTGRES_DB:-postgres}" -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_roles WHERE rolname = '\''$PV_WIKI_ROLE'\''"' \
+)"
+database_exists="$(
+  docker exec \
+    -e "PV_WIKI_DATABASE=${STATE_DATABASE}" \
+    "${POSTGRES_CONTAINER}" \
+    sh -lc \
+    'psql -X -Atq -U "$POSTGRES_USER" -d "${POSTGRES_DB:-postgres}" -v ON_ERROR_STOP=1 -c "SELECT 1 FROM pg_database WHERE datname = '\''$PV_WIKI_DATABASE'\''"' \
+)"
+
+if [[ "${role_exists}" == "1" ]]; then
+  printf \
+    "ALTER ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION CONNECTION LIMIT 10;\n" \
+    "${STATE_ROLE}" "${password}" |
+    docker exec -i "${POSTGRES_CONTAINER}" sh -lc \
+      'exec psql -X -U "$POSTGRES_USER" -d "${POSTGRES_DB:-postgres}" -v ON_ERROR_STOP=1' \
+      >/dev/null
+else
+  printf \
+    "CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION CONNECTION LIMIT 10;\n" \
+    "${STATE_ROLE}" "${password}" |
+    docker exec -i "${POSTGRES_CONTAINER}" sh -lc \
+      'exec psql -X -U "$POSTGRES_USER" -d "${POSTGRES_DB:-postgres}" -v ON_ERROR_STOP=1' \
+      >/dev/null
+fi
+
+if [[ "${database_exists}" != "1" ]]; then
+  docker exec \
+    -e "PV_WIKI_DATABASE=${STATE_DATABASE}" \
+    -e "PV_WIKI_ROLE=${STATE_ROLE}" \
+    "${POSTGRES_CONTAINER}" \
+    sh -lc \
+    'exec createdb -U "$POSTGRES_USER" -O "$PV_WIKI_ROLE" "$PV_WIKI_DATABASE"'
+fi
+printf \
+  "ALTER DATABASE %s OWNER TO %s;\nREVOKE ALL ON DATABASE %s FROM PUBLIC;\nGRANT CONNECT, TEMPORARY ON DATABASE %s TO %s;\n" \
+  "${STATE_DATABASE}" "${STATE_ROLE}" \
+  "${STATE_DATABASE}" \
+  "${STATE_DATABASE}" "${STATE_ROLE}" |
+  docker exec -i "${POSTGRES_CONTAINER}" sh -lc \
+    'exec psql -X -U "$POSTGRES_USER" -d "${POSTGRES_DB:-postgres}" -v ON_ERROR_STOP=1' \
+    >/dev/null
+
+worker_env_directory="$(dirname -- "${WORKER_ENV}")"
+temporary_env="$(mktemp "${worker_env_directory}/.worker.env.postgres-XXXXXXXX")"
+cleanup() {
+  rm -f -- "${temporary_env}"
+}
+trap cleanup EXIT
+awk \
+  '!/^PV_WIKI_STATE_DATABASE_URL=/ && !/^PV_WIKI_STATE_PATH=/' \
+  "${WORKER_ENV}" > "${temporary_env}"
+printf \
+  '\nPV_WIKI_STATE_DATABASE_URL=postgresql://%s:%s@%s:5432/%s\n' \
+  "${STATE_ROLE}" "${password}" "${STATE_HOST}" "${STATE_DATABASE}" \
+  >> "${temporary_env}"
+chmod 0600 "${temporary_env}"
+chown --reference="${WORKER_ENV}" "${temporary_env}"
+mv -- "${temporary_env}" "${WORKER_ENV}"
+trap - EXIT
+
+unset password
+echo "Provisioned PostgreSQL state database ${STATE_DATABASE} and role ${STATE_ROLE}; worker environment updated"
