@@ -36,7 +36,10 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    when a supported provider's default reasoning would consume the bounded
    output budget before returning JSON. When thinking is enabled on DeepSeek,
    optional `AI_REASONING_EFFORT=high` selects its shortest supported effort;
-   leave it empty for providers that do not document this extension.
+   leave it empty for providers that do not document this extension. For
+   DeepSeek thinking over full datasheet extracts, set
+   `AI_TIMEOUT_SECONDS=300`; this remains below the worker's bounded research
+   deadline and n8n's request timeout.
    Review the bundled versioned `suppliers.json` registry. Use
    `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` and
    `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for deployment-specific
@@ -204,8 +207,12 @@ unrelated hosts; inspect only the user-authorized VPS and supplied URL.
 `Sync Catalogue`, `Refresh Catalogue`, and `Refresh Homepage` have bounded
 retries because they are idempotent. `Run One Product` deliberately has no
 automatic retry: each new `/run-one` call may lease a different product, so an
-n8n retry would not retry the same item. Its 45-minute HTTP timeout covers the
-maximum supported research plus AI/Wiki tail. An overlapping `/run-one`
+n8n retry would not retry the same item. A provider wall-clock timeout is
+recorded against that product and returned as a normal `processed=true`,
+`published=false`, `reason=ai_timeout` response, allowing the loop to continue;
+other unhandled request failures still stop the workflow. Its 45-minute HTTP
+timeout covers the maximum supported research plus AI/Wiki tail. An
+overlapping `/run-one`
 returns the clean stop reason `worker_busy`; a failed request stops the current
 workflow execution and is handled once by the Error Workflow. Catalogue sync
 uses a separate serialized lane, so the monthly refresh

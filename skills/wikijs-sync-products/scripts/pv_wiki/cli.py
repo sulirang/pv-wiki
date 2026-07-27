@@ -27,10 +27,12 @@ from .ai import (
     AIOutputErrorCategory,
     AIResponseError,
     AISettings,
+    AITimeoutError,
     FinalAction,
     OpenAICompatibleClient,
     ResearchGap,
     SearchMoreAction,
+    TrustedSourcePolicy,
     ValidationFeedback,
 )
 from .config import (
@@ -122,7 +124,7 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
 VALIDATION_POLICY_VERSION = "2026-07-27.5"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-27.4"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-27.5"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
@@ -335,6 +337,25 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
         if search_domains:
             identity["_search_domains"] = sorted(search_domains)
     return identity
+
+
+def _trusted_source_policy_for_product(
+    product: Mapping[str, Any],
+) -> TrustedSourcePolicy | None:
+    """Return only public operator-owned supplier context for the AI prompt."""
+
+    brand = str(product.get("brand_code") or "").strip()
+    manufacturer = public_brand_alias(brand)
+    domains = trusted_source_domains_for_product(
+        brand,
+        manufacturer or None,
+    )
+    if not manufacturer or not domains:
+        return None
+    return TrustedSourcePolicy(
+        manufacturer=manufacturer,
+        domains=tuple(sorted(domains)),
+    )
 
 
 def _make_search_client(*, timeout: float) -> ExaClient:
@@ -1206,6 +1227,7 @@ def _research_scope_fingerprints(
             "action": "extract",
         }
     )
+    trusted_source_policy = _trusted_source_policy_for_product(product)
     ai_scope = digest(
         {
             "version": AI_RESEARCH_PROMPT_VERSION,
@@ -1220,6 +1242,14 @@ def _research_scope_fingerprints(
             "json_response_format": ai_settings.json_response_format,
             "thinking_mode": ai_settings.thinking_mode,
             "reasoning_effort": ai_settings.reasoning_effort,
+            "trusted_source_policy": (
+                {
+                    "manufacturer": trusted_source_policy.manufacturer,
+                    "domains": list(trusted_source_policy.domains),
+                }
+                if trusted_source_policy is not None
+                else None
+            ),
             "credential_fingerprint": hashlib.sha256(
                 ai_settings.api_key.encode("utf-8")
             ).hexdigest(),
@@ -1742,6 +1772,7 @@ def _run_research_ai(
     candidate_manufacturer: str | None,
     previous_queries: tuple[str, ...],
     validation_feedback: ValidationFeedback | None,
+    trusted_source_policy: TrustedSourcePolicy | None,
     final_only: bool,
 ) -> tuple[FinalAction | SearchMoreAction, int]:
     request = {
@@ -1755,6 +1786,14 @@ def _run_research_ai(
             else ""
         ),
         "final_only": final_only,
+        "trusted_source_policy": (
+            {
+                "manufacturer": trusted_source_policy.manufacturer,
+                "domains": list(trusted_source_policy.domains),
+            }
+            if trusted_source_policy is not None
+            else None
+        ),
     }
     fingerprint = _reserve_research_action(
         store,
@@ -1772,6 +1811,7 @@ def _run_research_ai(
             candidate_manufacturer=candidate_manufacturer,
             previous_queries=previous_queries,
             validation_feedback=validation_feedback,
+            trusted_source_policy=trusted_source_policy,
             final_only=final_only,
         )
         provider_requests = _provider_request_count(
@@ -2910,7 +2950,14 @@ def run_one(
             last_gap: str | None = None
             pending_queries: tuple[str, ...] | None = None
             validation_feedback: ValidationFeedback | None = None
-            candidate_manufacturer: str | None = None
+            trusted_source_policy = _trusted_source_policy_for_product(
+                lease.payload
+            )
+            candidate_manufacturer: str | None = (
+                trusted_source_policy.manufacturer
+                if trusted_source_policy is not None
+                else None
+            )
             search_budget_units = 0.0
 
             initial_search = _run_research_search(
@@ -3234,6 +3281,7 @@ def run_one(
                     candidate_manufacturer=candidate_manufacturer,
                     previous_queries=tuple(query_history),
                     validation_feedback=validation_feedback,
+                    trusted_source_policy=trusted_source_policy,
                     final_only=final_only,
                 )
                 ai_calls += 1
@@ -3456,6 +3504,23 @@ def run_one(
                 "resume_at": next_month_start().isoformat(),
             }
 
+        except AITimeoutError as exc:
+            # _run_research_ai already audits the uncertain provider action and
+            # closes the product attempt as ai_error. Retry the product later,
+            # but let n8n continue the remaining products in this batch.
+            _record_active_failure(store, lease, "ai_error", exc)
+            current = store.get_product(lease.product_id)
+            result: dict[str, Any] = {
+                "ok": True,
+                "processed": True,
+                "published": False,
+                "product_id": lease.product_id,
+                "outcome": "ai_error",
+                "reason": "ai_timeout",
+            }
+            if current is not None:
+                result["next_attempt_at"] = current.next_run_at
+            return result
         except LeaseLostError as exc:
             _record_active_failure(store, lease, "error", exc)
             raise

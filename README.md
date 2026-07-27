@@ -38,6 +38,15 @@ default so other compatible providers retain their native behavior. The
 optional `AI_REASONING_EFFORT=high|max` extension is also omitted by default;
 for DeepSeek, `high` is the shortest supported effort.
 
+For a product whose catalogue brand matches the operator-owned supplier
+registry, the AI prompt receives only the public manufacturer name and bounded
+official hostnames. This prevents redundant independent-source searches when
+an exact-model extract already comes from a configured manufacturer domain;
+the model still cannot authorize a hostname, and the local decision gate
+remains authoritative. A per-product AI wall-clock timeout is audited as
+`ai_error` and returned as a normal processed/non-publish result so n8n can
+continue the remaining products in that batch.
+
 ## Database boundaries
 
 There are four independent data roles:

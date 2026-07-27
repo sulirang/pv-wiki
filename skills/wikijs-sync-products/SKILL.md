@@ -191,7 +191,12 @@ model receives
 bounded public identity, search discovery hints without result URLs, and
 extracted evidence; it
 does not receive product database IDs, family codes, lease tokens, or
-credentials by default. An operator may explicitly enable
+credentials by default. When a catalogue brand matches the operator-owned
+supplier registry, the research prompt also receives only its public
+manufacturer alias and bounded official hostnames so a configured exact-model
+manufacturer extract does not trigger redundant independent corroboration.
+Local validation, never AI output, still authorizes the source. An operator may
+explicitly enable
 `PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS` only when alphanumeric product IDs and
 brand codes are safe public search hints. It discovers manufacturer and product
 type and may classify

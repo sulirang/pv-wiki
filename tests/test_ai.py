@@ -399,6 +399,65 @@ class PromptTests(unittest.TestCase):
         self.assertIn("research budget is exhausted", rules)
         self.assertIn("search_more is forbidden", rules)
 
+    def test_research_prompt_uses_bounded_registered_supplier_policy(
+        self,
+    ) -> None:
+        policy = ai.TrustedSourcePolicy(
+            manufacturer="Huawei",
+            domains=(
+                "support.huawei.com",
+                "solar.huawei.com",
+            ),
+        )
+        messages = ai.build_research_messages(
+            product={"model": "JUPITER-3000K-H1"},
+            trusted_source_policy=policy,
+        )
+
+        prompt = json.loads(messages[1]["content"])
+        self.assertEqual(
+            {
+                "manufacturer": "Huawei",
+                "trusted_domains": [
+                    "solar.huawei.com",
+                    "support.huawei.com",
+                ],
+                "independent_corroboration_required": False,
+            },
+            prompt["trusted_source_policy"],
+        )
+        source_policy = " ".join(prompt["source_policy"])
+        self.assertIn(
+            "independent-domain corroboration is not required",
+            source_policy,
+        )
+        self.assertIn(
+            "only the runtime decision gate can authorize",
+            source_policy,
+        )
+        action_rules = " ".join(prompt["action_contract"]["rules"])
+        self.assertIn(
+            "do not request independent_corroboration",
+            action_rules,
+        )
+
+    def test_registered_supplier_policy_rejects_unsafe_context(self) -> None:
+        with self.assertRaises(ValueError):
+            ai.TrustedSourcePolicy("", ("solar.huawei.com",))
+        with self.assertRaises(ValueError):
+            ai.TrustedSourcePolicy(
+                "Huawei",
+                ("https://solar.huawei.com/path",),
+            )
+        with self.assertRaises(TypeError):
+            ai.build_research_messages(
+                product={"model": "PV-42"},
+                trusted_source_policy={  # type: ignore[arg-type]
+                    "manufacturer": "Acme",
+                    "domains": ["acme.example"],
+                },
+            )
+
     def test_validation_feedback_rejects_unbounded_or_unsafe_text(self) -> None:
         fixed = ai.ValidationFeedback.for_gap(
             ai.ResearchGap.INDEPENDENT_CORROBORATION

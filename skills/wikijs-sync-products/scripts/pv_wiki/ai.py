@@ -132,6 +132,85 @@ class ValidationFeedback:
         return cls(gap=gap, note=_SAFE_VALIDATION_FEEDBACK_NOTES[gap])
 
 
+@dataclass(frozen=True, slots=True)
+class TrustedSourcePolicy:
+    """Bounded public supplier context copied from operator-owned config.
+
+    This context helps the model avoid redundant corroboration searches. It
+    never authorizes a source: the decision gate still resolves the catalogue
+    brand and validates every cited URL against the runtime registry.
+    """
+
+    manufacturer: str
+    domains: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.manufacturer, str)
+            or not self.manufacturer.strip()
+            or len(self.manufacturer.strip()) > 300
+            or any(ord(character) < 32 for character in self.manufacturer)
+        ):
+            raise ValueError(
+                "trusted source manufacturer must be a bounded public name"
+            )
+        manufacturer = " ".join(self.manufacturer.split())
+        if (
+            isinstance(self.domains, (str, bytes, bytearray))
+            or not isinstance(self.domains, Sequence)
+            or not 1 <= len(self.domains) <= 20
+        ):
+            raise ValueError(
+                "trusted source domains must contain 1-20 hostnames"
+            )
+        normalized_domains: set[str] = set()
+        for raw_domain in self.domains:
+            if not isinstance(raw_domain, str):
+                raise TypeError(
+                    "trusted source domains must contain only strings"
+                )
+            domain = raw_domain.strip().rstrip(".").casefold()
+            if (
+                not domain
+                or len(domain) > 253
+                or any(ord(character) < 32 for character in domain)
+                or any(
+                    marker in domain
+                    for marker in ("://", "/", "\\", "?", "#", "@", ":")
+                )
+            ):
+                raise ValueError(
+                    "trusted source domains must contain bounded hostnames"
+                )
+            try:
+                ascii_domain = domain.encode("idna").decode("ascii")
+            except UnicodeError as exc:
+                raise ValueError(
+                    "trusted source domains contain an invalid hostname"
+                ) from exc
+            labels = ascii_domain.split(".")
+            if len(labels) < 2 or any(
+                not label
+                or len(label) > 63
+                or re.fullmatch(
+                    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+                    label,
+                )
+                is None
+                for label in labels
+            ):
+                raise ValueError(
+                    "trusted source domains contain an invalid hostname"
+                )
+            normalized_domains.add(ascii_domain)
+        object.__setattr__(self, "manufacturer", manufacturer)
+        object.__setattr__(
+            self,
+            "domains",
+            tuple(sorted(normalized_domains)),
+        )
+
+
 class AIError(RuntimeError):
     """Base class for safe-to-log AI client failures."""
 
@@ -1351,6 +1430,7 @@ def build_research_messages(
     candidate_manufacturer: str | None = None,
     previous_queries: Sequence[str] = (),
     validation_feedback: ValidationFeedback | None = None,
+    trusted_source_policy: TrustedSourcePolicy | None = None,
     final_only: bool = False,
     max_evidence_chars: int = DEFAULT_MAX_EVIDENCE_CHARS,
 ) -> list[dict[str, str]]:
@@ -1364,6 +1444,13 @@ def build_research_messages(
         validation_feedback, ValidationFeedback
     ):
         raise TypeError("validation_feedback must be ValidationFeedback or None")
+    if trusted_source_policy is not None and not isinstance(
+        trusted_source_policy,
+        TrustedSourcePolicy,
+    ):
+        raise TypeError(
+            "trusted_source_policy must be TrustedSourcePolicy or None"
+        )
     bindings = _research_binding_terms(product, candidate_manufacturer)
     required_bindings = _required_research_binding_terms(
         product,
@@ -1393,6 +1480,21 @@ def build_research_messages(
             else None
         ),
     }
+    if trusted_source_policy is not None:
+        request["trusted_source_policy"] = {
+            "manufacturer": trusted_source_policy.manufacturer,
+            "trusted_domains": list(trusted_source_policy.domains),
+            "independent_corroboration_required": False,
+        }
+        request["source_policy"].append(
+            "trusted_source_policy is bounded operator-owned public context. "
+            "A successful HTTPS extract whose hostname equals or is a "
+            "subdomain of one listed trusted domain may be proposed as the "
+            "configured manufacturer primary source; independent-domain "
+            "corroboration is not required. The extract must still contain the "
+            "complete target model, and only the runtime decision gate can "
+            "authorize the source."
+        )
     request["action_contract"] = {
         "exact_top_level_shapes": {
             "final": {
@@ -1440,6 +1542,12 @@ def build_research_messages(
                 "Otherwise return search_more for exactly that gap, or return a "
                 "conservative final non-publish decision.",
             ]
+        )
+    if trusted_source_policy is not None:
+        request["action_contract"]["rules"].append(
+            "When a matching exact-model extract is covered by "
+            "trusted_source_policy, do not request independent_corroboration; "
+            "return final or identify a different genuine evidence gap."
         )
     return [
         {"role": "system", "content": _RESEARCH_SYSTEM_PROMPT},
@@ -2112,6 +2220,7 @@ class OpenAICompatibleClient:
         candidate_manufacturer: str | None = None,
         previous_queries: Sequence[str] = (),
         validation_feedback: ValidationFeedback | None = None,
+        trusted_source_policy: TrustedSourcePolicy | None = None,
         final_only: bool = False,
     ) -> ResearchAction:
         """Return one strictly validated ``final`` or ``search_more`` action.
@@ -2129,6 +2238,7 @@ class OpenAICompatibleClient:
             candidate_manufacturer=candidate_manufacturer,
             previous_queries=previous_queries,
             validation_feedback=validation_feedback,
+            trusted_source_policy=trusted_source_policy,
             final_only=final_only,
             max_evidence_chars=self.settings.max_evidence_chars,
         )
@@ -2223,6 +2333,7 @@ __all__ = [
     "ResearchAction",
     "ResearchGap",
     "SearchMoreAction",
+    "TrustedSourcePolicy",
     "ValidationFeedback",
     "build_decision_messages",
     "build_research_messages",

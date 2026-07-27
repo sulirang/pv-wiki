@@ -3450,6 +3450,68 @@ class CLITests(unittest.TestCase):
                 action.result_summary["error_category"],
             )
 
+    def test_run_one_ai_timeout_is_audited_without_stopping_batch(self) -> None:
+        self.configure_worker_environment()
+        url = "https://acme.example/pv-42.pdf"
+        search_client = mock.Mock()
+        search_client.credential_fingerprint = "a" * 64
+        search_client.search_product.return_value = {
+            "queries": ["PV-42 datasheet"],
+            "results": [{"url": url, "score": 0.9}],
+            "usage": {"credits": 3},
+        }
+        search_client.extract_urls.return_value = {
+            "results": [
+                {"url": url, "raw_content": "PV-42 specifications"}
+            ],
+            "failed_results": [],
+            "usage": {"credits": 1},
+        }
+        ai_client = mock.Mock()
+        ai_client.next_research_action.side_effect = ai.AITimeoutError(
+            "AI endpoint exceeded the configured wall-clock timeout"
+        )
+        with (
+            mock.patch.object(
+                cli,
+                "ExaClient",
+                return_value=search_client,
+            ),
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+                return_value=ai_client,
+            ),
+            mock.patch.object(cli, "WikiJSClient") as wiki_client,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["processed"])
+        self.assertFalse(payload["published"])
+        self.assertEqual("ai_error", payload["outcome"])
+        self.assertEqual("ai_timeout", payload["reason"])
+        self.assertIn("next_attempt_at", payload)
+        policy = ai_client.next_research_action.call_args.kwargs[
+            "trusted_source_policy"
+        ]
+        self.assertEqual("Acme", policy.manufacturer)
+        self.assertEqual(("acme.example",), policy.domains)
+        wiki_client.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("backoff", current.status)
+            self.assertEqual("ai_error", current.last_outcome)
+            action = store.research_action_history(
+                product_id="P-42",
+            )[-1]
+            self.assertEqual("ai", action.action)
+            self.assertEqual("uncertain", action.status)
+            self.assertEqual(
+                "AITimeoutError",
+                action.result_summary["error_type"],
+            )
+
     def test_run_one_source_change_during_ai_releases_stale_lease(self) -> None:
         self.configure_worker_environment()
         url = "https://acme.example/pv-42.pdf"

@@ -113,7 +113,7 @@ The operator owns the provider choice:
 AI_BASE_URL=https://provider.example/v1
 AI_API_KEY=...
 AI_MODEL=...
-AI_TIMEOUT_SECONDS=60
+AI_TIMEOUT_SECONDS=300  # recommended for DeepSeek thinking over full evidence
 AI_MAX_TOKENS=4096
 AI_THINKING_MODE=  # optional: enabled or disabled
 AI_REASONING_EFFORT=  # optional: high or max
@@ -133,6 +133,13 @@ the request includes `reasoning_effort`, with `high` being DeepSeek's shortest
 supported effort. Explicitly selecting `disabled` prevents a supported
 reasoning-by-default model from spending the bounded output allowance on
 reasoning before it returns the required JSON.
+
+For a registered catalogue supplier, the AI receives only the public
+manufacturer alias and configured official hostnames. A matching exact-model
+HTTPS extract from that registry does not require independent-domain
+corroboration, but runtime validation still owns the trust decision. An AI
+wall-clock timeout closes the current product as `ai_error` and returns a
+normal processed/non-publish response so the n8n batch continues.
 
 The model is an untrusted proposer. It receives only reader-facing product
 fields, bounded search-provider titles/snippets as discovery hints, and successful
