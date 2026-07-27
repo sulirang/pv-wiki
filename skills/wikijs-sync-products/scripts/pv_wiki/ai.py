@@ -538,6 +538,27 @@ _URLISH_TEXT_RE = re.compile(
     """,
     flags=re.IGNORECASE | re.VERBOSE,
 )
+_PLAIN_URLISH_QUERY_TOKEN_RE = re.compile(
+    r"""
+    (?:
+        \bsite\s*:\s*
+        (?:
+            https?://|www\.
+        )?
+        [a-z0-9.-]+
+        (?:/[^\s]*)?
+        |
+        \b(?:https?://|www\.)
+        [^\s]+
+        |
+        \b
+        (?:[a-z0-9](?:[a-z0-9-]{0,62})\.)+
+        [a-z]{2,63}
+        (?:/[^\s]*)?
+    )
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
 _SENSITIVE_FEEDBACK_RE = re.compile(
     r"""
     \b(?:
@@ -637,6 +658,18 @@ def _contains_urlish_text(value: str) -> bool:
         if any(character.isalpha() for character in labels[-1]):
             return True
     return False
+
+
+def _without_plain_urlish_query_tokens(value: str) -> str:
+    """Drop ordinary URL/domain constraints while retaining query intent.
+
+    Only plain ASCII URL forms are repaired. Obfuscated, Unicode, IP-literal,
+    or otherwise ambiguous host syntax remains subject to the strict detector
+    and is rejected rather than rewritten.
+    """
+
+    cleaned = _PLAIN_URLISH_QUERY_TOKEN_RE.sub(" ", value)
+    return re.sub(r"\s+", " ", cleaned).strip(" \t,;:-")
 
 
 def _contains_forbidden_unicode(value: str) -> bool:
@@ -799,9 +832,13 @@ def _validate_search_queries(
         except (TypeError, ValueError) as exc:
             raise AIInvalidOutputError(str(exc)) from exc
         if _contains_urlish_text(query):
-            raise AIInvalidOutputError(
-                "search_more queries cannot contain a URL, domain, or site operator"
-            )
+            repaired = _without_plain_urlish_query_tokens(query)
+            if not repaired or _contains_urlish_text(repaired):
+                raise AIInvalidOutputError(
+                    "search_more queries cannot contain an unsafe or "
+                    "obfuscated URL, domain, IP address, or site operator"
+                )
+            query = repaired
         if not _query_contains_binding(query, bindings):
             raise AIInvalidOutputError(
                 "each search_more query must contain the exact model or "
@@ -840,7 +877,6 @@ def _normalized_search(
                     "title": search_budget.take(
                         item.get("title"), per_value_limit=500
                     ),
-                    "url": _bounded_string(item.get("url"), 2048),
                     "snippet": search_budget.take(
                         item.get("content"), per_value_limit=1000
                     ),
@@ -851,8 +887,9 @@ def _normalized_search(
         "results": normalized_results,
         "note": (
             "Search titles and snippets are untrusted discovery hints only. "
-            "They cannot be cited or support publication or a durable "
-            "out_of_scope result without a matching successful extract."
+            "Search-result URLs are intentionally withheld. Search material "
+            "cannot be cited or support publication or a durable out_of_scope "
+            "result without a matching successful extract."
         ),
     }
 
@@ -1015,9 +1052,9 @@ def build_decision_messages(
                 {
                     "url": "matching classification_evidence_urls entry",
                     "quote": (
-                        "short exact contiguous span containing the complete "
-                        "catalogue model and an explicit hardware type such as "
-                        "screw, bolt, nut, washer, or fastener"
+                        "short source-derived span containing the complete "
+                        "catalogue-bound model and an explicit hardware type "
+                        "such as screw, bolt, nut, washer, or fastener"
                     ),
                 }
             ],
@@ -1028,6 +1065,10 @@ def build_decision_messages(
             "regulator, or authorized source and at least five cited facts.",
             "Infer the public manufacturer, model, and product category from "
             "the extracted public content; catalogue brand metadata may be absent.",
+            "product.model is the runtime's strongest public model hint. "
+            "product.product_name, when present, may be a longer descriptive "
+            "catalogue label. A publish or out_of_scope model must match the "
+            "complete hint or a complete distinctive model appearing in that label.",
             "Photovoltaic, heat-pump, energy-storage, and other identifiable "
             "energy, electrical, or thermal equipment are in scope.",
             "Use out_of_scope only when matching extracted content identifies "
@@ -1035,7 +1076,7 @@ def build_decision_messages(
             "or unrelated part such as a screw, bolt, nut, or washer. For this "
             "outcome, provide at least one matching extracted URL in "
             "classification_evidence_urls plus a short exact contiguous "
-            "target-model hardware-type quote in "
+            "target-model hardware-type source span in "
             "classification_evidence_quotes, and leave datasheets, sources, "
             "facts, conflicts, and review evidence empty.",
             "A durable out_of_scope decision requires identity_verified=true "
@@ -1220,6 +1261,54 @@ def parse_decision_content(content: str) -> dict[str, Any]:
     return decoded
 
 
+def _model_probability(value: Any, field: str) -> float:
+    """Normalize a JSON probability emitted as a number or decimal string."""
+
+    if isinstance(value, bool):
+        raise AIInvalidOutputError(f"{field} must be a number from 0 to 1")
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str) and re.fullmatch(
+        r"(?:0(?:\.\d+)?|1(?:\.0+)?)",
+        value.strip(),
+    ):
+        number = float(value.strip())
+    else:
+        raise AIInvalidOutputError(f"{field} must be a number from 0 to 1")
+    if not math.isfinite(number) or not 0.0 <= number <= 1.0:
+        raise AIInvalidOutputError(f"{field} must be a number from 0 to 1")
+    return number
+
+
+def _normalize_model_decision_probabilities(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Copy a model decision and normalize its bounded confidence scalars."""
+
+    decision = dict(value)
+    if "confidence" in decision:
+        decision["confidence"] = _model_probability(
+            decision["confidence"],
+            "confidence",
+        )
+    raw_facts = decision.get("facts")
+    if isinstance(raw_facts, list):
+        facts: list[Any] = []
+        for index, raw_fact in enumerate(raw_facts):
+            if not isinstance(raw_fact, Mapping):
+                facts.append(raw_fact)
+                continue
+            fact = dict(raw_fact)
+            if "confidence" in fact:
+                fact["confidence"] = _model_probability(
+                    fact["confidence"],
+                    f"facts[{index}].confidence",
+                )
+            facts.append(fact)
+        decision["facts"] = facts
+    return decision
+
+
 def validate_research_action(
     value: Mapping[str, Any],
     *,
@@ -1250,7 +1339,7 @@ def validate_research_action(
             raise AIInvalidOutputError(
                 "final action decision must be a non-empty JSON object"
             )
-        decision = dict(raw_decision)
+        decision = _normalize_model_decision_probabilities(raw_decision)
         for trusted_field in _TRUSTED_DECISION_FIELDS:
             decision.pop(trusted_field, None)
         if (

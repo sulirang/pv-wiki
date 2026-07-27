@@ -207,9 +207,10 @@ class PromptTests(unittest.TestCase):
         )
         search_result = prompt["retrieval"]["search"]["results"][0]
         self.assertEqual("Result", search_result["title"])
-        self.assertEqual(
+        self.assertNotIn("url", search_result)
+        self.assertNotIn(
             "https://search.example/pv-42",
-            search_result["url"],
+            messages[1]["content"],
         )
         self.assertEqual(1000, len(search_result["snippet"]))
         self.assertNotIn("failed_results", prompt["retrieval"]["extract"])
@@ -405,27 +406,38 @@ class ParsingTests(unittest.TestCase):
             action.queries,
         )
 
+    def test_plain_url_constraints_are_removed_from_search_queries(self) -> None:
+        for raw, expected in (
+            (
+                "PV-42 https://maker.example/data technical manual",
+                "PV-42 technical manual",
+            ),
+            (
+                "PV-42 maker.example technical manual",
+                "PV-42 technical manual",
+            ),
+            (
+                "PV-42 technical manual site:maker.example",
+                "PV-42 technical manual",
+            ),
+        ):
+            with self.subTest(raw=raw):
+                action = ai.validate_research_action(
+                    {
+                        "action": "search_more",
+                        "gap": "primary_datasheet",
+                        "queries": [raw],
+                    },
+                    product={"model": "PV-42"},
+                )
+                self.assertEqual((expected,), action.queries)
+
     def test_rejects_unsafe_unbound_or_non_novel_search_actions(self) -> None:
         invalid_actions = (
             {
                 "action": "search_more",
                 "gap": "not_a_gap",
                 "queries": ["PV-42 datasheet"],
-            },
-            {
-                "action": "search_more",
-                "gap": "primary_datasheet",
-                "queries": ["PV-42 https://maker.example/data"],
-            },
-            {
-                "action": "search_more",
-                "gap": "primary_datasheet",
-                "queries": ["PV-42 maker.example data"],
-            },
-            {
-                "action": "search_more",
-                "gap": "primary_datasheet",
-                "queries": ["PV-42 maker.example, data"],
             },
             {
                 "action": "search_more",
@@ -568,6 +580,42 @@ class ParsingTests(unittest.TestCase):
             validation_feedback=feedback,
         )
         self.assertEqual("ambiguous", conservative.decision["outcome"])
+
+    def test_final_normalizes_decimal_string_confidence(self) -> None:
+        action = ai.validate_research_action(
+            {
+                "action": "final",
+                "decision": {
+                    "outcome": "publish",
+                    "confidence": "0.95",
+                    "facts": [
+                        {
+                            "name": "Power",
+                            "confidence": "1.0",
+                        }
+                    ],
+                },
+            },
+            product={"model": "PV-42"},
+        )
+
+        self.assertEqual(0.95, action.decision["confidence"])
+        self.assertEqual(1.0, action.decision["facts"][0]["confidence"])
+
+        for invalid in ("95%", "nan", "1.1", True):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                ai.AIInvalidOutputError
+            ):
+                ai.validate_research_action(
+                    {
+                        "action": "final",
+                        "decision": {
+                            "outcome": "publish",
+                            "confidence": invalid,
+                        },
+                    },
+                    product={"model": "PV-42"},
+                )
 
 
 class OpenAICompatibleClientTests(unittest.TestCase):

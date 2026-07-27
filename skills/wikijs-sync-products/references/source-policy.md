@@ -2,14 +2,20 @@
 
 ## Entity match
 
-Compare the database name, optional brand hint, full manufacturer model,
-suffix, electrical/mechanical variant, region, and revision. Internal family
-codes are not public product categories and must not be used to infer product
-type. A shared family name or partial model is not enough. If two variants
-remain plausible, return `ambiguous`.
+The catalogue name may be either a public model or a longer description. The
+runtime selects the strongest public hint: a distinctive model-bearing name,
+or, only when the operator explicitly enables internal search hints, an
+eligible alphanumeric catalogue code when the name contains only generic
+specifications. A publish proposal must bind its complete manufacturer model
+to one of those catalogue identities, including suffix,
+electrical/mechanical variant, region, and revision. Internal family codes are
+not public product categories and must not be used to infer product type. A
+shared family name or partial model is not enough. If two variants remain
+plausible, return `ambiguous`.
 
-Bounded search titles/snippets are untrusted discovery hints. Successful
-extracts are used to discover the public manufacturer and product type. Keep
+Bounded search titles/snippets are untrusted discovery hints; their URLs are
+withheld from the model. Successful extracts are used to discover the public
+manufacturer and product type. Keep
 photovoltaic, heat-pump, energy-storage, and other identifiable energy,
 electrical, or thermal equipment in scope. Return `out_of_scope` only for a
 high-confidence, matching extract that positively identifies generic commodity
@@ -35,9 +41,10 @@ If the evidence is incomplete, the AI may request `search_more` only for
 `missing_exact_fact`, `conflict_resolution`, or `scope_classification`.
 Each request has one or two novel queries. When the catalogue has a model/name,
 every query must contain it exactly; only a record without such an identity may
-fall back to a meaningful current public-manufacturer candidate. Queries cannot
-contain a URL, domain, `site:` operator, trust grant, or publication
-instruction.
+fall back to a meaningful current public-manufacturer candidate. The runtime
+removes ordinary URL, domain, and `site:` constraints before search while
+retaining the bound query intent. Obfuscated or otherwise ambiguous URL/IP
+forms, trust grants, and publication instructions fail closed.
 Supplemental results remain subject to the same local URL, identity, source,
 quote, and publication gates as the initial pass.
 
@@ -94,7 +101,8 @@ identity.
 Every fact is a compact object with `name`, `value`, optional `unit`,
 optional datasheet section `category`, `confidence`, `evidence_urls`, and
 `evidence_quotes`. Keep `name` equal to the exact source field label. Each
-short quote must be an exact span from the cited bounded extract and contain
+short quote is grounded back to an actual contiguous span from the cited
+bounded extract and must contain
 the full target model, field label, and selected value, without a sibling
 model or revision in that span; translated labels belong in surrounding prose,
 not the verified fact name. Extract the complete target-specific row or cell
@@ -109,7 +117,9 @@ normalized for uniqueness, and conflict names use the same normalization.
 
 Put datasheet documents in `datasheets` and other evidence pages in `sources`.
 Every cited URL must have been successfully selected for provider Extract during
-the same lease. Verified facts below the configured fact confidence threshold
+the same lease. Unrelated successfully extracted candidates do not have to
+contain the target identity and cannot invalidate otherwise cited evidence.
+Verified facts below the configured fact confidence threshold
 or fields also listed in `conflicts` are rejected from automatic publication.
 
 `summary` is reader-facing prose, not an audit note. For `publish`, summarize

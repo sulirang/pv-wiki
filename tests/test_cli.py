@@ -1036,6 +1036,62 @@ class CLITests(unittest.TestCase):
         self.assertEqual(baseline["extract"], changed_retrieval["extract"])
         self.assertNotEqual(baseline["ai"], changed_retrieval["ai"])
 
+    def test_search_identity_uses_public_model_code_for_descriptive_name(
+        self,
+    ) -> None:
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
+        foxess = {
+            **product(),
+            "brand_code": "",
+            "product_id": "H3-8.0-E",
+            "product_name": (
+                "8000W Three Phase, Dual MPPT hybrid inverter"
+            ),
+        }
+        self.assertEqual(
+            {
+                "model": "H3-8.0-E",
+                "product_name": (
+                    "8000W Three Phase, Dual MPPT hybrid inverter"
+                ),
+            },
+            cli._search_identity(foxess),
+        )
+        self.assertEqual(
+            {
+                "model": "SUN2000-50KTL-M3 INVERTER",
+            },
+            cli._search_identity(
+                {
+                    **product(),
+                    "brand_code": "",
+                    "product_id": "01073873",
+                    "product_name": "SUN2000-50KTL-M3 INVERTER",
+                }
+            ),
+        )
+
+    def test_ai_output_circuit_is_scoped_to_prompt_contract(self) -> None:
+        self.configure_worker_environment()
+        settings = ai.AISettings.from_env()
+        provider = cli._ai_provider_fingerprint(settings)
+        output = cli._ai_output_fingerprint(settings)
+
+        self.assertNotEqual(provider, output)
+        with mock.patch.object(
+            cli,
+            "AI_RESEARCH_PROMPT_VERSION",
+            "next-contract",
+        ):
+            self.assertEqual(
+                provider,
+                cli._ai_provider_fingerprint(settings),
+            )
+            self.assertNotEqual(
+                output,
+                cli._ai_output_fingerprint(settings),
+            )
+
     def test_failure_status_distinguishes_definitive_from_partial_calls(self) -> None:
         search_client = mock.Mock()
         search_client.last_operation_completed_requests = 0

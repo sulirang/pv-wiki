@@ -11,6 +11,9 @@ sys.path.insert(0, str(SCRIPTS))
 from pv_wiki.decision import (  # noqa: E402
     DecisionError,
     SourceVerificationError,
+    model_matches_catalogue_identity,
+    preferred_catalogue_model,
+    text_contains_catalogue_identity,
     text_contains_competing_identity,
     text_contains_exact_identity,
     validate_decision as _validate_decision,
@@ -240,6 +243,47 @@ class DecisionTests(unittest.TestCase):
                 self.assertFalse(
                     text_contains_competing_identity("PV-42", body)
                 )
+
+    def test_catalogue_identity_distinguishes_model_codes_from_descriptions(
+        self,
+    ) -> None:
+        description = "8000W Three Phase, Dual MPPT hybrid inverter"
+        self.assertEqual(
+            "H3-8.0-E",
+            preferred_catalogue_model(
+                "H3-8.0-E",
+                description,
+                allow_product_id=True,
+            ),
+        )
+        self.assertTrue(
+            model_matches_catalogue_identity(
+                "H3-8.0-E",
+                product_id="H3-8.0-E",
+                product_name=description,
+            )
+        )
+        self.assertFalse(
+            model_matches_catalogue_identity(
+                "HYD 8KTL-3PH",
+                product_id="H3-8.0-E",
+                product_name=description,
+            )
+        )
+        self.assertTrue(
+            text_contains_catalogue_identity(
+                "H3-8.0-E",
+                description,
+                "FOXESS model H3-8.0-E hybrid inverter",
+            )
+        )
+        self.assertEqual(
+            "SUN2000-50KTL-M3 INVERTER",
+            preferred_catalogue_model(
+                "01073873",
+                "SUN2000-50KTL-M3 INVERTER",
+            ),
+        )
 
     def test_accepts_cited_official_publish(self) -> None:
         result = validate_decision(
@@ -580,12 +624,52 @@ class DecisionTests(unittest.TestCase):
 
         item = valid_decision()
         item["model"] = "PV-43"
-        with self.assertRaisesRegex(DecisionError, "catalogue product name"):
+        with self.assertRaisesRegex(DecisionError, "catalogue identity"):
             validate_decision(
                 item,
                 expected_product_id="P-42",
                 expected_lease_token="1234567890abcdef",
             )
+
+    def test_publish_uses_catalogue_bound_model_and_ignores_uncited_extracts(
+        self,
+    ) -> None:
+        model = "H3-8.0-E"
+        official_url = "https://foxess.example/H3-8.0-E.pdf"
+        unrelated_url = "https://market.example/unrelated"
+        item = valid_decision()
+        item["product_id"] = model
+        item["model"] = model
+        item["manufacturer"] = "FOXESS"
+        item["datasheets"][0]["url"] = official_url
+        item["datasheets"][0]["title"] = f"{model} datasheet"
+        rows = []
+        for fact in item["facts"]:
+            fact["evidence_urls"] = [official_url]
+            quote = (
+                f"{model} {fact['name']} {fact['value']} "
+                f"{fact.get('unit', '')}"
+            ).strip()
+            fact["evidence_quotes"] = [
+                {"url": official_url, "quote": quote}
+            ]
+            rows.append(quote)
+
+        result = _validate_decision(
+            item,
+            expected_product_id=model,
+            expected_lease_token="1234567890abcdef",
+            expected_product_name=(
+                "8000W Three Phase, Dual MPPT hybrid inverter"
+            ),
+            trusted_source_domains={"foxess.example"},
+            evidence_text_by_url={
+                official_url: "\n".join(rows),
+                unrelated_url: "A different product with no matching model.",
+            },
+        )
+
+        self.assertEqual("publish", result["outcome"])
 
     def test_matching_manufacturer_domain_is_verified_without_an_override(self) -> None:
         item = valid_decision()
@@ -1154,6 +1238,52 @@ class DecisionTests(unittest.TestCase):
                     "https://acme.example/PV-42.pdf": body
                 },
             )
+
+    def test_out_of_scope_ellipsis_quote_is_grounded_to_source_text(self) -> None:
+        url = "https://catalog.example/flange-nut-m8"
+        body = (
+            "Product: flange nut M8. Galvanized steel construction. "
+            "Type: metric fastener."
+        )
+        item = valid_decision()
+        item.update(
+            {
+                "outcome": "out_of_scope",
+                "confidence": 0.95,
+                "manufacturer": "",
+                "model": "flange nut m8",
+                "product_category": "Fastener",
+                "summary": "A generic M8 flange nut.",
+                "classification_evidence_urls": [url],
+                "classification_evidence_quotes": [
+                    {
+                        "url": url,
+                        "quote": (
+                            "Product: flange nut M8 ... "
+                            "Type: metric fastener."
+                        ),
+                    }
+                ],
+                "datasheets": [],
+                "sources": [],
+                "facts": [],
+                "conflicts": [],
+            }
+        )
+
+        result = _validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            expected_product_name="flange nut m8",
+            allowed_classification_urls={url},
+            classification_text_by_url={url: body},
+        )
+
+        self.assertEqual(
+            body,
+            result["classification_evidence_quotes"][0]["quote"],
+        )
 
     def test_explicit_hardware_identity_can_mention_solar_mounting_use(
         self,

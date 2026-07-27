@@ -22,6 +22,7 @@ from . import __version__
 from .ai import (
     AIError,
     AIHTTPError,
+    AIInvalidOutputError,
     AISettings,
     FinalAction,
     OpenAICompatibleClient,
@@ -59,7 +60,8 @@ from .decision import (
     DecisionError,
     SourceVerificationError,
     canonical_product_category,
-    text_contains_exact_identity,
+    preferred_catalogue_model,
+    text_contains_catalogue_identity,
     validate_decision,
 )
 from .render import render_home_page, render_product_page, stable_path, stable_slug
@@ -110,8 +112,8 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
-VALIDATION_POLICY_VERSION = "2026-07-23.2"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-26.2"
+VALIDATION_POLICY_VERSION = "2026-07-27.1"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-27.1"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
@@ -244,12 +246,20 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
     """Map known catalogue columns to provider-neutral identity aliases."""
 
     public_name = str(product.get("product_name") or "").strip()
-    if not public_name:
+    include_internal_hints = include_internal_search_hints()
+    public_model = preferred_catalogue_model(
+        product.get("product_id"),
+        public_name,
+        allow_product_id=include_internal_hints,
+    )
+    if not public_model:
         raise CLIError(
-            "product_name is empty; record insufficient_identity without search"
+            "catalogue identity is empty; record insufficient_identity without search"
         )
-    identity: dict[str, Any] = {"model": public_name, "product_name": public_name}
-    if include_internal_search_hints():
+    identity: dict[str, Any] = {"model": public_model}
+    if public_name and public_name != public_model:
+        identity["product_name"] = public_name
+    if include_internal_hints:
         brand = str(product.get("brand_code") or "").strip()
         if brand:
             identity["manufacturer"] = brand
@@ -504,13 +514,20 @@ def _validation_research_gap(error: DecisionError) -> str | None:
         or "exact supporting extract span" in message
     ):
         return "missing_exact_fact"
-    if "model does not exactly match" in message:
+    if (
+        "model does not exactly match" in message
+        or "publish model is not bound" in message
+    ):
         return "conflict_resolution"
+    if "cited publish evidence" in message:
+        return "missing_exact_fact"
     if "generic hardware" in message:
         return "scope_classification"
     if "out_of_scope" in message and (
         "classification" in message or "identity" in message
     ):
+        return "scope_classification"
+    if "classification_evidence_quotes" in message:
         return "scope_classification"
     return None
 
@@ -885,7 +902,6 @@ def _run_extract(
         client = _make_search_client(timeout=timeout)
         bundle = client.extract_urls(submitted, query)
         limit = max_extract_chars()
-        expected_identity = str(lease.payload.get("product_name") or "")
         for result in bundle.get("results", []):
             content = result.get("raw_content")
             if isinstance(content, str) and len(content) > limit:
@@ -898,7 +914,11 @@ def _run_extract(
             result["identity_verified"] = (
                 isinstance(content, str)
                 and bool(content.strip())
-                and text_contains_exact_identity(expected_identity, content)
+                and text_contains_catalogue_identity(
+                    lease.product_id,
+                    lease.payload.get("product_name"),
+                    content,
+                )
             )
         successful_urls = [
             item["url"]
@@ -1111,6 +1131,21 @@ def _ai_provider_fingerprint(settings: AISettings) -> str:
                 "credential_fingerprint": hashlib.sha256(
                     settings.api_key.encode("utf-8")
                 ).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _ai_output_fingerprint(settings: AISettings) -> str:
+    """Scope invalid model output to the active prompt/action contract."""
+
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "provider_fingerprint": _ai_provider_fingerprint(settings),
+                "prompt_version": AI_RESEARCH_PROMPT_VERSION,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -1338,7 +1373,6 @@ def _run_research_extract(
             raise ExaResponseError("Exa extract result must be an object")
         bundle = dict(raw_bundle)
         limit = max_extract_chars()
-        expected_identity = str(lease.payload.get("product_name") or "")
         successful_urls: list[str] = []
         successful_url_set: set[str] = set()
         results = bundle.get("results")
@@ -1368,8 +1402,9 @@ def _run_research_extract(
                 identity_verified = (
                     isinstance(content, str)
                     and bool(content.strip())
-                    and text_contains_exact_identity(
-                        expected_identity,
+                    and text_contains_catalogue_identity(
+                        lease.product_id,
+                        lease.payload.get("product_name"),
                         content,
                     )
                 )
@@ -1488,7 +1523,7 @@ def _run_research_ai(
     )
     try:
         action = client.next_research_action(
-            product=lease.payload,
+            product=_search_identity(lease.payload),
             search=search,
             extract=extract,
             candidate_manufacturer=candidate_manufacturer,
@@ -1538,7 +1573,11 @@ def _run_research_ai(
                 "last_research_provider_requests",
                 default=1,
             ),
-            "provider_fingerprint": _ai_provider_fingerprint(settings),
+            "provider_fingerprint": (
+                _ai_output_fingerprint(settings)
+                if isinstance(exc, AIInvalidOutputError)
+                else _ai_provider_fingerprint(settings)
+            ),
             "error_type": exc.__class__.__name__,
         }
         if isinstance(exc, AIHTTPError) and isinstance(
@@ -1876,7 +1915,10 @@ def _nonpublish_decision(
         "outcome": outcome,
         "confidence": 1.0,
         "manufacturer": "",
-        "model": str(lease.payload.get("product_name") or "").strip(),
+        "model": preferred_catalogue_model(
+            lease.product_id,
+            lease.payload.get("product_name"),
+        ),
         "product_category": "",
         "summary": "",
         "review_summary": "",
@@ -2197,7 +2239,12 @@ def run_one(
             product_name = " ".join(
                 str(lease.payload.get("product_name") or "").split()
             )
-            if not product_name:
+            product_model = preferred_catalogue_model(
+                lease.product_id,
+                product_name,
+                allow_product_id=include_internal_search_hints(),
+            )
+            if not product_model:
                 return _apply_decision(
                     store,
                     lease,
@@ -2207,6 +2254,13 @@ def run_one(
                         "The catalogue record has no public product name.",
                     ),
                 )
+            research_identity = " ".join(
+                dict.fromkeys(
+                    item
+                    for item in (product_model, product_name)
+                    if item
+                )
+            )
 
             recovered_publish = _recover_validated_publish(store, lease)
             if recovered_publish is not None:
@@ -2273,7 +2327,7 @@ def run_one(
                     raise AIError(message)
                 invalid_output_products = (
                     store.recent_ai_provider_error_products(
-                        ai_provider_fingerprint,
+                        _ai_output_fingerprint(ai_settings),
                         error_types=AI_INVALID_OUTPUT_CIRCUIT_ERROR_TYPES,
                         within=AI_INVALID_OUTPUT_CIRCUIT_WINDOW,
                     )
@@ -2394,7 +2448,7 @@ def run_one(
                     round_number=0,
                     scope_fingerprints=research_scope_fingerprints,
                     urls=initial_urls,
-                    query=_research_extract_query(product_name, None),
+                    query=_research_extract_query(research_identity, None),
                 )
                 extract = _merge_extract_bundles(extract, initial_extract)
                 search_budget_units += max(
@@ -2586,7 +2640,7 @@ def run_one(
                         scope_fingerprints=research_scope_fingerprints,
                         urls=supplemental_urls,
                         query=_research_extract_query(
-                            product_name,
+                            research_identity,
                             last_gap,
                         ),
                     )

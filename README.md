@@ -65,6 +65,8 @@ metadata; it does not replace any of the three application databases.
   [`docs/search-provider-benchmark-2026-07-26.md`](docs/search-provider-benchmark-2026-07-26.md).
 - Calls a user-selected OpenAI-compatible model with bounded public discovery
   hints and extracts so it can identify the manufacturer and product type.
+  Search-result URLs are withheld from the model; only successful Extract URLs
+  are visible as citation candidates.
   The model may return only a final proposal or one of six fixed evidence gaps
   with one or two locally validated, exact-model-bound supplemental queries.
 - Lets the model classify matching generic hardware such as screws, bolts,
@@ -82,15 +84,20 @@ metadata; it does not replace any of the three application databases.
   model. A second independent HTTPS extract must corroborate the identity, and
   every published fact must have exact quotes from both domains. A failed check
   becomes `source_unverified` and cannot publish.
-- Requires the complete catalogue product name in publication evidence as well
-  as an exact proposed-model match.
+- Separates a descriptive catalogue name from its public model identity. A
+  proposed model must be a complete distinctive model embedded in the name or
+  an eligible alphanumeric catalogue code when internal search hints are
+  explicitly enabled, and only cited extracts—not unrelated successful
+  candidates—must contain that bound model.
 - Allows multi-model series datasheets into analysis, while requiring every
   published fact to use a target-model-only span with no sibling/revision.
 - Keeps database IDs, family codes, lease tokens, and secrets out of the model
   prompt.
 - Validates exact source URLs, source trust, confidence, conflicts, public
-  category, five unique facts, and short exact model/label/value evidence spans
-  before a page can publish.
+  category, five unique facts, and source-grounded model/label/value evidence
+  spans before a page can publish. Ordinary URL/domain constraints accidentally
+  included in an AI supplemental query are discarded; obfuscated forms fail
+  closed.
 - Upserts only the `PV-WIKI-AUTO` section and preserves human-authored text.
 - Builds a normal catalogue homepage with brand/category entry points, totals,
   per-brand counts, and recently updated products.

@@ -189,6 +189,18 @@ _EXPLICIT_REVISION_SUFFIX_PATTERN = (
     r"(?![^\W_])"
     r")?"
 )
+_MODEL_FRAGMENT_RE = re.compile(
+    r"(?<!\w)[^\W_]+(?:[./_-][^\W_]+)*(?!\w)",
+    flags=re.UNICODE,
+)
+_MEASUREMENT_FRAGMENT_RE = re.compile(
+    r"\d+(?:[.,]\d+)?(?:"
+    r"w|kw|mw|v|kv|a|ma|ah|wh|kwh|va|kva|"
+    r"mm|cm|m|g|kg|hz|khz|mhz"
+    r")",
+    flags=re.IGNORECASE,
+)
+_ELLIPSIS_RE = re.compile(r"\s*(?:\.{3,}|…+)\s*")
 _PRODUCT_CATEGORY_ALIASES = {
     "heat pump": "热泵",
     "heat pumps": "热泵",
@@ -297,6 +309,183 @@ def text_contains_exact_identity(expected: str, body: str) -> bool:
         + r"(?![^\W_])(?![.\-_/][^\W_])"
     )
     return re.search(pattern, body_text, flags=re.UNICODE) is not None
+
+
+def _is_distinctive_model_identity(value: str) -> bool:
+    key = identity_key(value)
+    return (
+        len(key) >= 3
+        and any(character.isalpha() for character in key)
+        and any(character.isdecimal() for character in key)
+        and _MEASUREMENT_FRAGMENT_RE.fullmatch(key) is None
+    )
+
+
+def _distinctive_model_fragments(value: str) -> tuple[str, ...]:
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for match in _MODEL_FRAGMENT_RE.finditer(value):
+        fragment = match.group(0)
+        key = identity_key(fragment)
+        if (
+            key not in seen
+            and _is_distinctive_model_identity(fragment)
+        ):
+            seen.add(key)
+            fragments.append(fragment)
+    return tuple(fragments)
+
+
+def preferred_catalogue_model(
+    product_id: Any,
+    product_name: Any,
+    *,
+    allow_product_id: bool = False,
+) -> str:
+    """Choose a public model hint, promoting the stable key only by opt-in."""
+
+    name = " ".join(str(product_name or "").split())
+    stable_id = " ".join(str(product_id or "").split())
+    if not name:
+        return ""
+    if _distinctive_model_fragments(name):
+        return name
+    if allow_product_id and _is_distinctive_model_identity(stable_id):
+        return stable_id
+    return name
+
+
+def model_matches_catalogue_identity(
+    model: str,
+    *,
+    product_id: str,
+    product_name: str,
+) -> bool:
+    """Require a proposed public model to be anchored in catalogue identity."""
+
+    model_key = identity_key(model)
+    name_key = identity_key(product_name)
+    product_id_key = identity_key(product_id)
+    if not model_key:
+        return False
+    if name_key and model_key == name_key:
+        return True
+    if not _is_distinctive_model_identity(model):
+        return False
+    if (
+        product_id_key
+        and model_key == product_id_key
+        and _is_distinctive_model_identity(product_id)
+    ):
+        return True
+    fragments = _distinctive_model_fragments(product_name)
+    return (
+        bool(fragments)
+        and model_key in name_key
+        and all(identity_key(fragment) in model_key for fragment in fragments)
+    )
+
+
+def text_contains_catalogue_identity(
+    product_id: Any,
+    product_name: Any,
+    body: str,
+) -> bool:
+    """Recognize a catalogue-bound model in an extracted public document."""
+
+    if not isinstance(body, str) or not body.strip():
+        return False
+    name = " ".join(str(product_name or "").split())
+    stable_id = " ".join(str(product_id or "").split())
+    fragments = _distinctive_model_fragments(name)
+    return (
+        bool(name)
+        and text_contains_exact_identity(name, body)
+    ) or (
+        bool(fragments)
+        and all(text_contains_exact_identity(fragment, body) for fragment in fragments)
+    ) or (
+        _is_distinctive_model_identity(stable_id)
+        and text_contains_exact_identity(stable_id, body)
+    )
+
+
+def _flexible_whitespace_pattern(value: str) -> str:
+    return r"\s+".join(
+        re.escape(part)
+        for part in re.split(r"\s+", value.strip())
+        if part
+    )
+
+
+def _ground_extract_quote(
+    proposed: str,
+    body: str,
+    *,
+    maximum: int = 500,
+) -> str | None:
+    """Return an actual bounded source span for a model-proposed quote."""
+
+    if not proposed or not body:
+        return None
+    exact_index = body.find(proposed)
+    if exact_index >= 0:
+        return proposed
+
+    direct_pattern = _flexible_whitespace_pattern(proposed)
+    if direct_pattern:
+        direct = re.search(direct_pattern, body, flags=re.IGNORECASE)
+        if direct is not None:
+            span = body[direct.start():direct.end()].strip()
+            return span if 0 < len(span) <= maximum else None
+
+    normalized_body: list[str] = []
+    raw_offsets: list[tuple[int, int]] = []
+    for raw_index, character in enumerate(body):
+        normalized_character = unicodedata.normalize(
+            "NFKC",
+            character,
+        ).casefold()
+        for normalized in normalized_character:
+            if normalized.isalnum():
+                normalized_body.append(normalized)
+                raw_offsets.append((raw_index, raw_index + 1))
+    normalized_proposed = identity_key(proposed)
+    normalized_index = "".join(normalized_body).find(normalized_proposed)
+    if normalized_proposed and normalized_index >= 0:
+        raw_start = raw_offsets[normalized_index][0]
+        raw_end = raw_offsets[
+            normalized_index + len(normalized_proposed) - 1
+        ][1]
+        span = body[raw_start:raw_end].strip()
+        if 0 < len(span) <= maximum:
+            return span
+
+    anchors = [
+        anchor.strip()
+        for anchor in _ELLIPSIS_RE.split(proposed)
+        if len(identity_key(anchor)) >= 3
+    ]
+    if len(anchors) < 2:
+        return None
+    start: int | None = None
+    end = 0
+    for anchor in anchors:
+        pattern = _flexible_whitespace_pattern(anchor)
+        match = re.search(pattern, body[end:], flags=re.IGNORECASE)
+        if match is None:
+            return None
+        absolute_start = end + match.start()
+        absolute_end = end + match.end()
+        if start is None:
+            start = absolute_start
+        end = absolute_end
+        if start is not None and end - start > maximum:
+            return None
+    if start is None:
+        return None
+    span = body[start:end].strip()
+    return span if 0 < len(span) <= maximum else None
 
 
 def _mixed_model_token_pattern(token: str) -> str | None:
@@ -806,6 +995,29 @@ def validate_decision(
     if outcome not in OUTCOMES:
         raise DecisionError("outcome is invalid")
     confidence = _confidence(raw.get("confidence"), "confidence")
+    summary = _text(raw.get("summary"), "summary", limit=2000)
+    manufacturer = _text(raw.get("manufacturer"), "manufacturer", limit=300)
+    model = _text(raw.get("model"), "model", limit=300)
+    product_category = canonical_product_category(
+        _text(raw.get("product_category"), "product_category", limit=100)
+    )
+    catalogue_name = expected_product_name or ""
+    model_is_catalogue_bound = model_matches_catalogue_identity(
+        model,
+        product_id=expected_product_id,
+        product_name=catalogue_name,
+    )
+    if outcome == "publish" and not (
+        model_is_catalogue_bound
+    ):
+        raise DecisionError(
+            "publish model is not bound to the catalogue identity"
+        )
+    decision_identity = (
+        model
+        if model_is_catalogue_bound
+        else preferred_catalogue_model(expected_product_id, catalogue_name)
+    )
 
     trusted_domains = frozenset(
         domain.strip().rstrip(".").casefold()
@@ -963,27 +1175,24 @@ def validate_decision(
                 raise DecisionError(
                     "evidence_text_by_url values must be bounded non-empty strings"
                 )
-            if outcome == "publish" and not text_contains_exact_identity(
-                expected_product_name or "",
-                body,
-            ):
-                raise DecisionError(
-                    "publish evidence must contain the complete catalogue "
-                    "model identity"
-                )
             evidence_body_by_url[url] = body
             normalized_evidence_text[url] = identity_key(body)
 
-    summary = _text(raw.get("summary"), "summary", limit=2000)
-    manufacturer = _text(raw.get("manufacturer"), "manufacturer", limit=300)
-    model = _text(raw.get("model"), "model", limit=300)
-    product_category = canonical_product_category(
-        _text(raw.get("product_category"), "product_category", limit=100)
-    )
+    if outcome == "publish" and any(
+        url in evidence_body_by_url
+        and not text_contains_exact_identity(
+            model,
+            evidence_body_by_url[url],
+        )
+        for url in declared_urls
+    ):
+        raise DecisionError(
+            "cited publish evidence must contain the catalogue-bound model identity"
+        )
     auto_verified_urls = _auto_verified_manufacturer_urls(
         datasheets + sources,
         manufacturer=manufacturer,
-        expected_product_name=expected_product_name or "",
+        expected_product_name=model,
         evidence_body_by_url=evidence_body_by_url,
     )
 
@@ -1114,18 +1323,24 @@ def validate_decision(
                     f"facts[{index}].evidence_quotes URLs must also be "
                     "listed in evidence_urls"
                 )
-            if outcome == "publish" and not _quote_supports_fact(
-                quote,
-                name=name,
-                value=value,
-                unit=unit,
-                expected_product_name=expected_product_name or "",
-                normalized_body=normalized_evidence_text.get(quote_url, ""),
-            ):
-                raise DecisionError(
-                    f"facts[{index}].evidence_quotes[{quote_index}] is not "
-                    "an exact supporting extract span"
+            if outcome == "publish":
+                grounded_quote = _ground_extract_quote(
+                    quote,
+                    evidence_body_by_url.get(quote_url, ""),
                 )
+                if grounded_quote is None or not _quote_supports_fact(
+                    grounded_quote,
+                    name=name,
+                    value=value,
+                    unit=unit,
+                    expected_product_name=model,
+                    normalized_body=normalized_evidence_text.get(quote_url, ""),
+                ):
+                    raise DecisionError(
+                        f"facts[{index}].evidence_quotes[{quote_index}] is not "
+                        "an exact supporting extract span"
+                    )
+                quote = grounded_quote
             evidence_quotes.append({"url": quote_url, "quote": quote})
         fact = {
             "name": name,
@@ -1214,7 +1429,7 @@ def validate_decision(
         if not any(
             url in normalized_classification_text
             and text_contains_exact_identity(
-                expected_product_name or "",
+                decision_identity,
                 normalized_classification_text[url],
             )
             for url in classification_evidence_urls
@@ -1223,15 +1438,20 @@ def validate_decision(
                 "out_of_scope evidence must contain the complete catalogue identity"
             )
         for index, item in enumerate(classification_evidence_quotes):
-            if not _quote_supports_out_of_scope(
+            grounded_quote = _ground_extract_quote(
                 item["quote"],
-                expected_product_name=expected_product_name or "",
+                normalized_classification_text.get(item["url"], ""),
+            )
+            if not _quote_supports_out_of_scope(
+                grounded_quote or "",
+                expected_product_name=decision_identity,
                 body=normalized_classification_text.get(item["url"], ""),
             ):
                 raise DecisionError(
                     f"classification_evidence_quotes[{index}] is not a "
                     "contiguous target-model hardware-type quote from the extract"
                 )
+            item["quote"] = grounded_quote
 
     if outcome == "publish":
         if confidence < minimum_confidence:
@@ -1254,12 +1474,6 @@ def validate_decision(
                 "publish cannot classify the catalogue product as generic "
                 "hardware; return out_of_scope with exact classification "
                 "evidence"
-            )
-        expected_identity = identity_key(expected_product_name or "")
-        proposed_identity = identity_key(model)
-        if not expected_identity or proposed_identity != expected_identity:
-            raise DecisionError(
-                "publish model does not exactly match the catalogue product name"
             )
         if len(facts) < 5:
             raise DecisionError(
@@ -1383,7 +1597,10 @@ __all__ = [
     "SourceVerificationError",
     "canonical_product_category",
     "identity_key",
+    "model_matches_catalogue_identity",
+    "preferred_catalogue_model",
     "text_contains_competing_identity",
+    "text_contains_catalogue_identity",
     "text_contains_exact_identity",
     "validate_decision",
     "validate_public_url",

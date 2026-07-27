@@ -181,9 +181,13 @@ The supported AI protocol is OpenAI-compatible Chat Completions. The worker
 adds `/chat/completions` to `AI_BASE_URL`. HTTPS is mandatory by default.
 Loopback HTTP is accepted; another trusted private HTTP endpoint requires the
 operator to explicitly set `AI_ALLOW_INSECURE_HTTP=true`. The model receives
-bounded public identity, search discovery hints, and extracted evidence; it
+bounded public identity, search discovery hints without result URLs, and
+extracted evidence; it
 does not receive product database IDs, family codes, lease tokens, or
-credentials. It discovers manufacturer and product type and may classify
+credentials by default. An operator may explicitly enable
+`PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS` only when alphanumeric product IDs and
+brand codes are safe public search hints. It discovers manufacturer and product
+type and may classify
 matching generic hardware as out of scope. The local decision gate, not the model,
 controls Wiki.js writes. Within one `/run-one`, the model may request at most
 two supplemental passes using a fixed evidence-gap enum and locally validated
@@ -201,8 +205,10 @@ a product issue or manual-review task. The model cannot grant trust by itself.
 For certificate-verifying PostgreSQL
 modes, mount the catalogue public/private CA from `CATALOGUE_CA_PATH`
 read-only as documented in the deployment guide.
-Only bounded extracts containing the exact full model are eligible evidence;
-the document may also cover sibling models in the same series. Each
+Only cited bounded extracts containing the catalogue-bound full model are
+eligible evidence; unrelated extracted discovery candidates are ignored by
+the publication identity check. The document may also cover sibling models in
+the same series. Each
 specification must include a short exact target-model-only extract span
 containing the model, source field label, and value, with no sibling model or
 revision inside that span. Record ambiguous multi-model table rows as a normal
