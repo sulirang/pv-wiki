@@ -209,7 +209,7 @@ _SPECIFICATION_FRAGMENT_RE = re.compile(
     r"(?:[/_-]\d+(?:[.,]\d+)?"
     r"(?:w|kw|mw|v|kv|a|ma|ah|wh|kwh|va|kva|hz))+"
     r"|\d+(?:mppt|ph|phase|cells?)"
-    r"|r(?:32|290|410a|134a)"
+    r"|r(?:32|290|410a|134a)(?:[-_/][a-z0-9]+)?"
     r")",
     flags=re.IGNORECASE,
 )

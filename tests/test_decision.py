@@ -101,6 +101,17 @@ class DecisionTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            (
+                "AHB16VR3HP",
+                "Pompa di Calore 16 kW Monoblocco Inverter R32-M",
+            ),
+            catalogue_model_candidates(
+                "AHB16VR3HP",
+                "Pompa di Calore 16 kW Monoblocco Inverter R32-M",
+                allow_product_id=True,
+            ),
+        )
+        self.assertEqual(
             "R125-G2",
             preferred_catalogue_model(
                 "R125-G2",
