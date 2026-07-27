@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import sys
+import time
 import unittest
 import urllib.error
 from email.message import Message
@@ -61,6 +63,19 @@ def settings(**overrides: object) -> ai.AISettings:
     return ai.AISettings(**values)
 
 
+def blocking_provider_worker(
+    _send_connection: object,
+    _endpoint: str,
+    _data: bytes,
+    _headers: object,
+    _socket_timeout: float,
+    _max_response_bytes: int,
+) -> None:
+    """Test target that can only finish if the deadline process is not killed."""
+
+    time.sleep(30)
+
+
 class AISettingsTests(unittest.TestCase):
     def test_loads_ai_variables_and_llm_aliases_without_secret_repr(self) -> None:
         direct = ai.AISettings.from_env(
@@ -75,6 +90,7 @@ class AISettingsTests(unittest.TestCase):
                 "AI_MAX_TOKENS": "3072",
                 "AI_MAX_RESPONSE_BYTES": "8192",
                 "AI_MAX_EVIDENCE_CHARS": "9000",
+                "AI_JSON_RESPONSE_FORMAT": "true",
             }
         )
         self.assertEqual("https://primary.example/v1", direct.base_url)
@@ -82,6 +98,7 @@ class AISettingsTests(unittest.TestCase):
         self.assertEqual("primary-model", direct.model)
         self.assertEqual(75, direct.timeout)
         self.assertEqual(3072, direct.max_tokens)
+        self.assertTrue(direct.json_response_format)
         self.assertNotIn("primary-key", repr(direct))
 
         aliases = ai.AISettings.from_env(
@@ -92,6 +109,7 @@ class AISettingsTests(unittest.TestCase):
             }
         )
         self.assertEqual("alias-model", aliases.model)
+        self.assertFalse(aliases.json_response_format)
 
     def test_requires_https_except_for_loopback(self) -> None:
         for url in (
@@ -139,6 +157,18 @@ class AISettingsTests(unittest.TestCase):
             settings(api_key="replace-with-user-owned-ai-key")
         with self.assertRaisesRegex(ai.AIConfigError, "model name"):
             settings(model="replace-with-model-name")
+        with self.assertRaisesRegex(
+            ai.AIConfigError,
+            "AI_JSON_RESPONSE_FORMAT",
+        ):
+            ai.AISettings.from_env(
+                {
+                    "AI_BASE_URL": "https://llm.example/v1",
+                    "AI_API_KEY": "key",
+                    "AI_MODEL": "model",
+                    "AI_JSON_RESPONSE_FORMAT": "sometimes",
+                }
+            )
 
     def test_nonfinite_json_constants_are_rejected(self) -> None:
         for value in ("NaN", "Infinity", "-Infinity"):
@@ -224,7 +254,11 @@ class PromptTests(unittest.TestCase):
             " ".join(prompt["source_policy"]),
         )
         self.assertIn(
-            "dual evidence is required",
+            "second independent https non-community extract",
+            " ".join(prompt["source_policy"]).casefold(),
+        )
+        self.assertIn(
+            "do not each require a duplicate quote",
             " ".join(prompt["source_policy"]).casefold(),
         )
         evidence_chars = len(
@@ -246,6 +280,30 @@ class PromptTests(unittest.TestCase):
                 product={},
                 max_evidence_chars=999,
             )
+
+    def test_prompt_supports_structured_multimodel_table_quotes(self) -> None:
+        messages = ai.build_decision_messages(product={"model": "H1-3.7-E"})
+        prompt = json.loads(messages[1]["content"])
+        quote_contract = prompt["output_contract"]["fact_item"][
+            "evidence_quotes"
+        ]
+
+        self.assertEqual("array with 1-5 entries", quote_contract["type"])
+        legacy, structured = quote_contract["item_shapes_exactly_one_of"]
+        self.assertEqual({"url", "quote"}, set(legacy))
+        self.assertEqual(
+            {"url", "model_quote", "quote"},
+            set(structured),
+        )
+        self.assertIn("model header row", structured["model_quote"])
+        self.assertIn("target-column value", structured["quote"])
+
+        policy = " ".join(prompt["source_policy"])
+        self.assertIn("{url, model_quote, quote}", policy)
+        self.assertIn("Markdown-pipe or TSV", policy)
+        self.assertIn("same number of explicit pipe/tab cells", policy)
+        self.assertIn("same target column", policy)
+        self.assertIn("unambiguous same-column", policy)
 
     def test_research_prompt_has_bounded_actions_and_safe_validation_feedback(
         self,
@@ -298,6 +356,9 @@ class PromptTests(unittest.TestCase):
         )
         rules = " ".join(prompt["action_contract"]["rules"])
         self.assertIn("conservative final non-publish", rules)
+        self.assertIn("corrected final proposal", rules)
+        self.assertIn("only those existing extracted URLs", rules)
+        self.assertNotIn("Do not return final publish", rules)
         self.assertIn("cannot name or authorize a source or domain", rules)
 
     def test_validation_feedback_rejects_unbounded_or_unsafe_text(self) -> None:
@@ -432,6 +493,66 @@ class ParsingTests(unittest.TestCase):
                 )
                 self.assertEqual((expected,), action.queries)
 
+    def test_decimal_model_binding_is_opaque_during_url_detection(self) -> None:
+        for model in ("H3-8.0-E", "HS3-3.6K-S2-W"):
+            query = f"{model} official technical manual"
+            with self.subTest(model=model):
+                action = ai.validate_research_action(
+                    {
+                        "action": "search_more",
+                        "gap": "primary_datasheet",
+                        "queries": [query],
+                    },
+                    product={"model": model},
+                )
+                self.assertEqual((query,), action.queries)
+
+    def test_decimal_model_does_not_hide_other_urlish_query_text(self) -> None:
+        model = "H3-8.0-E"
+        repaired = ai.validate_research_action(
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": [f"{model} maker.example technical manual"],
+            },
+            product={"model": model},
+        )
+        self.assertEqual(
+            (f"{model} technical manual",),
+            repaired.queries,
+        )
+
+        for unsafe in (
+            f"{model} evil[.]example manual",
+            f"{model} 192.0.2.10 manual",
+            f"{model} https[:]//evil.example manual",
+            f"{model}.evil.example manual",
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(
+                ai.AIInvalidOutputError
+            ):
+                ai.validate_research_action(
+                    {
+                        "action": "search_more",
+                        "gap": "primary_datasheet",
+                        "queries": [unsafe],
+                    },
+                    product={"model": model},
+                )
+
+        for unsafe_binding in ("maker.example", "192.0.2.10"):
+            with self.subTest(
+                unsafe_binding=unsafe_binding
+            ), self.assertRaises(ai.AIInvalidOutputError):
+                ai.validate_research_action(
+                    {
+                        "action": "search_more",
+                        "gap": "primary_datasheet",
+                        "queries": [f"{unsafe_binding} manual"],
+                    },
+                    product={"model": unsafe_binding},
+                )
+
     def test_rejects_unsafe_unbound_or_non_novel_search_actions(self) -> None:
         invalid_actions = (
             {
@@ -552,10 +673,6 @@ class ParsingTests(unittest.TestCase):
         )
         invalid_actions = (
             {
-                "action": "final",
-                "decision": {"outcome": "publish"},
-            },
-            {
                 "action": "search_more",
                 "gap": "primary_datasheet",
                 "queries": ["PV-42 datasheet"],
@@ -570,6 +687,16 @@ class ParsingTests(unittest.TestCase):
                     product={"model": "PV-42"},
                     validation_feedback=feedback,
                 )
+
+        corrected_publish = ai.validate_research_action(
+            {
+                "action": "final",
+                "decision": {"outcome": "publish"},
+            },
+            product={"model": "PV-42"},
+            validation_feedback=feedback,
+        )
+        self.assertEqual("publish", corrected_publish.decision["outcome"])
 
         conservative = ai.validate_research_action(
             {
@@ -657,6 +784,146 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertEqual(2048, payload["max_tokens"])
         self.assertEqual(0, payload["temperature"])
         self.assertIs(payload["stream"], False)
+        self.assertNotIn("response_format", payload)
+
+    def test_json_response_format_and_bounded_provider_metadata(self) -> None:
+        calls: list[dict] = []
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": json.dumps(
+                                    {"outcome": "no_datasheet"}
+                                )
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 120,
+                        "completion_tokens": 15,
+                        "total_tokens": 135,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": 7,
+                        },
+                        "provider_note": "must-not-be-preserved",
+                    },
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(json_response_format=True),
+            opener=fake_open,
+        )
+        result = client.decide(product={"name": "PV-42"})
+
+        self.assertEqual({"outcome": "no_datasheet"}, result)
+        self.assertEqual(
+            {"type": "json_object"},
+            calls[0]["response_format"],
+        )
+        self.assertEqual("stop", client.last_finish_reason)
+        self.assertEqual(
+            {
+                "prompt_tokens": 120,
+                "completion_tokens": 15,
+                "total_tokens": 135,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 7,
+                },
+            },
+            client.last_usage,
+        )
+        self.assertEqual(1, len(client.last_response_metadata))
+        self.assertNotIn(
+            "must-not-be-preserved",
+            repr(client.last_response_metadata),
+        )
+
+    def test_nonfinal_finish_reason_repairs_before_content_is_accepted(
+        self,
+    ) -> None:
+        for finish_reason in (
+            "length",
+            "content_filter",
+            "tool_calls",
+            "provider_specific_stop",
+        ):
+            calls: list[dict] = []
+            responses = iter(
+                [
+                    FakeResponse(
+                        {
+                            "choices": [
+                                {
+                                    "finish_reason": finish_reason,
+                                    "message": {
+                                        "content": json.dumps(
+                                            {"outcome": "publish"}
+                                        )
+                                    },
+                                }
+                            ],
+                            "usage": {"total_tokens": 200},
+                        }
+                    ),
+                    FakeResponse(
+                        {
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "message": {
+                                        "content": json.dumps(
+                                            {"outcome": "no_datasheet"}
+                                        )
+                                    },
+                                }
+                            ],
+                            "usage": {"total_tokens": 20},
+                        }
+                    ),
+                ]
+            )
+
+            def fake_open(
+                request: object,
+                *,
+                timeout: float,
+            ) -> FakeResponse:
+                del timeout
+                calls.append(json.loads(request.data.decode("utf-8")))
+                return next(responses)
+
+            with self.subTest(finish_reason=finish_reason):
+                client = ai.OpenAICompatibleClient(
+                    settings(),
+                    opener=fake_open,
+                )
+                self.assertEqual(
+                    {"outcome": "no_datasheet"},
+                    client.decide(product={"name": "PV-42"}),
+                )
+                self.assertEqual(2, len(calls))
+                self.assertIn(
+                    "incomplete_response",
+                    calls[1]["messages"][-1]["content"],
+                )
+                self.assertEqual(
+                    [finish_reason, "stop"],
+                    [
+                        item.finish_reason
+                        for item in client.last_response_metadata
+                    ],
+                )
+                self.assertEqual(
+                    {"total_tokens": 200},
+                    client.last_response_metadata[0].usage,
+                )
 
     def test_retries_one_empty_model_output_with_a_bounded_repair_prompt(self) -> None:
         calls: list[dict] = []
@@ -692,6 +959,56 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertEqual(2, len(calls[0]["messages"]))
         self.assertEqual(3, len(calls[1]["messages"]))
         self.assertIn("Retry once", calls[1]["messages"][-1]["content"])
+        self.assertIn(
+            "empty_content",
+            calls[1]["messages"][-1]["content"],
+        )
+
+    def test_repair_prompt_uses_safe_category_without_echoing_output(self) -> None:
+        calls: list[dict] = []
+        responses = iter(
+            [
+                FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "sensitive-provider-output api-key"
+                                }
+                            }
+                        ]
+                    }
+                ),
+                FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {"outcome": "no_datasheet"}
+                                    )
+                                }
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return next(responses)
+
+        client = ai.OpenAICompatibleClient(settings(), opener=fake_open)
+        self.assertEqual(
+            {"outcome": "no_datasheet"},
+            client.decide(product={"name": "PV-42"}),
+        )
+        repair = calls[1]["messages"][-1]["content"]
+        self.assertIn("invalid_json", repair)
+        self.assertNotIn("sensitive-provider-output", repair)
+        self.assertNotIn("api-key", repair)
 
     def test_research_retries_one_structurally_invalid_action(self) -> None:
         calls: list[dict] = []
@@ -748,7 +1065,7 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
         self.assertEqual(2, client.last_research_provider_requests)
         self.assertIn(
-            "bounded action contract",
+            "action_contract",
             calls[1]["messages"][-1]["content"],
         )
 
@@ -783,23 +1100,14 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertEqual(2, calls)
         self.assertEqual(2, client.last_research_provider_requests)
 
-    def test_validation_feedback_repairs_a_repeated_publish_into_search_more(
+    def test_validation_feedback_allows_one_corrected_final_publish_proposal(
         self,
     ) -> None:
         calls = 0
-        responses = iter(
-            [
-                {
-                    "action": "final",
-                    "decision": {"outcome": "publish"},
-                },
-                {
-                    "action": "search_more",
-                    "gap": "independent_corroboration",
-                    "queries": ["PV-42 independent test report"],
-                },
-            ]
-        )
+        response = {
+            "action": "final",
+            "decision": {"outcome": "publish"},
+        }
 
         def fake_open(_request: object, *, timeout: float) -> FakeResponse:
             nonlocal calls
@@ -810,7 +1118,7 @@ class OpenAICompatibleClientTests(unittest.TestCase):
                     "choices": [
                         {
                             "message": {
-                                "content": json.dumps(next(responses))
+                                "content": json.dumps(response)
                             }
                         }
                     ]
@@ -825,12 +1133,9 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             ),
         )
 
-        self.assertIsInstance(action, ai.SearchMoreAction)
-        self.assertEqual(
-            ai.ResearchGap.INDEPENDENT_CORROBORATION,
-            action.gap,
-        )
-        self.assertEqual(2, calls)
+        self.assertIsInstance(action, ai.FinalAction)
+        self.assertEqual("publish", action.decision["outcome"])
+        self.assertEqual(1, calls)
 
     def test_redirects_are_disabled(self) -> None:
         self.assertTrue(
@@ -884,6 +1189,101 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertIn("401", message)
         self.assertNotIn("super-secret-key", message)
         self.assertNotIn("sensitive provider details", message)
+
+    def test_default_opener_has_a_killable_wall_clock_deadline(self) -> None:
+        before = {child.pid for child in multiprocessing.active_children()}
+        started_at = time.monotonic()
+        with self.assertRaises(ai.AITimeoutError) as raised:
+            ai._isolated_default_provider_request(
+                endpoint="https://llm.example/v1/chat/completions",
+                data=b"{}",
+                headers={"Authorization": "Bearer super-secret-key"},
+                timeout=0.05,
+                max_response_bytes=1024,
+                _context=multiprocessing.get_context("spawn"),
+                _worker=blocking_provider_worker,
+            )
+
+        elapsed = time.monotonic() - started_at
+        self.assertLess(elapsed, 1)
+        self.assertNotIn("super-secret-key", str(raised.exception))
+        after = {child.pid for child in multiprocessing.active_children()}
+        self.assertEqual(before, after)
+
+    def test_local_isolation_setup_failures_are_not_network_uncertainty(
+        self,
+    ) -> None:
+        request = {
+            "endpoint": "https://llm.example/v1/chat/completions",
+            "data": b"{}",
+            "headers": {"Authorization": "Bearer super-secret-key"},
+            "timeout": 1,
+            "max_response_bytes": 1024,
+        }
+
+        with (
+            mock.patch.object(
+                ai.multiprocessing,
+                "get_context",
+                side_effect=RuntimeError("spawn unavailable"),
+            ),
+            self.assertRaises(ai.AILocalExecutionError) as context_error,
+        ):
+            ai._isolated_default_provider_request(**request)
+        self.assertNotIsInstance(
+            context_error.exception,
+            ai.AINetworkError,
+        )
+
+        pipe_context = mock.Mock()
+        pipe_context.Pipe.side_effect = OSError("file descriptors exhausted")
+        with self.assertRaises(ai.AILocalExecutionError) as pipe_error:
+            ai._isolated_default_provider_request(
+                **request,
+                _context=pipe_context,
+            )
+        self.assertNotIsInstance(pipe_error.exception, ai.AINetworkError)
+
+        receive_connection = mock.Mock()
+        send_connection = mock.Mock()
+        process_context = mock.Mock()
+        process_context.Pipe.return_value = (
+            receive_connection,
+            send_connection,
+        )
+        process_context.Process.side_effect = RuntimeError(
+            "process construction failed"
+        )
+        with self.assertRaises(ai.AILocalExecutionError):
+            ai._isolated_default_provider_request(
+                **request,
+                _context=process_context,
+            )
+        receive_connection.close.assert_called_once_with()
+        send_connection.close.assert_called_once_with()
+
+        receive_connection = mock.Mock()
+        send_connection = mock.Mock()
+        process = mock.Mock()
+        process.start.side_effect = OSError("process start failed")
+        start_context = mock.Mock()
+        start_context.Pipe.return_value = (
+            receive_connection,
+            send_connection,
+        )
+        start_context.Process.return_value = process
+        with self.assertRaises(ai.AILocalExecutionError) as start_error:
+            ai._isolated_default_provider_request(
+                **request,
+                _context=start_context,
+            )
+        self.assertIsInstance(start_error.exception, ai.AIError)
+        self.assertNotIsInstance(start_error.exception, ai.AINetworkError)
+        self.assertNotIn("super-secret-key", str(start_error.exception))
+        receive_connection.close.assert_called_once_with()
+        send_connection.close.assert_called_once_with()
+        process.close.assert_called_once_with()
+        self.assertIn("AILocalExecutionError", ai.__all__)
 
     def test_response_body_is_hard_limited_without_content_length(self) -> None:
         class OversizedResponse:

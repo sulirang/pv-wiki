@@ -115,10 +115,28 @@
       "name": "Run One Product",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 60000,
       "position": [-220, 60]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d209f8b0-3f2d-49d9-91c7-8d67938dca4e",
+              "name": "batchStartedAt",
+              "value": "={{ $now.toMillis() }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6991c665-0997-469c-a8d6-56a11db18ec6",
+      "name": "Initialize Batch",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-360, 60],
+      "notes": "One workflow execution may call /run-one at most 15 times and stops starting new calls after 45 minutes."
     },
     {
       "parameters": {
@@ -132,7 +150,7 @@
           "conditions": [
             {
               "id": "62b0ed69-d64d-4fc0-a64a-28a556d55f85",
-              "leftValue": "={{ $json.processed }}",
+              "leftValue": "={{ $json.processed === true && $runIndex < 14 && ($now.toMillis() - $('Initialize Batch').first().json.batchStartedAt) < 2700000 }}",
               "operator": {
                 "type": "boolean",
                 "operation": "true",
@@ -148,7 +166,8 @@
       "name": "Continue While Processed",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [80, 60]
+      "position": [80, 60],
+      "notes": "A zero-based run index below 14 permits at most 15 /run-one calls. The elapsed-time check prevents a new call after 45 minutes."
     }
   ],
   "connections": {
@@ -159,15 +178,18 @@
       "main": [[{"node": "Sync Catalogue", "type": "main", "index": 0}]]
     },
     "Hourly Due Recovery": {
-      "main": [[{"node": "Run One Product", "type": "main", "index": 0}]]
+      "main": [[{"node": "Initialize Batch", "type": "main", "index": 0}]]
     },
     "Daily Catalogue Recovery": {
       "main": [[{"node": "Refresh Catalogue", "type": "main", "index": 0}]]
     },
     "Sync Catalogue": {
-      "main": [[{"node": "Run One Product", "type": "main", "index": 0}]]
+      "main": [[{"node": "Initialize Batch", "type": "main", "index": 0}]]
     },
     "Refresh Catalogue": {
+      "main": [[{"node": "Initialize Batch", "type": "main", "index": 0}]]
+    },
+    "Initialize Batch": {
       "main": [[{"node": "Run One Product", "type": "main", "index": 0}]]
     },
     "Run One Product": {

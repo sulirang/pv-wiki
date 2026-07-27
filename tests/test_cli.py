@@ -139,6 +139,38 @@ class CLITests(unittest.TestCase):
             store.begin_search(lease)
             store.finish_search(lease, [url], {"credits": 3})
 
+    def test_requeue_command_wakes_only_the_requested_cutover_outcome(
+        self,
+    ) -> None:
+        attempted_at = datetime.now(timezone.utc)
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("old-policy", now=attempted_at)
+            store.record_outcome(
+                lease,
+                "invalid_decision",
+                error="old policy",
+                now=attempted_at,
+            )
+
+        code, payload, error = self.run_cli(
+            "requeue",
+            "--outcome",
+            "invalid_decision",
+            "--reason",
+            "validation-policy-2026-07-27.2",
+            "--attempted-after",
+            (attempted_at - timedelta(seconds=1)).isoformat(),
+            "--attempted-before",
+            (attempted_at + timedelta(seconds=1)).isoformat(),
+        )
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(1, payload["requeued"])
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertEqual("invalid_decision", current.last_outcome)
+
     def configure_required_environment(self, *, sslmode: str) -> None:
         os.environ.update(
             {
@@ -156,12 +188,15 @@ class CLITests(unittest.TestCase):
                 "WIKIJS_TOKEN": "wiki-secret",
                 "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON":
                     '{"Acme":["acme.example"]}',
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON":
+                    '{"Acme":"Acme"}',
             }
         )
 
     def configure_worker_environment(self) -> None:
         os.environ.update(
             {
+                "EXA_API_KEY": "exa-secret",
                 "AI_BASE_URL": "https://ai.example.com/v1",
                 "AI_API_KEY": "ai-secret",
                 "AI_MODEL": "test-model",
@@ -171,6 +206,8 @@ class CLITests(unittest.TestCase):
                 "WIKIJS_PATH_PREFIX": "products",
                 "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON":
                     '{"Acme":["acme.example"]}',
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON":
+                    '{"Acme":"Acme"}',
             }
         )
 
@@ -225,6 +262,23 @@ class CLITests(unittest.TestCase):
         )
         reader.assert_not_called()
         exa_client.assert_not_called()
+
+    def test_doctor_rejects_global_budget_below_product_reservation(
+        self,
+    ) -> None:
+        self.configure_required_environment(sslmode="verify-full")
+        os.environ["PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT"] = "10"
+
+        code, payload, error = self.run_cli("doctor")
+
+        self.assertEqual(2, code, error)
+        self.assertFalse(
+            payload["checks"]["global_research_budget_config"]["ok"]
+        )
+        self.assertIn(
+            "at least PV_WIKI_RESEARCH_MAX_CREDITS",
+            payload["checks"]["global_research_budget_config"]["error"],
+        )
 
     def test_search_client_factory_always_uses_exa(self) -> None:
         sentinel = mock.Mock()
@@ -406,9 +460,56 @@ class CLITests(unittest.TestCase):
 
         identity = cli._search_identity(product())
 
-        self.assertEqual("Acme", identity["manufacturer"])
+        self.assertNotIn("manufacturer", identity)
         self.assertNotIn("category", identity)
         self.assertNotIn("family_code", identity)
+
+    def test_internal_brand_hint_requires_operator_trust_mapping(self) -> None:
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
+        os.environ["PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON"] = (
+            '{"Acme":["acme.example"]}'
+        )
+        os.environ["PV_WIKI_PUBLIC_BRAND_ALIASES_JSON"] = (
+            '{"Acme":"Acme Solar"}'
+        )
+
+        identity = cli._search_identity(product())
+
+        self.assertEqual("Acme Solar", identity["manufacturer"])
+
+    def test_internal_company_identifier_is_not_promoted_as_model(self) -> None:
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
+
+        with self.assertRaisesRegex(
+            cli.CLIError,
+            "catalogue identity is empty",
+        ):
+            cli._search_identity(
+                {
+                    **product(),
+                    "product_id": "SEARCH4SOLAR BV",
+                    "product_name": "46",
+                    "brand_code": "",
+                }
+            )
+
+    def test_company_suffix_id_falls_back_to_public_product_description(
+        self,
+    ) -> None:
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
+        public_name = "8000W Three Phase, Dual MPPT hybrid inverter"
+
+        identity = cli._search_identity(
+            {
+                **product(),
+                "product_id": "SEARCH4SOLAR-BV",
+                "product_name": public_name,
+                "brand_code": "",
+            }
+        )
+
+        self.assertEqual(public_name, identity["model"])
+        self.assertNotIn("SEARCH4SOLAR-BV", identity.values())
 
     def test_legacy_public_category_fact_is_normalized_for_homepage(self) -> None:
         category = cli._decision_product_category(
@@ -808,6 +909,9 @@ class CLITests(unittest.TestCase):
                 "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON": (
                     '{"Acme":["acme.example"]}'
                 ),
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON": (
+                    '{"Acme":"Acme"}'
+                ),
             }
         )
         client = mock.Mock()
@@ -908,6 +1012,9 @@ class CLITests(unittest.TestCase):
         os.environ["PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON"] = (
             '{"Acme":["acme.example"]}'
         )
+        os.environ["PV_WIKI_PUBLIC_BRAND_ALIASES_JSON"] = (
+            '{"Acme":"Acme"}'
+        )
 
         with mock.patch.object(cli, "WikiJSClient") as wiki_client:
             code, payload, error = self.run_cli(
@@ -928,6 +1035,9 @@ class CLITests(unittest.TestCase):
         path = self.write_json("invalid.json", decision(token))
         os.environ["PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON"] = (
             '{"Acme":["acme.example"]}'
+        )
+        os.environ["PV_WIKI_PUBLIC_BRAND_ALIASES_JSON"] = (
+            '{"Acme":"Acme"}'
         )
 
         code, payload, error = self.run_cli(
@@ -1091,6 +1201,30 @@ class CLITests(unittest.TestCase):
                 output,
                 cli._ai_output_fingerprint(settings),
             )
+        json_settings = ai.AISettings(
+            base_url=settings.base_url,
+            api_key=settings.api_key,
+            model=settings.model,
+            json_response_format=True,
+            timeout=settings.timeout,
+            max_tokens=settings.max_tokens,
+            max_response_bytes=settings.max_response_bytes,
+            max_evidence_chars=settings.max_evidence_chars,
+        )
+        self.assertEqual(
+            provider,
+            cli._ai_provider_fingerprint(json_settings),
+        )
+        self.assertNotEqual(
+            output,
+            cli._ai_output_fingerprint(json_settings),
+        )
+        self.assertNotEqual(
+            output,
+            cli._ai_output_fingerprint(
+                replace(settings, max_tokens=2048)
+            ),
+        )
 
     def test_failure_status_distinguishes_definitive_from_partial_calls(self) -> None:
         search_client = mock.Mock()
@@ -1139,6 +1273,63 @@ class CLITests(unittest.TestCase):
                 ),
                 ai_client,
             ),
+        )
+        self.assertEqual(
+            "failed",
+            cli._ai_failure_status(
+                ai.AIInvalidOutputError("bounded repair violated contract"),
+                ai_client,
+            ),
+        )
+        self.assertEqual(
+            "failed",
+            cli._ai_failure_status(
+                ai.AIResponseError("oversized provider response"),
+                ai_client,
+            ),
+        )
+        self.assertEqual(
+            "failed",
+            cli._ai_failure_status(
+                ai.AILocalExecutionError("spawn unavailable"),
+                ai_client,
+            ),
+        )
+
+    def test_ai_response_audit_keeps_only_numeric_token_metadata(self) -> None:
+        client = mock.Mock()
+        client.last_response_metadata = [
+            ai.AIResponseMetadata(
+                finish_reason="length",
+                usage={
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 4,
+                        "provider_note": "discard",
+                    },
+                },
+            ),
+            ai.AIResponseMetadata(
+                finish_reason="stop",
+                usage={
+                    "prompt_tokens": 110,
+                    "completion_tokens": 8,
+                    "provider_note": "discard",
+                },
+            ),
+        ]
+
+        self.assertEqual(
+            {
+                "finish_reasons": ["length", "stop"],
+                "usage_totals": {
+                    "prompt_tokens": 210,
+                    "completion_tokens": 18,
+                    "reasoning_tokens": 4,
+                },
+            },
+            cli._ai_response_audit(client),
         )
 
     def test_ai_provider_rejection_circuit_stops_before_exa(self) -> None:
@@ -1197,23 +1388,208 @@ class CLITests(unittest.TestCase):
         ):
             code, payload, error = self.run_cli("run-one")
 
-        self.assertEqual(2, code)
-        self.assertEqual({}, payload)
-        self.assertIn("AIError", error)
-        self.assertIn("HTTP 401", error)
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertEqual("ai_provider_circuit_open", payload["reason"])
+        self.assertEqual(401, payload["http_status"])
         exa_factory.assert_not_called()
         ai_factory.assert_not_called()
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-SECOND")
-            self.assertEqual("ai_error", current.last_outcome)
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
 
-    def test_ai_rate_limit_circuit_stops_cleanly_before_exa(self) -> None:
+    def test_global_daily_credit_stop_restores_lease_before_research(self) -> None:
+        self.configure_worker_environment()
+        os.environ["PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT"] = "20"
+        usage = {
+            "known_credits": 20.0,
+            "unknown_or_uncertain_actions": 1,
+        }
+        with (
+            mock.patch.object(
+                state.StateStore,
+                "research_usage_between",
+                return_value=usage,
+            ) as usage_reader,
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(cli, "OpenAICompatibleClient") as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertEqual(
+            "global_daily_research_budget_exhausted",
+            payload["reason"],
+        )
+        self.assertEqual(20, payload["credit_limit"])
+        self.assertEqual(1, payload["unknown_or_uncertain_actions"])
+        self.assertEqual(1, usage_reader.call_count)
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
+
+    def test_global_budget_fails_closed_for_uncertain_usage(self) -> None:
+        self.configure_worker_environment()
+        os.environ["PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT"] = "500"
+        usage = {
+            "known_credits": 1.0,
+            "unknown_or_uncertain_actions": 1,
+        }
+        with (
+            mock.patch.object(
+                state.StateStore,
+                "research_usage_between",
+                return_value=usage,
+            ),
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(cli, "OpenAICompatibleClient") as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertEqual(
+            "global_daily_research_usage_uncertain",
+            payload["reason"],
+        )
+        self.assertEqual(20, payload["reserved_credits"])
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
+
+    def test_global_budget_reserves_one_full_product_before_research(self) -> None:
+        self.configure_worker_environment()
+        os.environ["PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT"] = "500"
+        usage = {
+            "known_credits": 481.0,
+            "unknown_or_uncertain_actions": 0,
+        }
+        with (
+            mock.patch.object(
+                state.StateStore,
+                "research_usage_between",
+                return_value=usage,
+            ),
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(cli, "OpenAICompatibleClient") as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertEqual(
+            "global_daily_research_budget_reservation_blocked",
+            payload["reason"],
+        )
+        self.assertEqual(20, payload["reserved_credits"])
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
+
+    def test_invalid_global_budget_defers_without_product_failure(self) -> None:
+        self.configure_worker_environment()
+        os.environ["PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT"] = "invalid"
+
+        with (
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+            ) as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual({}, payload)
+        self.assertEqual(2, code)
+        self.assertIn("ConfigError", error)
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
+            self.assertEqual(
+                ["system_paused"],
+                [
+                    attempt.outcome
+                    for attempt in store.attempt_history("P-42")
+                ],
+            )
+
+    def test_global_budget_uses_latest_blocked_window_resume(self) -> None:
+        self.configure_worker_environment()
+        os.environ["PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT"] = "20"
+        os.environ["PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT"] = "20"
+        usage = {
+            "known_credits": 20.0,
+            "unknown_or_uncertain_actions": 0,
+        }
+        with (
+            mock.patch.object(
+                state.StateStore,
+                "research_usage_between",
+                return_value=usage,
+            ) as usage_reader,
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+            ) as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(["daily", "monthly"], payload["blocked_windows"])
+        resume_at = datetime.fromisoformat(payload["resume_at"])
+        self.assertEqual(1, resume_at.day)
+        self.assertEqual(2, usage_reader.call_count)
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+
+    def test_repeated_content_failures_are_quarantined_before_research(
+        self,
+    ) -> None:
         self.configure_worker_environment()
         with (
             mock.patch.object(
                 state.StateStore,
-                "recent_ai_provider_rejection",
-                side_effect=[None, 429],
+                "content_failure_streak",
+                return_value=cli.CONTENT_FAILURE_QUARANTINE_THRESHOLD,
+            ),
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(cli, "OpenAICompatibleClient") as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["processed"])
+        self.assertFalse(payload["published"])
+        self.assertEqual("content_quarantined", payload["outcome"])
+        self.assertEqual("content_failure_quarantine", payload["reason"])
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+
+    def test_ai_rate_limit_circuit_stops_cleanly_before_exa(self) -> None:
+        self.configure_worker_environment()
+        event = mock.Mock()
+        event.http_status = 429
+        event.expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)
+        with (
+            mock.patch.object(
+                state.StateStore,
+                "recent_ai_provider_rejection_event",
+                side_effect=[None, event],
             ),
             mock.patch.object(cli, "ExaClient") as exa_factory,
             mock.patch.object(
@@ -1236,7 +1612,7 @@ class CLITests(unittest.TestCase):
                 state.StateStore,
                 "recent_ai_provider_error_products",
                 return_value=3,
-            ),
+            ) as error_products,
             mock.patch.object(cli, "ExaClient") as exa_factory,
             mock.patch.object(
                 cli,
@@ -1245,12 +1621,196 @@ class CLITests(unittest.TestCase):
         ):
             code, payload, error = self.run_cli("run-one")
 
-        self.assertEqual(2, code)
-        self.assertEqual({}, payload)
-        self.assertIn("AIError", error)
-        self.assertIn("invalid output", error)
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertEqual(
+            "ai_invalid_output_circuit_open",
+            payload["reason"],
+        )
+        self.assertEqual(
+            cli.AI_INVALID_OUTPUT_CIRCUIT_CATEGORIES,
+            error_products.call_args.kwargs["categories"],
+        )
         exa_factory.assert_not_called()
         ai_factory.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
+
+    def test_empty_identity_finishes_without_ai_or_exa_configuration(
+        self,
+    ) -> None:
+        with state.StateStore(self.state_path) as store:
+            store.upsert_product({**product(), "product_name": ""})
+
+        with (
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+            ) as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["processed"])
+        self.assertEqual("insufficient_identity", payload["outcome"])
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+
+    def test_missing_exa_configuration_defers_without_product_failure(
+        self,
+    ) -> None:
+        self.configure_worker_environment()
+        os.environ.pop("EXA_API_KEY")
+
+        with mock.patch.object(
+            cli,
+            "OpenAICompatibleClient",
+        ) as ai_factory:
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual({}, payload)
+        self.assertEqual(2, code)
+        self.assertIn("ExaConfigError", error)
+        ai_factory.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
+            self.assertEqual(
+                ["system_paused"],
+                [
+                    attempt.outcome
+                    for attempt in store.attempt_history("P-42")
+                ],
+            )
+
+    def test_exa_provider_rejection_defers_next_product(self) -> None:
+        self.configure_worker_environment()
+        now = datetime.now(timezone.utc)
+        search_client = cli.ExaClient(api_key="exa-secret")
+        provider_fingerprint = cli._exa_provider_fingerprint(search_client)
+        with state.StateStore(self.state_path) as store:
+            first = store.lease_next("first-worker", now=now)
+            request_fingerprint = state.research_request_fingerprint(
+                "search",
+                {"queries": ["PV-42 datasheet"]},
+            )
+            store.begin_research_action(
+                first,
+                round_number=0,
+                action="search",
+                request_fingerprint=request_fingerprint,
+                now=now,
+            )
+            store.finish_research_action(
+                first,
+                round_number=0,
+                action="search",
+                request_fingerprint=request_fingerprint,
+                status="failed",
+                result_summary={
+                    "provider_fingerprint": provider_fingerprint,
+                    "error_type": "ExaHTTPError",
+                    "http_status": 401,
+                },
+                credits=0,
+                error="unauthorized",
+                now=now,
+            )
+            store.record_outcome(
+                first,
+                "search_error",
+                error="unauthorized",
+                now=now,
+            )
+            store.upsert_product(
+                {
+                    **product(),
+                    "product_id": "P-SECOND",
+                    "product_name": "PV-43",
+                },
+                now=now,
+            )
+
+        with (
+            mock.patch.object(
+                cli,
+                "ExaClient",
+                return_value=search_client,
+            ) as exa_factory,
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+            ) as ai_factory,
+        ):
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertEqual("exa_provider_circuit_open", payload["reason"])
+        self.assertEqual(401, payload["http_status"])
+        self.assertEqual(
+            now + cli.EXA_PROVIDER_CIRCUIT_WINDOW,
+            datetime.fromisoformat(payload["resume_at"]),
+        )
+        exa_factory.assert_called_once()
+        ai_factory.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-SECOND")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.last_outcome)
+
+    def test_wiki_recovery_runs_without_ai_or_exa_configuration(self) -> None:
+        self.configure_worker_environment()
+        now = datetime.now(timezone.utc)
+        with state.StateStore(self.state_path) as store:
+            first = store.lease_next("first-worker", now=now)
+            store.record_outcome(
+                first,
+                "wikijs_error",
+                payload={
+                    "decision": decision(first.token),
+                    "validation_policy_fingerprint": (
+                        cli._validation_policy_fingerprint()
+                    ),
+                },
+                error="response lost",
+                now=now,
+            )
+            self.assertEqual(
+                1,
+                store.requeue_products(
+                    {"wikijs_error"},
+                    reason="retry-wiki-only",
+                    now=now,
+                ),
+            )
+        for name in ("AI_BASE_URL", "AI_API_KEY", "AI_MODEL", "EXA_API_KEY"):
+            os.environ.pop(name, None)
+
+        with (
+            mock.patch.object(cli, "ExaClient") as exa_factory,
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+            ) as ai_factory,
+            mock.patch.object(cli, "WikiJSClient") as wiki_factory,
+        ):
+            wiki_factory.return_value.upsert_page.return_value = {
+                "action": "updated",
+                "page": {"id": 42},
+            }
+            code, payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["published"])
+        self.assertEqual("synced", payload["outcome"])
+        exa_factory.assert_not_called()
+        ai_factory.assert_not_called()
+        wiki_factory.return_value.upsert_page.assert_called_once()
 
     def test_wiki_failure_reuses_validated_decision_without_new_research(self) -> None:
         self.configure_worker_environment()
@@ -1349,10 +1909,11 @@ class CLITests(unittest.TestCase):
             mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
         ):
-            code, _, error = self.run_cli("run-one")
+            code, payload, error = self.run_cli("run-one")
 
-        self.assertEqual(2, code)
-        self.assertIn("decision circuit is open", error)
+        self.assertEqual(0, code, error)
+        self.assertFalse(payload["processed"])
+        self.assertEqual("ai_decision_circuit_open", payload["reason"])
         search_client.assert_not_called()
         ai_client.assert_not_called()
         wiki_client.assert_not_called()
@@ -1375,6 +1936,7 @@ class CLITests(unittest.TestCase):
         self.assertFalse(payload["processed"])
         self.assertFalse(payload["published"])
         self.assertEqual("search_quota_exhausted", payload["reason"])
+        self.assertEqual("product_and_provider", payload["pause_scope"])
         resume_at = datetime.fromisoformat(payload["resume_at"])
         self.assertEqual(1, resume_at.day)
         self.assertEqual((0, 0, 0), (resume_at.hour, resume_at.minute, resume_at.second))
@@ -1386,6 +1948,41 @@ class CLITests(unittest.TestCase):
             self.assertEqual("search_quota_exhausted", current.last_outcome)
             self.assertEqual(0, current.consecutive_failures)
             self.assertEqual(resume_at, current.next_run_at)
+            store.upsert_product(
+                {
+                    **product(),
+                    "product_id": "P-SECOND",
+                    "product_name": "PV-43",
+                }
+            )
+
+        with (
+            mock.patch.object(
+                cli,
+                "ExaClient",
+                return_value=search_client,
+            ),
+            mock.patch.object(
+                cli,
+                "OpenAICompatibleClient",
+            ) as second_ai_client,
+        ):
+            code, second_payload, error = self.run_cli("run-one")
+
+        self.assertEqual(0, code, error)
+        self.assertFalse(second_payload["processed"])
+        self.assertEqual(
+            "search_quota_exhausted",
+            second_payload["reason"],
+        )
+        self.assertEqual("system", second_payload["pause_scope"])
+        self.assertEqual(payload["resume_at"], second_payload["resume_at"])
+        search_client.search_product.assert_called_once()
+        second_ai_client.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            second = store.get_product("P-SECOND")
+            self.assertEqual("due", second.status)
+            self.assertIsNone(second.last_outcome)
 
     def test_partial_search_before_quota_is_audited_and_retryable(
         self,
@@ -1426,12 +2023,21 @@ class CLITests(unittest.TestCase):
                     "completed_provider_requests"
                 ],
             )
+            self.assertEqual(
+                "ExaQuotaExhaustedError",
+                actions[0].result_summary["error_type"],
+            )
+            self.assertEqual(
+                cli._exa_provider_fingerprint(search_client),
+                actions[0].result_summary["provider_fingerprint"],
+            )
 
     def test_run_one_missing_brand_uses_ai_manufacturer_and_publishes(self) -> None:
         with state.StateStore(self.state_path) as store:
             store.upsert_product({**product(), "brand_code": ""})
         self.configure_worker_environment()
         url = "https://acme.example/pv-42.pdf"
+        corroboration_url = "https://lab.example/pv-42-listing"
         search_client = mock.Mock()
         search_client.search_product.return_value = {
             "queries": ["PV-42 datasheet"],
@@ -1441,6 +2047,12 @@ class CLITests(unittest.TestCase):
                     "url": url,
                     "content": "official",
                     "score": 0.99,
+                },
+                {
+                    "title": "Independent equipment listing",
+                    "url": corroboration_url,
+                    "content": "independent",
+                    "score": 0.9,
                 }
             ],
             "usage": {"credits": 3},
@@ -1452,11 +2064,19 @@ class CLITests(unittest.TestCase):
                 {
                     "url": url,
                     "raw_content": (
+                        "Acme official product documentation\n"
                         "PV-42 Rated power 42 W\n"
                         "PV-42 Input voltage 48 V\n"
                         "PV-42 Efficiency 98.5%\n"
                         "PV-42 Ingress protection IP65\n"
                         "PV-42 Weight 12 kg"
+                    ),
+                },
+                {
+                    "url": corroboration_url,
+                    "raw_content": (
+                        "Independent equipment registry: Acme PV-42 "
+                        "solar inverter."
                     ),
                 }
             ],
@@ -1467,8 +2087,16 @@ class CLITests(unittest.TestCase):
             extract_client.extract_urls.return_value
         )
         ai_client = mock.Mock()
+        proposal = decision("forged-token")
+        proposal["sources"] = [
+            {
+                "url": corroboration_url,
+                "title": "Independent equipment listing",
+                "source_type": "regulatory",
+            }
+        ]
         ai_client.next_research_action.return_value = ai.FinalAction(
-            decision("forged-token")
+            proposal
         )
         wiki_client = mock.Mock()
         wiki_client.upsert_page.return_value = {
@@ -1506,13 +2134,13 @@ class CLITests(unittest.TestCase):
         ai_factory.assert_called_once()
         self.assertEqual("test-model", ai_factory.call_args.args[0].model)
         self.assertEqual(
-            [url],
-            [
+            {url, corroboration_url},
+            {
                 item["url"]
                 for item in ai_client.next_research_action.call_args.kwargs[
                     "extract"
                 ]["results"]
-            ],
+            },
         )
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
@@ -2179,6 +2807,7 @@ class CLITests(unittest.TestCase):
         blank = {**product(), "product_name": ""}
         with state.StateStore(self.state_path) as store:
             store.upsert_product(blank)
+        self.configure_worker_environment()
 
         with (
             mock.patch.object(cli, "ExaClient") as search_client,
@@ -2694,6 +3323,17 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
             self.assertEqual("ai_error", current.last_outcome)
+            action = store.research_action_history(
+                product_id="P-42",
+            )[-1]
+            self.assertEqual(
+                cli._ai_output_fingerprint(ai.AISettings.from_env()),
+                action.result_summary["provider_fingerprint"],
+            )
+            self.assertEqual(
+                ai.AIOutputErrorCategory.PROVIDER_ENVELOPE.value,
+                action.result_summary["error_category"],
+            )
 
     def test_run_one_source_change_during_ai_releases_stale_lease(self) -> None:
         self.configure_worker_environment()

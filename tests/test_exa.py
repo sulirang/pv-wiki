@@ -45,6 +45,21 @@ class ExaClientTests(unittest.TestCase):
             with self.assertRaisesRegex(exa.ExaConfigError, "EXA_API_KEY"):
                 exa.ExaClient(opener=mock.Mock())
 
+    def test_credential_fingerprint_includes_key_order(self) -> None:
+        first = exa.ExaClient(
+            api_key=["exa-first", "exa-second"],
+            opener=mock.Mock(),
+        )
+        reordered = exa.ExaClient(
+            api_key=["exa-second", "exa-first"],
+            opener=mock.Mock(),
+        )
+
+        self.assertNotEqual(
+            first.credential_fingerprint,
+            reordered.credential_fingerprint,
+        )
+
     def test_search_normalizes_rank_content_cost_and_budget_units(self) -> None:
         seen: list[tuple[object, dict]] = []
 

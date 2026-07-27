@@ -140,7 +140,9 @@ class ExaClient:
 
         self._keys = keys
         self.credential_fingerprint = hashlib.sha256(
-            "\0".join(sorted(set(keys))).encode("utf-8")
+            # Key order controls which credential receives the first request
+            # and therefore belongs to the provider/circuit scope.
+            "\0".join(keys).encode("utf-8")
         ).hexdigest()
         self._key_index = 0
         self._quota_exhausted_keys: set[str] = set()

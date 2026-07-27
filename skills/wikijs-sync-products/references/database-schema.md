@@ -43,24 +43,49 @@ separately.
 External search sends only `product_name` by default. Bounded search
 titles/snippets and successful extracts let AI discover the public manufacturer
 and product type. `family_code` always remains local and never becomes a range
-route, public category, search term, or AI input. `brand_code` is included only
-when the operator explicitly enables `PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS`.
-`product_id` is never a search-provider or AI input.
+route, public category, search term, or AI input. Raw `brand_code` is never
+sent; when internal hints are enabled, only its operator-configured public
+manufacturer value from `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` may be sent.
+`product_id` is eligible only under
+`PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS=true`, and then only when it is a short
+ASCII model-shaped value without whitespace or a company suffix. Purely
+numeric/company-like names and identifiers remain local.
+
+Source authority is configured separately:
+`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` maps an exact catalogue brand or its
+explicit public alias to narrow trusted hosts. A trusted-domain override
+requires the corresponding public alias, and AI-discovered manufacturer text
+cannot select, union, or replace either operator mapping.
 
 ## Durable worker state
 
 The read-only PostgreSQL schema is unchanged. The worker separately owns a
-local SQLite schema (currently version 7):
+local SQLite schema (currently version 9):
 
-- `products` stores source hashes, due/backoff state, leases, and the latest
-  outcome;
+- `products` stores source hashes, due/backoff state, leases, the exact
+  pre-lease queue snapshot needed for penalty-free system deferral, and the
+  latest product outcome;
 - `attempts` binds one immutable source snapshot to one finite lease and final
   audit result;
 - `research_actions` records every bounded Search, Extract, and AI action as
-  `started`, `completed`, `failed`, or `uncertain`.
+  `started`, `completed`, `failed`, or `uncertain`;
+- `requeue_events` is an append-only audit of explicit policy cutovers that
+  wake selected historical outcomes without rewriting attempts.
+
+When both classes are eligible, leasing gives `due` products an approximately
+4:1 weighted preference over matured `backoff` products and falls back to the
+other class when needed. Six consecutive content failures are counted across
+the configured content outcomes for the same `source_hash`; the next visit
+records `content_quarantined` and schedules an annual refresh. A changed source
+hash resets that revision-specific streak and makes the product due
+immediately.
+Requeueing never deletes or rewrites an old attempt. Instead, the product's
+content-failure cutoff advances to the latest completed attempt, so a new
+policy epoch counts only later content outcomes while the earlier audit remains
+queryable.
 
 `research_actions` uniquely constrains both `(attempt, round, action)` and an
-attempt-local `(action, request fingerprint)`. Version 7 also stores an
+attempt-local `(action, request fingerprint)`. Version 9 also stores an
 action-specific scope fingerprint. Before any new provider call, the worker
 compares each earlier unresolved action against the current scope for that
 prior action: Search and Extract use separate provider wire scopes, while AI uses
@@ -77,3 +102,19 @@ metadata are never stored in this table. An attempt closing with a still
 eligible for autonomous crash recovery because their response bodies are not
 persisted; a Wiki-only publish failure instead reuses the already validated
 decision and skips new research.
+
+Global daily/monthly research limits are computed from bounded audited Exa
+Search/Extract `research_actions` in UTC windows before paid research starts.
+The optional
+`PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT` and
+`PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT` values default to zero (disabled).
+Each enabled limit must be at least `PV_WIKI_RESEARCH_MAX_CREDITS`; the worker
+reserves that full per-product allowance immediately before paid research.
+Insufficient remaining headroom or any unknown/uncertain usage in the enabled
+window finishes the short attempt as `system_paused` and atomically restores
+its original `due`, matured `backoff`, or `synced` queue state and
+`next_run_at`. This does not change failure counts, the last product outcome,
+or publication metadata. The limits do not include AI tokens or currency.
+Authenticated worker `GET /status` exposes only aggregate/redacted queue,
+budget, and circuit readiness; it does not return catalogue rows, credentials,
+provider fingerprints, prompts, or extract bodies.

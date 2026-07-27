@@ -336,6 +336,24 @@ def _distinctive_model_fragments(value: str) -> tuple[str, ...]:
     return tuple(fragments)
 
 
+def _looks_like_organization_name(value: str) -> bool:
+    tokens = [
+        identity_key(token)
+        for token in re.findall(r"\S+", value, flags=re.UNICODE)
+    ]
+    return bool(tokens) and tokens[-1] in _LEGAL_ENTITY_TOKENS
+
+
+def _looks_like_product_description(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return (
+        _IN_SCOPE_ENGLISH_TYPE_RE.search(normalized) is not None
+        or _OUT_OF_SCOPE_ENGLISH_TYPE_RE.search(normalized) is not None
+        or any(term in normalized for term in _IN_SCOPE_CJK_TYPE_TERMS)
+        or any(term in normalized for term in _OUT_OF_SCOPE_CJK_TYPE_TERMS)
+    )
+
+
 def preferred_catalogue_model(
     product_id: Any,
     product_name: Any,
@@ -348,8 +366,17 @@ def preferred_catalogue_model(
     stable_id = " ".join(str(product_id or "").split())
     if not name:
         return ""
+    name_key = identity_key(name)
+    if (
+        not name_key
+        or name_key.isdecimal()
+        or _looks_like_organization_name(name)
+    ):
+        return ""
     if _distinctive_model_fragments(name):
         return name
+    if not _looks_like_product_description(name):
+        return ""
     if allow_product_id and _is_distinctive_model_identity(stable_id):
         return stable_id
     return name
@@ -457,6 +484,12 @@ def _ground_extract_quote(
         raw_end = raw_offsets[
             normalized_index + len(normalized_proposed) - 1
         ][1]
+        while (
+            raw_end < len(body)
+            and not body[raw_end].isalnum()
+            and body[raw_end] not in "\r\n"
+        ):
+            raw_end += 1
         span = body[raw_start:raw_end].strip()
         if 0 < len(span) <= maximum:
             return span
@@ -771,11 +804,17 @@ def _auto_verified_manufacturer_urls(
     manufacturer_tokens = _manufacturer_tokens(manufacturer)
     if not manufacturer_tokens:
         return set()
+    declared_noncommunity_urls = {
+        item["url"]
+        for item in items
+        if item["source_type"] != "community"
+    }
     corroborating_labels = {
         _registrable_domain_label(urlsplit(url).hostname or "")
         for url, body in evidence_body_by_url.items()
         if (
-            urlsplit(url).scheme.casefold() == "https"
+            url in declared_noncommunity_urls
+            and urlsplit(url).scheme.casefold() == "https"
             and _body_supports_manufacturer_identity(
                 body,
                 manufacturer_tokens=manufacturer_tokens,
@@ -807,13 +846,78 @@ def _auto_verified_manufacturer_urls(
     return verified
 
 
-def _fact_value_present(value: Any, unit: str, normalized_body: str) -> bool:
-    value_key = identity_key(str(value))
-    unit_key = identity_key(unit)
-    if not value_key:
+def _numeric_value_pattern(value: int | float) -> str:
+    number = format(float(value), ".15g") if isinstance(value, float) else str(value)
+    if "e" in number.casefold():
+        mantissa, exponent = re.split(r"[eE]", number, maxsplit=1)
+        mantissa_pattern = re.escape(mantissa).replace(r"\.", r"[.,]")
+        return mantissa_pattern + r"[eE]" + re.escape(exponent)
+    if "." in number:
+        whole, fraction = number.split(".", maxsplit=1)
+        return re.escape(whole) + r"[.,]" + re.escape(fraction) + r"0*"
+    return re.escape(number) + (
+        r"(?:[.,]0+)?"
+        if isinstance(value, float)
+        else ""
+    )
+
+
+def _bounded_literal_pattern(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    parts = [part for part in re.split(r"\s+", normalized) if part]
+    return r"\s+".join(re.escape(part) for part in parts)
+
+
+def _fact_value_present(value: Any, unit: str, body: str) -> bool:
+    """Match a complete value/unit token, never a numeric substring."""
+
+    if not isinstance(body, str) or not body:
         return False
-    target = f"{value_key}{unit_key}" if unit_key else value_key
-    return target in normalized_body
+    if isinstance(value, bool):
+        value_pattern = re.escape(str(value))
+        numeric = False
+    elif isinstance(value, (int, float)):
+        value_pattern = _numeric_value_pattern(value)
+        numeric = True
+    else:
+        value_pattern = _bounded_literal_pattern(str(value))
+        numeric = False
+    if not value_pattern:
+        return False
+
+    unit_pattern = _bounded_literal_pattern(unit) if unit else ""
+    prefix = r"(?<![\w.,+\-])"
+    if numeric:
+        value_suffix = r"(?![\d.,])"
+    else:
+        value_suffix = r"(?!\w)" if str(value)[-1:].isalnum() else ""
+    if unit_pattern:
+        unit_suffix = (
+            r"(?![\w/])"
+            if unit[-1:].isalnum()
+            else r"(?![%\w/])"
+        )
+        suffix = rf"{value_suffix}\s*{unit_pattern}{unit_suffix}"
+    else:
+        literal_suffix = r"(?!/)" if str(value)[-1:].isalnum() else ""
+        suffix = value_suffix + literal_suffix
+    suffix += r"(?!\s*(?:/|;|\bor\b))"
+    return re.search(
+        prefix + value_pattern + suffix,
+        unicodedata.normalize("NFKC", body),
+        flags=re.IGNORECASE | re.UNICODE,
+    ) is not None
+
+
+def _fact_label_tail(quote: str, name: str) -> str | None:
+    pattern = _flexible_whitespace_pattern(
+        unicodedata.normalize("NFKC", name)
+    )
+    if not pattern:
+        return None
+    normalized_quote = unicodedata.normalize("NFKC", quote)
+    match = re.search(pattern, normalized_quote, flags=re.IGNORECASE)
+    return normalized_quote[match.end():] if match is not None else None
 
 
 def _quote_supports_fact(
@@ -827,14 +931,109 @@ def _quote_supports_fact(
 ) -> bool:
     quote_key = identity_key(quote)
     name_key = identity_key(name)
+    value_region = _fact_label_tail(quote, name)
     return (
         len(quote_key) >= 8
         and len(name_key) >= 2
         and quote_key in normalized_body
         and name_key in quote_key
-        and _fact_value_present(value, unit, quote_key)
+        and value_region is not None
+        and _fact_value_present(value, unit, value_region)
         and text_contains_exact_identity(expected_product_name, quote)
         and not text_contains_competing_identity(expected_product_name, quote)
+    )
+
+
+def _table_row_cells(row: str) -> list[str] | None:
+    """Parse one explicit Markdown/TSV row; prose spacing is not structural."""
+
+    lines = [line.strip() for line in row.splitlines() if line.strip()]
+    if len(lines) != 1:
+        return None
+    line = lines[0]
+    if "|" in line:
+        cells = [cell.strip() for cell in line.split("|")]
+        if cells and not cells[0]:
+            cells.pop(0)
+        if cells and not cells[-1]:
+            cells.pop()
+    elif "\t" in line:
+        cells = [cell.strip() for cell in line.split("\t")]
+    else:
+        return None
+    return cells if len(cells) >= 2 and all(cells) else None
+
+
+def _cell_has_unambiguous_fact_value(
+    cell: str,
+    *,
+    value: Any,
+    unit: str,
+) -> bool:
+    if not _fact_value_present(value, unit, cell):
+        return False
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return re.search(r"\s(?:/|;|\bor\b)\s", cell, flags=re.IGNORECASE) is None
+
+    expected = float(value)
+    numeric_tokens = re.findall(
+        r"(?<![\w.,])[+\-]?\d+(?:[.,]\d+)?(?![\w.,])",
+        unicodedata.normalize("NFKC", cell),
+        flags=re.UNICODE,
+    )
+    for token in numeric_tokens:
+        try:
+            candidate = float(token.replace(",", "."))
+        except ValueError:
+            return False
+        if not math.isclose(candidate, expected, rel_tol=1e-12, abs_tol=1e-12):
+            return False
+    return bool(numeric_tokens)
+
+
+def _structured_table_quote_supports_fact(
+    *,
+    model_quote: str,
+    fact_quote: str,
+    name: str,
+    value: Any,
+    unit: str,
+    expected_product_name: str,
+) -> bool:
+    """Bind a target model header cell to the same column in a fact row."""
+
+    header_cells = _table_row_cells(model_quote)
+    fact_cells = _table_row_cells(fact_quote)
+    if (
+        header_cells is None
+        or fact_cells is None
+        or len(header_cells) != len(fact_cells)
+    ):
+        return False
+    target_columns = [
+        index
+        for index, cell in enumerate(header_cells)
+        if text_contains_exact_identity(expected_product_name, cell)
+        and not text_contains_competing_identity(expected_product_name, cell)
+    ]
+    if len(target_columns) != 1:
+        return False
+    target_column = target_columns[0]
+    label_cells = [
+        index
+        for index, cell in enumerate(fact_cells)
+        if (
+            index != target_column
+            and identity_key(name) == identity_key(cell)
+        )
+    ]
+    return (
+        len(label_cells) == 1
+        and _cell_has_unambiguous_fact_value(
+            fact_cells[target_column],
+            value=value,
+            unit=unit,
+        )
     )
 
 
@@ -971,6 +1170,7 @@ def validate_decision(
     allowed_classification_urls: set[str] | None = None,
     trusted_source_domains: set[str] | frozenset[str] | None = None,
     expected_product_name: str | None = None,
+    operator_manufacturer_identity: str | None = None,
     evidence_text_by_url: Mapping[str, str] | None = None,
     classification_text_by_url: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -997,6 +1197,25 @@ def validate_decision(
     confidence = _confidence(raw.get("confidence"), "confidence")
     summary = _text(raw.get("summary"), "summary", limit=2000)
     manufacturer = _text(raw.get("manufacturer"), "manufacturer", limit=300)
+    operator_manufacturer = (
+        _text(
+            operator_manufacturer_identity,
+            "operator_manufacturer_identity",
+            required=True,
+            limit=300,
+        )
+        if operator_manufacturer_identity is not None
+        else ""
+    )
+    if (
+        outcome == "publish"
+        and operator_manufacturer
+        and identity_key(manufacturer) != identity_key(operator_manufacturer)
+    ):
+        raise SourceVerificationError(
+            "publish manufacturer conflicts with the operator-approved "
+            "catalogue brand identity"
+        )
     model = _text(raw.get("model"), "model", limit=300)
     product_category = canonical_product_category(
         _text(raw.get("product_category"), "product_category", limit=100)
@@ -1191,7 +1410,7 @@ def validate_decision(
         )
     auto_verified_urls = _auto_verified_manufacturer_urls(
         datasheets + sources,
-        manufacturer=manufacturer,
+        manufacturer=operator_manufacturer or manufacturer,
         expected_product_name=model,
         evidence_body_by_url=evidence_body_by_url,
     )
@@ -1303,10 +1522,16 @@ def validate_decision(
                     f"facts[{index}].evidence_quotes[{quote_index}] "
                     "must be an object"
                 )
-            if set(quote_item) != {"url", "quote"}:
+            quote_fields = set(quote_item)
+            structured_table_quote = "model_quote" in quote_fields
+            if quote_fields not in (
+                {"url", "quote"},
+                {"url", "quote", "model_quote"},
+            ):
                 raise DecisionError(
                     f"facts[{index}].evidence_quotes[{quote_index}] "
-                    "must contain only url and quote"
+                    "must contain url and quote, with only an optional "
+                    "model_quote table-header span"
                 )
             quote_url = validate_public_url(
                 quote_item.get("url"),
@@ -1328,20 +1553,65 @@ def validate_decision(
                     quote,
                     evidence_body_by_url.get(quote_url, ""),
                 )
-                if grounded_quote is None or not _quote_supports_fact(
-                    grounded_quote,
-                    name=name,
-                    value=value,
-                    unit=unit,
-                    expected_product_name=model,
-                    normalized_body=normalized_evidence_text.get(quote_url, ""),
-                ):
+                grounded_model_quote: str | None = None
+                supports_fact = False
+                if grounded_quote is not None and structured_table_quote:
+                    model_quote = _text(
+                        quote_item.get("model_quote"),
+                        (
+                            f"facts[{index}].evidence_quotes[{quote_index}]"
+                            ".model_quote"
+                        ),
+                        required=True,
+                        limit=500,
+                    )
+                    grounded_model_quote = _ground_extract_quote(
+                        model_quote,
+                        evidence_body_by_url.get(quote_url, ""),
+                    )
+                    supports_fact = (
+                        grounded_model_quote is not None
+                        and _structured_table_quote_supports_fact(
+                            model_quote=grounded_model_quote,
+                            fact_quote=grounded_quote,
+                            name=name,
+                            value=value,
+                            unit=unit,
+                            expected_product_name=model,
+                        )
+                    )
+                elif grounded_quote is not None:
+                    supports_fact = _quote_supports_fact(
+                        grounded_quote,
+                        name=name,
+                        value=value,
+                        unit=unit,
+                        expected_product_name=model,
+                        normalized_body=normalized_evidence_text.get(quote_url, ""),
+                    )
+                if not supports_fact:
                     raise DecisionError(
                         f"facts[{index}].evidence_quotes[{quote_index}] is not "
                         "an exact supporting extract span"
                     )
                 quote = grounded_quote
-            evidence_quotes.append({"url": quote_url, "quote": quote})
+                normalized_quote = {"url": quote_url, "quote": quote}
+                if grounded_model_quote is not None:
+                    normalized_quote["model_quote"] = grounded_model_quote
+                evidence_quotes.append(normalized_quote)
+            else:
+                normalized_quote = {"url": quote_url, "quote": quote}
+                if structured_table_quote:
+                    normalized_quote["model_quote"] = _text(
+                        quote_item.get("model_quote"),
+                        (
+                            f"facts[{index}].evidence_quotes[{quote_index}]"
+                            ".model_quote"
+                        ),
+                        required=True,
+                        limit=500,
+                    )
+                evidence_quotes.append(normalized_quote)
         fact = {
             "name": name,
             "value": value,
@@ -1396,6 +1666,32 @@ def validate_decision(
     if disputed_facts:
         raise DecisionError("conflicted fields must not also appear as verified facts")
 
+    if outcome in {"no_datasheet", "ambiguous", "insufficient_identity"}:
+        if facts:
+            raise DecisionError(
+                f"{outcome} must not contain verified specification facts"
+            )
+        if any(item["is_primary"] for item in datasheets):
+            raise DecisionError(
+                f"{outcome} must not declare a primary datasheet"
+            )
+        if review_summary or review_evidence_urls:
+            raise DecisionError(
+                f"{outcome} must not contain publication review evidence"
+            )
+        if classification_evidence_urls or classification_evidence_quotes:
+            raise DecisionError(
+                f"{outcome} must not contain out_of_scope classification evidence"
+            )
+        if outcome == "no_datasheet" and datasheets:
+            raise DecisionError(
+                "no_datasheet must not declare datasheet candidates"
+            )
+        if outcome == "insufficient_identity" and normalized_conflicts:
+            raise DecisionError(
+                "insufficient_identity must not assert verified conflicts; "
+                "use ambiguous"
+            )
     if outcome == "out_of_scope":
         if confidence < minimum_confidence:
             raise DecisionError(
@@ -1512,49 +1808,27 @@ def validate_decision(
                     "source, a configured domain override, or two enabled independent "
                     "mirrors"
                 )
-        configured_fact_urls = {
-            item["url"]
-            for item in datasheets + sources
-            if item["source_type"] in TRUSTED_TYPES
-            and _url_has_trusted_domain(item["url"], trusted_domains)
+        configured_primary_urls = {
+            item["url"] for item in configured_primary
         }
-        auto_fact_urls = {
-            item["url"]
-            for item in datasheets + sources
-            if item["source_type"] == "manufacturer"
-            and item["url"] in auto_verified_urls
+        auto_primary_urls = {
+            item["url"] for item in auto_primary
         }
         for index, fact in enumerate(facts):
             quoted_urls = {
                 item["url"] for item in fact["evidence_quotes"]
             }
             if configured_primary:
-                trusted_evidence = quoted_urls & configured_fact_urls
-                if not trusted_evidence:
+                if not quoted_urls & configured_primary_urls:
                     raise SourceVerificationError(
-                        f"facts[{index}] needs evidence from an automatically "
-                        "verified manufacturer source or configured domain override"
+                        f"facts[{index}] needs evidence from the configured "
+                        "primary manufacturer datasheet"
                     )
             elif auto_primary:
-                automatic_evidence = quoted_urls & auto_fact_urls
-                quoted_organization_labels = {
-                    _registrable_domain_label(urlsplit(url).hostname or "")
-                    for url in quoted_urls
-                    if source_types_by_url.get(url) != "community"
-                    and urlsplit(url).scheme.casefold() == "https"
-                }
-                automatic_labels = {
-                    _registrable_domain_label(urlsplit(url).hostname or "")
-                    for url in automatic_evidence
-                }
-                if not automatic_evidence or not any(
-                    label and label not in automatic_labels
-                    for label in quoted_organization_labels
-                ):
+                if not quoted_urls & auto_primary_urls:
                     raise SourceVerificationError(
-                        f"facts[{index}] needs exact quotes from both the "
-                        "automatically verified manufacturer candidate and a "
-                        "second independent non-community domain"
+                        f"facts[{index}] needs evidence from the automatically "
+                        "verified primary manufacturer datasheet"
                     )
             else:
                 matching_mirror_domains = {

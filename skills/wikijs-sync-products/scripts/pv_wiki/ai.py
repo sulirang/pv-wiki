@@ -11,8 +11,10 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import multiprocessing
 import os
 import re
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -138,6 +140,10 @@ class AIConfigError(AIError, ValueError):
     """Raised when the configured compatible API is missing or unsafe."""
 
 
+class AILocalExecutionError(AIError):
+    """Raised when local request isolation fails before provider I/O starts."""
+
+
 class AIHTTPError(AIError):
     """Raised when the compatible API returns a non-success HTTP status."""
 
@@ -155,12 +161,47 @@ class AINetworkError(AIError):
     """Raised when the compatible API cannot be reached."""
 
 
+class AITimeoutError(AINetworkError):
+    """Raised after the isolated provider call exceeds its wall-clock limit."""
+
+
 class AIResponseError(AIError):
     """Raised when a response is oversized, malformed, or not one JSON object."""
 
 
+class AIOutputErrorCategory(str, Enum):
+    """Safe, finite reasons that may be disclosed in one repair prompt."""
+
+    EMPTY_CONTENT = "empty_content"
+    INVALID_JSON = "invalid_json"
+    PROVIDER_ENVELOPE = "provider_envelope"
+    INCOMPLETE_RESPONSE = "incomplete_response"
+    DECISION_CONTRACT = "decision_contract"
+    ACTION_CONTRACT = "action_contract"
+    SEARCH_QUERY_CONTRACT = "search_query_contract"
+
+
 class AIInvalidOutputError(AIResponseError):
     """Raised for a model output that can be retried once automatically."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: AIOutputErrorCategory = AIOutputErrorCategory.DECISION_CONTRACT,
+    ) -> None:
+        if not isinstance(category, AIOutputErrorCategory):
+            raise TypeError("category must be an AIOutputErrorCategory")
+        self.category = category
+        super().__init__(message)
+
+
+@dataclass(frozen=True, slots=True)
+class AIResponseMetadata:
+    """Bounded non-content metadata retained from one provider response."""
+
+    finish_reason: str | None
+    usage: dict[str, Any] | None
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -312,10 +353,13 @@ class AISettings:
     max_tokens: int = DEFAULT_MAX_TOKENS
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     max_evidence_chars: int = DEFAULT_MAX_EVIDENCE_CHARS
+    json_response_format: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_insecure_http, bool):
             raise AIConfigError("AI_ALLOW_INSECURE_HTTP must be true or false")
+        if not isinstance(self.json_response_format, bool):
+            raise AIConfigError("AI_JSON_RESPONSE_FORMAT must be true or false")
         object.__setattr__(
             self,
             "base_url",
@@ -429,11 +473,16 @@ class AISettings:
             env,
             ("AI_ALLOW_INSECURE_HTTP", "LLM_ALLOW_INSECURE_HTTP"),
         )
+        json_response_format = _boolean_from_env(
+            env,
+            ("AI_JSON_RESPONSE_FORMAT", "LLM_JSON_RESPONSE_FORMAT"),
+        )
         return cls(
             base_url=base_url,
             api_key=api_key,
             model=model,
             allow_insecure_http=allow_insecure_http,
+            json_response_format=json_response_format,
             timeout=timeout,
             max_tokens=max_tokens,
             max_response_bytes=max_response_bytes,
@@ -634,6 +683,7 @@ def _contains_urlish_text(value: str) -> bool:
         }
     )
     normalized = re.sub(r"\[\s*\.\s*\]|\(\s*\.\s*\)", ".", normalized)
+    normalized = re.sub(r"\[\s*:\s*\]|\(\s*:\s*\)", ":", normalized)
     if _URLISH_TEXT_RE.search(normalized):
         return True
     for token in re.findall(r"\[[^\]\s]+\]|[^\s]+", normalized):
@@ -773,6 +823,79 @@ def _query_contains_binding(query: str, bindings: Sequence[str]) -> bool:
     return False
 
 
+def _binding_is_opaque_model_token(value: str) -> bool:
+    """Return whether a runtime binding may be hidden during URL inspection.
+
+    Decimal model identifiers such as ``H3-8.0-E`` resemble hostnames to a
+    deliberately conservative Unicode host detector. Real IP literals,
+    ordinary domains, URL schemes, and obfuscated-dot forms remain visible.
+    """
+
+    candidate = unicodedata.normalize("NFKC", value).strip()
+    translated = candidate.translate(
+        {
+            ord("\u3002"): ".",
+            ord("\uff0e"): ".",
+            ord("\uff61"): ".",
+        }
+    )
+    translated = re.sub(r"\[\s*:\s*\]|\(\s*:\s*\)", ":", translated)
+    if re.search(
+        r"(?:[a-z][a-z0-9+.-]*://|\bwww\.|\bsite\s*:|\[\s*\.\s*\]|\(\s*\.\s*\))",
+        translated,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    if _URLISH_TEXT_RE.search(translated):
+        return False
+    ip_candidate = translated.strip("[]")
+    try:
+        ipaddress.ip_address(ip_candidate)
+    except ValueError:
+        pass
+    else:
+        return False
+    host_match = _UNICODE_HOST_CANDIDATE_RE.fullmatch(translated)
+    if host_match is not None:
+        labels = translated.rstrip(".").split(".")
+        # A conventional alphabetic TLD is a domain, not a decimal model
+        # component. Mixed digit/hyphen suffixes such as ``0-E`` remain opaque.
+        if len(labels) >= 2 and len(labels[-1]) >= 2 and labels[-1].isalpha():
+            return False
+    return True
+
+
+def _without_opaque_query_bindings(
+    query: str,
+    bindings: Sequence[str],
+) -> str:
+    """Hide only exact, runtime-approved model-like terms for URL detection."""
+
+    result = unicodedata.normalize("NFKC", query)
+    eligible = {
+        unicodedata.normalize("NFKC", binding)
+        for binding in bindings
+        if _binding_is_opaque_model_token(binding)
+    }
+    for binding in sorted(eligible, key=len, reverse=True):
+        result = re.sub(
+            rf"(?<!\w){re.escape(binding)}(?!\w)",
+            " ",
+            result,
+            flags=re.IGNORECASE,
+        )
+    return result
+
+
+def _query_contains_urlish_outside_bindings(
+    query: str,
+    bindings: Sequence[str],
+) -> bool:
+    return _contains_urlish_text(
+        _without_opaque_query_bindings(query, bindings)
+    )
+
+
 def _normalize_previous_queries(previous_queries: Sequence[str]) -> tuple[str, ...]:
     if isinstance(previous_queries, (str, bytes)) or not isinstance(
         previous_queries, Sequence
@@ -807,7 +930,8 @@ def _validate_search_queries(
 ) -> tuple[str, ...]:
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_RESEARCH_QUERIES:
         raise AIInvalidOutputError(
-            f"search_more queries must contain 1-{MAX_RESEARCH_QUERIES} strings"
+            f"search_more queries must contain 1-{MAX_RESEARCH_QUERIES} strings",
+            category=AIOutputErrorCategory.SEARCH_QUERY_CONTRACT,
         )
     bindings = _required_research_binding_terms(
         product,
@@ -815,7 +939,8 @@ def _validate_search_queries(
     )
     if not bindings:
         raise AIInvalidOutputError(
-            "search_more requires an exact model or candidate manufacturer binding"
+            "search_more requires an exact model or candidate manufacturer binding",
+            category=AIOutputErrorCategory.SEARCH_QUERY_CONTRACT,
         )
     previous_keys = {
         item.casefold() for item in _normalize_previous_queries(previous_queries)
@@ -830,19 +955,33 @@ def _validate_search_queries(
                 maximum=MAX_RESEARCH_QUERY_CHARS,
             )
         except (TypeError, ValueError) as exc:
-            raise AIInvalidOutputError(str(exc)) from exc
-        if _contains_urlish_text(query):
+            raise AIInvalidOutputError(
+                "search_more query is not a valid bounded string",
+                category=AIOutputErrorCategory.SEARCH_QUERY_CONTRACT,
+            ) from exc
+        if not _query_contains_binding(query, bindings):
+            raise AIInvalidOutputError(
+                "each search_more query must contain the exact model or "
+                "current candidate manufacturer",
+                category=AIOutputErrorCategory.SEARCH_QUERY_CONTRACT,
+            )
+        if _query_contains_urlish_outside_bindings(query, bindings):
             repaired = _without_plain_urlish_query_tokens(query)
-            if not repaired or _contains_urlish_text(repaired):
+            if (
+                not repaired
+                or _query_contains_urlish_outside_bindings(repaired, bindings)
+            ):
                 raise AIInvalidOutputError(
                     "search_more queries cannot contain an unsafe or "
-                    "obfuscated URL, domain, IP address, or site operator"
+                    "obfuscated URL, domain, IP address, or site operator",
+                    category=AIOutputErrorCategory.SEARCH_QUERY_CONTRACT,
                 )
             query = repaired
         if not _query_contains_binding(query, bindings):
             raise AIInvalidOutputError(
                 "each search_more query must contain the exact model or "
-                "current candidate manufacturer"
+                "current candidate manufacturer",
+                category=AIOutputErrorCategory.SEARCH_QUERY_CONTRACT,
             )
         key = query.casefold()
         if key not in seen:
@@ -850,7 +989,8 @@ def _validate_search_queries(
             normalized.append(query)
     if not normalized:
         raise AIInvalidOutputError(
-            "search_more must contain at least one novel query"
+            "search_more must contain at least one novel query",
+            category=AIOutputErrorCategory.SEARCH_QUERY_CONTRACT,
         )
     return tuple(normalized)
 
@@ -1030,15 +1170,28 @@ def build_decision_messages(
                 "unit": "string",
                 "confidence": "number from 0 to 1",
                 "evidence_urls": ["successful extracted URL"],
-                "evidence_quotes": [
-                    {
-                        "url": "successful extracted URL",
-                        "quote": (
-                            "short exact target-model-only span containing "
-                            "full model, field label, and value"
-                        ),
-                    }
-                ],
+                "evidence_quotes": {
+                    "type": "array with 1-5 entries",
+                    "item_shapes_exactly_one_of": [
+                        {
+                            "url": "successful extracted URL",
+                            "quote": (
+                                "short exact target-model-only span containing "
+                                "full model, field label, and value"
+                            ),
+                        },
+                        {
+                            "url": "successful extracted URL",
+                            "model_quote": (
+                                "one exact Markdown-pipe or TSV model header row"
+                            ),
+                            "quote": (
+                                "one exact same-table parameter row containing "
+                                "the field label and target-column value"
+                            ),
+                        },
+                    ],
+                },
             },
             "conflict_item": {
                 "field": "string",
@@ -1086,15 +1239,25 @@ def build_decision_messages(
             "Keep conflicting claims out of facts and list them in conflicts.",
             "A source document may cover multiple sibling models; do not reject "
             "the document for that alone.",
-            "For every fact, copy its name from the source field label and add "
-            "a short exact contiguous evidence quote containing the full target "
-            "model, that label, and value, with no sibling model or revision.",
-            "When the same fact appears on both a manufacturer-domain candidate "
-            "and a second independent HTTPS non-community domain, include exact "
-            "quotes from both URLs. This dual evidence is required for automatic "
-            "source verification when no configured domain override exists.",
-            "If a multi-model table does not provide an unambiguous target-model "
-            "span for every fact, return ambiguous; never guess a nearby column.",
+            "For every fact, copy its name from the source field label. For "
+            "ordinary prose or a target-only row, use exactly {url, quote}, "
+            "where quote is one exact contiguous span containing the full target "
+            "model, field label, and value with no sibling model or revision.",
+            "For a multi-model Markdown-pipe or TSV table, use exactly "
+            "{url, model_quote, quote}. model_quote must be one exact model "
+            "header row and quote one exact parameter row from the same extracted "
+            "document. Both rows must have the same number of explicit pipe/tab "
+            "cells; the complete target model must occur in exactly one header "
+            "cell, the fact label in exactly one non-target parameter cell, and "
+            "the target value and unit unambiguously in that same target column.",
+            "When no configured manufacturer-domain override exists, a second "
+            "independent HTTPS non-community extract must corroborate the public "
+            "manufacturer and complete model. Specification facts themselves "
+            "must be quoted from the verified primary manufacturer datasheet; "
+            "they do not each require a duplicate quote from the second source.",
+            "If a multi-model table does not provide an unambiguous same-column "
+            "model-to-value binding for every fact, return ambiguous; never "
+            "guess a nearby column or convert prose spacing into table cells.",
             "Community sources may support review_summary only, never specifications.",
             "review_summary requires at least two review_evidence_urls.",
             "Use empty strings and empty arrays for unavailable optional material.",
@@ -1188,10 +1351,11 @@ def build_research_messages(
             [
                 "Local validation rejected an earlier publish proposal for the "
                 "fixed validation_feedback gap.",
-                "Return search_more for exactly that gap, or return a conservative "
-                "final non-publish decision.",
-                "Do not return final publish until new extracted evidence resolves "
-                "the fixed gap.",
+                "If the existing extracts already resolve that gap, return one "
+                "corrected final proposal using only those existing extracted "
+                "URLs; local validation will run again.",
+                "Otherwise return search_more for exactly that gap, or return a "
+                "conservative final non-publish decision.",
             ]
         )
     return [
@@ -1232,13 +1396,17 @@ def parse_decision_content(content: str) -> dict[str, Any]:
     """Parse plain JSON or one complete ``json`` fence, rejecting all chatter."""
 
     if not isinstance(content, str) or not content.strip():
-        raise AIInvalidOutputError("AI response content must be a non-empty string")
+        raise AIInvalidOutputError(
+            "AI response content must be a non-empty string",
+            category=AIOutputErrorCategory.EMPTY_CONTENT,
+        )
     candidate = content.strip()
     if "```" in candidate:
         match = _JSON_FENCE.fullmatch(candidate)
         if match is None or candidate.count("```") != 2:
             raise AIInvalidOutputError(
-                "AI response must contain only one complete json code fence"
+                "AI response must contain only one complete json code fence",
+                category=AIOutputErrorCategory.INVALID_JSON,
             )
         candidate = match.group("body").strip()
     try:
@@ -1254,10 +1422,14 @@ def parse_decision_content(content: str) -> dict[str, Any]:
         ValueError,
     ) as exc:
         raise AIInvalidOutputError(
-            "AI response content is not valid unambiguous JSON"
+            "AI response content is not valid unambiguous JSON",
+            category=AIOutputErrorCategory.INVALID_JSON,
         ) from exc
     if not isinstance(decoded, dict):
-        raise AIInvalidOutputError("AI response decision must be a JSON object")
+        raise AIInvalidOutputError(
+            "AI response decision must be a JSON object",
+            category=AIOutputErrorCategory.DECISION_CONTRACT,
+        )
     return decoded
 
 
@@ -1320,7 +1492,10 @@ def validate_research_action(
     """Validate one untrusted model action into a small runtime-owned type."""
 
     if not isinstance(value, Mapping):
-        raise AIInvalidOutputError("research action must be a JSON object")
+        raise AIInvalidOutputError(
+            "research action must be a JSON object",
+            category=AIOutputErrorCategory.ACTION_CONTRACT,
+        )
     if not isinstance(product, Mapping):
         raise TypeError("product must be a mapping")
     if validation_feedback is not None and not isinstance(
@@ -1332,39 +1507,37 @@ def validate_research_action(
     if action == "final":
         if set(value) != {"action", "decision"}:
             raise AIInvalidOutputError(
-                "final action must contain only action and decision"
+                "final action must contain only action and decision",
+                category=AIOutputErrorCategory.ACTION_CONTRACT,
             )
         raw_decision = value.get("decision")
         if not isinstance(raw_decision, Mapping) or not raw_decision:
             raise AIInvalidOutputError(
-                "final action decision must be a non-empty JSON object"
+                "final action decision must be a non-empty JSON object",
+                category=AIOutputErrorCategory.ACTION_CONTRACT,
             )
         decision = _normalize_model_decision_probabilities(raw_decision)
         for trusted_field in _TRUSTED_DECISION_FIELDS:
             decision.pop(trusted_field, None)
-        if (
-            validation_feedback is not None
-            and decision.get("outcome") == "publish"
-        ):
-            raise AIInvalidOutputError(
-                "final publish is forbidden until validation feedback is resolved"
-            )
         return FinalAction(decision=decision)
 
     if action == "search_more":
         if set(value) != {"action", "gap", "queries"}:
             raise AIInvalidOutputError(
-                "search_more action must contain only action, gap, and queries"
+                "search_more action must contain only action, gap, and queries",
+                category=AIOutputErrorCategory.ACTION_CONTRACT,
             )
         try:
             gap = ResearchGap(value.get("gap"))
         except (TypeError, ValueError) as exc:
             raise AIInvalidOutputError(
-                "search_more gap is not an allowed ResearchGap"
+                "search_more gap is not an allowed ResearchGap",
+                category=AIOutputErrorCategory.ACTION_CONTRACT,
             ) from exc
         if validation_feedback is not None and gap is not validation_feedback.gap:
             raise AIInvalidOutputError(
-                "search_more gap must match the fixed validation feedback gap"
+                "search_more gap must match the fixed validation feedback gap",
+                category=AIOutputErrorCategory.ACTION_CONTRACT,
             )
         queries = _validate_search_queries(
             value.get("queries"),
@@ -1375,7 +1548,8 @@ def validate_research_action(
         return SearchMoreAction(gap=gap, queries=queries)
 
     raise AIInvalidOutputError(
-        "research action must be exactly final or search_more"
+        "research action must be exactly final or search_more",
+        category=AIOutputErrorCategory.ACTION_CONTRACT,
     )
 
 
@@ -1410,6 +1584,263 @@ def _content_length(response: Any) -> int | None:
     return value if value >= 0 else None
 
 
+def _default_provider_request_worker(
+    send_connection: Any,
+    endpoint: str,
+    data: bytes,
+    headers: Mapping[str, str],
+    socket_timeout: float,
+    max_response_bytes: int,
+) -> None:
+    """Perform one default network request in a process the parent can kill."""
+
+    result: tuple[str, Any]
+    try:
+        request = urllib.request.Request(
+            endpoint,
+            data=data,
+            headers=dict(headers),
+            method="POST",
+        )
+        with _NO_REDIRECT_OPENER.open(
+            request,
+            timeout=socket_timeout,
+        ) as response:
+            status = getattr(response, "status", 200)
+            if not isinstance(status, int) or not 200 <= status < 300:
+                result = (
+                    "http_error",
+                    status if isinstance(status, int) else None,
+                )
+            else:
+                length = _content_length(response)
+                if length is not None and length > max_response_bytes:
+                    result = ("oversized", None)
+                else:
+                    body = response.read(max_response_bytes + 1)
+                    if not isinstance(body, bytes):
+                        result = ("invalid_body", None)
+                    elif len(body) > max_response_bytes:
+                        result = ("oversized", None)
+                    else:
+                        result = ("ok", body)
+    except urllib.error.HTTPError as exc:
+        result = (
+            "http_error",
+            exc.code if isinstance(exc.code, int) else None,
+        )
+    except (urllib.error.URLError, TimeoutError, OSError):
+        result = ("network_error", None)
+    except BaseException:
+        # Provider/library details never cross the subprocess boundary.
+        result = ("network_error", None)
+    try:
+        send_connection.send(result)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+    finally:
+        send_connection.close()
+
+
+def _stop_provider_process(process: multiprocessing.Process) -> None:
+    """Reap a provider child, escalating from terminate to kill if necessary."""
+
+    if process.is_alive():
+        process.terminate()
+        process.join(0.25)
+    if process.is_alive():
+        process.kill()
+        process.join(0.25)
+    if not process.is_alive():
+        process.join()
+    process.close()
+
+
+def _close_provider_resource(resource: Any | None) -> None:
+    """Best-effort close one local multiprocessing resource."""
+
+    if resource is None:
+        return
+    try:
+        resource.close()
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+
+def _isolated_default_provider_request(
+    *,
+    endpoint: str,
+    data: bytes,
+    headers: Mapping[str, str],
+    timeout: float,
+    max_response_bytes: int,
+    _context: Any | None = None,
+    _worker: Callable[..., None] | None = None,
+) -> bytes:
+    """Return a bounded response body before an absolute wall-clock deadline."""
+
+    started_at = time.monotonic()
+    receive_connection: Any | None = None
+    send_connection: Any | None = None
+    process: Any | None = None
+    try:
+        context = _context or multiprocessing.get_context("spawn")
+        receive_connection, send_connection = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_worker or _default_provider_request_worker,
+            args=(
+                send_connection,
+                endpoint,
+                data,
+                dict(headers),
+                timeout,
+                max_response_bytes,
+            ),
+            daemon=True,
+        )
+        process.start()
+    except (OSError, RuntimeError, ValueError):
+        _close_provider_resource(receive_connection)
+        _close_provider_resource(send_connection)
+        _close_provider_resource(process)
+        raise AILocalExecutionError(
+            "AI request isolation could not start"
+        ) from None
+    _close_provider_resource(send_connection)
+    try:
+        remaining = max(0.0, timeout - (time.monotonic() - started_at))
+        if not receive_connection.poll(remaining):
+            raise AITimeoutError(
+                "AI endpoint exceeded the configured wall-clock timeout"
+            )
+        try:
+            result = receive_connection.recv()
+        except (EOFError, OSError):
+            raise AINetworkError("AI endpoint request failed") from None
+    finally:
+        _close_provider_resource(receive_connection)
+        _stop_provider_process(process)
+
+    if (
+        not isinstance(result, tuple)
+        or len(result) != 2
+        or not isinstance(result[0], str)
+    ):
+        raise AINetworkError("AI endpoint request failed")
+    outcome, detail = result
+    if outcome == "ok" and isinstance(detail, bytes):
+        return detail
+    if outcome == "http_error":
+        raise AIHTTPError(
+            (
+                f"AI endpoint returned HTTP {detail}"
+                if isinstance(detail, int)
+                else "AI endpoint returned a non-success HTTP status"
+            ),
+            status_code=detail if isinstance(detail, int) else None,
+        )
+    if outcome == "oversized":
+        raise AIResponseError("AI response exceeds the configured size limit")
+    if outcome == "invalid_body":
+        raise AIResponseError("AI response body must be bytes")
+    raise AINetworkError("AI endpoint request failed")
+
+
+def _normalized_finish_reason(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().casefold()
+    if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", candidate):
+        return candidate
+    return None
+
+
+def _normalized_usage(value: Any, *, depth: int = 0) -> dict[str, Any] | None:
+    """Keep bounded numeric token metadata and discard provider-authored text."""
+
+    if not isinstance(value, Mapping) or depth > 2:
+        return None
+    result: dict[str, Any] = {}
+    for raw_key, raw_item in list(value.items())[:32]:
+        if (
+            not isinstance(raw_key, str)
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", raw_key) is None
+        ):
+            continue
+        if (
+            isinstance(raw_item, int)
+            and not isinstance(raw_item, bool)
+            and 0 <= raw_item <= 1_000_000_000_000
+        ):
+            result[raw_key] = raw_item
+        elif (
+            isinstance(raw_item, float)
+            and math.isfinite(raw_item)
+            and 0 <= raw_item <= 1_000_000_000_000
+        ):
+            result[raw_key] = raw_item
+        elif isinstance(raw_item, Mapping):
+            nested = _normalized_usage(raw_item, depth=depth + 1)
+            if nested:
+                result[raw_key] = nested
+    return result
+
+
+_REPAIR_GUIDANCE = {
+    AIOutputErrorCategory.EMPTY_CONTENT: (
+        "The response content was empty. Produce the required JSON object."
+    ),
+    AIOutputErrorCategory.INVALID_JSON: (
+        "The response was not one unambiguous JSON object. Correct only its "
+        "JSON serialization and contract shape."
+    ),
+    AIOutputErrorCategory.PROVIDER_ENVELOPE: (
+        "The response envelope did not contain usable message content. Produce "
+        "the required JSON object in message content."
+    ),
+    AIOutputErrorCategory.INCOMPLETE_RESPONSE: (
+        "The provider reported a non-final or filtered completion. Produce a "
+        "complete replacement response within the bounded output contract."
+    ),
+    AIOutputErrorCategory.DECISION_CONTRACT: (
+        "The proposed decision violated the documented decision contract. "
+        "Correct its types, fields, and bounded values."
+    ),
+    AIOutputErrorCategory.ACTION_CONTRACT: (
+        "The proposed research action violated a documented top-level action "
+        "shape. Correct the action and its required fields."
+    ),
+    AIOutputErrorCategory.SEARCH_QUERY_CONTRACT: (
+        "A proposed search query violated the binding or safety contract. Use "
+        "an exact runtime-provided binding and no URL, domain, IP, or site operator."
+    ),
+}
+
+
+def _repair_instruction(
+    error: AIInvalidOutputError,
+    *,
+    research: bool,
+) -> str:
+    """Build a fixed repair instruction without copying provider content."""
+
+    guidance = _REPAIR_GUIDANCE[error.category]
+    if research:
+        contract = (
+            "Return exactly one final or search_more JSON object with no prose. "
+            "A search_more request cannot authorize trust or publication."
+        )
+    else:
+        contract = (
+            "Return exactly one complete JSON object matching the output "
+            "contract, with no prose or Markdown."
+        )
+    return (
+        f"Retry once. Safe error category: {error.category.value}. "
+        f"{guidance} {contract}"
+    )
+
+
 class OpenAICompatibleClient:
     """Minimal, dependency-free client for ``POST /chat/completions``."""
 
@@ -1421,10 +1852,19 @@ class OpenAICompatibleClient:
     ) -> None:
         self.settings = settings or AISettings.from_env()
         self._opener = opener or _NO_REDIRECT_OPENER.open
+        self._use_isolated_default_opener = opener is None
+        self.last_finish_reason: str | None = None
+        self.last_usage: dict[str, Any] | None = None
+        self.last_response_metadata: list[AIResponseMetadata] = []
 
     @property
     def endpoint(self) -> str:
         return f"{self.settings.base_url}/chat/completions"
+
+    def _reset_response_metadata(self) -> None:
+        self.last_finish_reason = None
+        self.last_usage = None
+        self.last_response_metadata = []
 
     def _post(self, messages: Sequence[Mapping[str, str]]) -> dict[str, Any]:
         payload = {
@@ -1434,50 +1874,70 @@ class OpenAICompatibleClient:
             "max_tokens": self.settings.max_tokens,
             "stream": False,
         }
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(
-                payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
-            ).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.settings.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with self._opener(request, timeout=self.settings.timeout) as response:
-                status = getattr(response, "status", 200)
-                if not isinstance(status, int) or not 200 <= status < 300:
-                    raise AIHTTPError(
-                        "AI endpoint returned a non-success HTTP status",
-                        status_code=status if isinstance(status, int) else None,
-                    )
-                length = _content_length(response)
-                if (
-                    length is not None
-                    and length > self.settings.max_response_bytes
-                ):
-                    raise AIResponseError(
-                        "AI response exceeds the configured size limit"
-                    )
-                body = response.read(self.settings.max_response_bytes + 1)
-                if not isinstance(body, bytes):
-                    raise AIResponseError("AI response body must be bytes")
-                if len(body) > self.settings.max_response_bytes:
-                    raise AIResponseError(
-                        "AI response exceeds the configured size limit"
-                    )
-        except AIError:
-            raise
-        except urllib.error.HTTPError as exc:
-            raise AIHTTPError(
-                f"AI endpoint returned HTTP {exc.code}",
-                status_code=exc.code,
-            ) from None
-        except (urllib.error.URLError, TimeoutError, OSError):
-            raise AINetworkError("AI endpoint request failed") from None
+        if self.settings.json_response_format:
+            payload["response_format"] = {"type": "json_object"}
+        data = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.settings.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        if self._use_isolated_default_opener:
+            body = _isolated_default_provider_request(
+                endpoint=self.endpoint,
+                data=data,
+                headers=headers,
+                timeout=self.settings.timeout,
+                max_response_bytes=self.settings.max_response_bytes,
+            )
+        else:
+            request = urllib.request.Request(
+                self.endpoint,
+                data=data,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with self._opener(
+                    request,
+                    timeout=self.settings.timeout,
+                ) as response:
+                    status = getattr(response, "status", 200)
+                    if not isinstance(status, int) or not 200 <= status < 300:
+                        raise AIHTTPError(
+                            "AI endpoint returned a non-success HTTP status",
+                            status_code=(
+                                status if isinstance(status, int) else None
+                            ),
+                        )
+                    length = _content_length(response)
+                    if (
+                        length is not None
+                        and length > self.settings.max_response_bytes
+                    ):
+                        raise AIResponseError(
+                            "AI response exceeds the configured size limit"
+                        )
+                    body = response.read(self.settings.max_response_bytes + 1)
+                    if not isinstance(body, bytes):
+                        raise AIResponseError(
+                            "AI response body must be bytes"
+                        )
+                    if len(body) > self.settings.max_response_bytes:
+                        raise AIResponseError(
+                            "AI response exceeds the configured size limit"
+                        )
+            except AIError:
+                raise
+            except urllib.error.HTTPError as exc:
+                raise AIHTTPError(
+                    f"AI endpoint returned HTTP {exc.code}",
+                    status_code=exc.code,
+                ) from None
+            except (urllib.error.URLError, TimeoutError, OSError):
+                raise AINetworkError("AI endpoint request failed") from None
 
         try:
             decoded = json.loads(
@@ -1490,24 +1950,54 @@ class OpenAICompatibleClient:
             RecursionError,
             ValueError,
         ) as exc:
-            raise AIInvalidOutputError("AI endpoint returned invalid JSON") from exc
+            raise AIInvalidOutputError(
+                "AI endpoint returned invalid JSON",
+                category=AIOutputErrorCategory.PROVIDER_ENVELOPE,
+            ) from exc
         if not isinstance(decoded, Mapping):
             raise AIInvalidOutputError(
-                "AI endpoint response must be a JSON object"
+                "AI endpoint response must be a JSON object",
+                category=AIOutputErrorCategory.PROVIDER_ENVELOPE,
             )
         choices = decoded.get("choices")
         if not isinstance(choices, list) or not choices:
-            raise AIInvalidOutputError("AI endpoint response has no choices")
+            raise AIInvalidOutputError(
+                "AI endpoint response has no choices",
+                category=AIOutputErrorCategory.PROVIDER_ENVELOPE,
+            )
         first = choices[0]
         if not isinstance(first, Mapping):
-            raise AIInvalidOutputError("AI endpoint returned an invalid choice")
+            raise AIInvalidOutputError(
+                "AI endpoint returned an invalid choice",
+                category=AIOutputErrorCategory.PROVIDER_ENVELOPE,
+            )
+        raw_finish_reason = first.get("finish_reason")
+        finish_reason = _normalized_finish_reason(raw_finish_reason)
+        usage = _normalized_usage(decoded.get("usage"))
+        self.last_finish_reason = finish_reason
+        self.last_usage = usage
+        self.last_response_metadata.append(
+            AIResponseMetadata(
+                finish_reason=finish_reason,
+                usage=usage,
+            )
+        )
+        if raw_finish_reason is not None and finish_reason != "stop":
+            raise AIInvalidOutputError(
+                "AI endpoint response did not finish normally",
+                category=AIOutputErrorCategory.INCOMPLETE_RESPONSE,
+            )
         message = first.get("message")
         if not isinstance(message, Mapping):
-            raise AIInvalidOutputError("AI endpoint returned an invalid message")
+            raise AIInvalidOutputError(
+                "AI endpoint returned an invalid message",
+                category=AIOutputErrorCategory.PROVIDER_ENVELOPE,
+            )
         content = message.get("content")
         if not isinstance(content, str):
             raise AIInvalidOutputError(
-                "AI endpoint message content must be a string"
+                "AI endpoint message content must be a string",
+                category=AIOutputErrorCategory.PROVIDER_ENVELOPE,
             )
         decision = parse_decision_content(content)
         # Even if a model ignores the contract, it cannot choose the trusted
@@ -1528,9 +2018,10 @@ class OpenAICompatibleClient:
     ) -> ResearchAction:
         """Return one strictly validated ``final`` or ``search_more`` action.
 
-        Validation feedback constrains this call only. After executing an
-        accepted search and adding its extracts, callers should clear feedback
-        before asking whether the newly expanded evidence can be published.
+        Validation feedback constrains this call only. Existing extracts may
+        support one corrected final proposal; otherwise the fixed gap constrains
+        any supplemental search. The caller still owns bounded retries and local
+        semantic validation.
         """
 
         messages = build_research_messages(
@@ -1543,6 +2034,7 @@ class OpenAICompatibleClient:
             max_evidence_chars=self.settings.max_evidence_chars,
         )
         self.last_research_provider_requests = 0
+        self._reset_response_metadata()
 
         def post(
             request_messages: Sequence[Mapping[str, Any]],
@@ -1561,18 +2053,14 @@ class OpenAICompatibleClient:
 
         try:
             return parse(post(messages))
-        except AIInvalidOutputError:
+        except AIInvalidOutputError as error:
             repair_messages = [
                 *messages,
                 {
                     "role": "user",
-                    "content": (
-                        "The previous response was empty, invalid, or violated "
-                        "the bounded action contract. Retry once. Return exactly "
-                        "one final or search_more JSON object with no prose. A "
-                        "search_more query must use the fixed gap, contain an "
-                        "exact runtime-provided binding term, contain no URL or "
-                        "domain, and cannot authorize trust or publication."
+                    "content": _repair_instruction(
+                        error,
+                        research=True,
                     ),
                 },
             ]
@@ -1595,17 +2083,17 @@ class OpenAICompatibleClient:
             extract=extract,
             max_evidence_chars=self.settings.max_evidence_chars,
         )
+        self._reset_response_metadata()
         try:
             return self._post(messages)
-        except AIInvalidOutputError:
+        except AIInvalidOutputError as error:
             repair_messages = [
                 *messages,
                 {
                     "role": "user",
-                    "content": (
-                        "The previous response was empty or invalid. Retry once. "
-                        "Return exactly one complete JSON object matching the "
-                        "output contract, with no prose or Markdown."
+                    "content": _repair_instruction(
+                        error,
+                        research=False,
                     ),
                 },
             ]
@@ -1619,9 +2107,13 @@ __all__ = [
     "AIError",
     "AIHTTPError",
     "AIInvalidOutputError",
+    "AILocalExecutionError",
     "AINetworkError",
+    "AIOutputErrorCategory",
+    "AIResponseMetadata",
     "AIResponseError",
     "AISettings",
+    "AITimeoutError",
     "FinalAction",
     "MAX_RESEARCH_QUERIES",
     "MAX_RESEARCH_QUERY_HISTORY",

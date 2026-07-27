@@ -2,7 +2,7 @@
 
 PV Wiki turns a read-only PostgreSQL product catalogue into cited,
 reader-facing Wiki.js pages. n8n owns schedules, execution history, bounded
-retries for idempotent or lease-safe calls, and notifications. A separate
+retries for idempotent catalogue/homepage calls, and notifications. A separate
 `pv-wiki-worker` performs one bounded product cycle at a time and owns durable
 queue retry/backoff state:
 
@@ -24,7 +24,7 @@ and must not create a Hermes cron job.
 | Component | Responsibility |
 | --- | --- |
 | Hermes skill | One-time discovery, installation, upgrade, repair, and removal guidance |
-| n8n | Schedule triggers, execution history, bounded retry-safe calls, and system/batch-level alerts |
+| n8n | Schedule triggers, execution history, bounded batches, idempotent-operation retries, and system/batch-level alerts |
 | PV Wiki worker | Product queue/backoff, bounded multi-round research, source validation, and Wiki.js updates |
 | Exa | Bounded public-web discovery and content extraction; never writes Wiki.js |
 | AI provider | Proposes either a final decision or a bounded evidence-gap search; never writes Wiki.js |
@@ -76,23 +76,33 @@ metadata; it does not replace any of the three application databases.
   mentions an accessory bolt, the classification is rejected. A second local
   gate also rejects any `publish` proposal whose model or public category
   itself identifies generic hardware.
-- Uses `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` as an optional source-domain
-  override and fast path, not as a complete manufacturer registry.
-- When no mapping matches, automatically verifies only an HTTPS manufacturer
-  host whose name is consistent with the AI-discovered manufacturer and whose
-  extracted body contains both that manufacturer and the complete product
-  model. A second independent HTTPS extract must corroborate the identity, and
-  every published fact must have exact quotes from both domains. A failed check
+- Uses `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` to map an operator-owned catalogue
+  `brand_code` to its public manufacturer name. Raw brand codes are never
+  substituted by AI output. `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` separately
+  maps that catalogue brand or its exact public alias to narrow trusted hosts.
+- When no trusted-domain mapping matches, automatically verifies only an HTTPS
+  manufacturer host whose name is consistent with the operator-approved public
+  alias when one is configured, or otherwise with the AI-discovered public
+  manufacturer. Its extracted body must contain both that manufacturer and the
+  complete product model. A second independent HTTPS extract must corroborate
+  that manufacturer and complete model. Specification facts themselves are
+  quoted from the verified primary manufacturer datasheet; they do not each
+  need a duplicate quote from the independent identity source. A failed check
   becomes `source_unverified` and cannot publish.
 - Separates a descriptive catalogue name from its public model identity. A
   proposed model must be a complete distinctive model embedded in the name or
   an eligible alphanumeric catalogue code when internal search hints are
   explicitly enabled, and only cited extracts—not unrelated successful
   candidates—must contain that bound model.
-- Allows multi-model series datasheets into analysis, while requiring every
-  published fact to use a target-model-only span with no sibling/revision.
-- Keeps database IDs, family codes, lease tokens, and secrets out of the model
-  prompt.
+- Allows multi-model series datasheets into analysis. A normal prose/target-only
+  row still needs one exact model/label/value quote. A Markdown-pipe or TSV
+  table may instead provide `model_quote` for the exact model-header row and
+  `quote` for the exact parameter row; the runtime accepts it only when the
+  target model occurs in one unique header cell and the selected value is
+  unambiguous in the same column.
+- Keeps family codes, lease tokens, secrets, and unapproved database IDs out of
+  the model prompt. Only an explicitly enabled, short ASCII model-shaped
+  `product_id` may be promoted to the public model hint.
 - Validates exact source URLs, source trust, confidence, conflicts, public
   category, five unique facts, and source-grounded model/label/value evidence
   spans before a page can publish. Ordinary URL/domain constraints accidentally
@@ -104,6 +114,21 @@ metadata; it does not replace any of the three application databases.
 - Creates new Wiki.js pages as private, unpublished drafts by default.
 - Records valid non-publish outcomes in SQLite and retries them automatically;
   it does not create a per-product AI issue or manual-review queue.
+- Selects eligible `due` and matured `backoff` products with an approximately
+  4:1 weighted preference, falling back to the other class when one is empty.
+  Six consecutive content failures for one unchanged source revision cause a
+  `content_quarantined` annual wait; a catalogue source change wakes the
+  product immediately.
+- Supports optional UTC-wide research stop-losses through
+  `PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT` and
+  `PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT`. Zero disables the corresponding
+  window; each non-zero limit must be at least the per-product
+  `PV_WIKI_RESEARCH_MAX_CREDITS`. Immediately before paid research, the worker
+  reserves that full per-product maximum. Insufficient remaining headroom or
+  any unknown/uncertain Exa usage in the active window stops fail-closed,
+  restores the product's exact prior queue state, and reports its UTC resume
+  boundary. These limits count audited Exa Search/Extract units, not AI tokens
+  or currency; keep provider-account spend limits enabled for AI.
 - Persists every Search, Extract, and AI action before execution. A current
   attempt cannot replay an action slot, and any unresolved `started` or
   `uncertain` action blocks later calls while its action-specific provider and
@@ -127,8 +152,8 @@ The production bundle is in [`deploy/n8n`](deploy/n8n/README.md). It includes:
 - an optional Caddy HTTPS overlay;
 - two secret-free, inactive workflow templates:
   - `PV Wiki - Product Cycle` starts on the existing monthly quota cadence
-    and serially processes products until the queue is empty or every
-    configured key has exhausted its credits; a daily non-quota-waking
+    and makes at most 15 serial product calls per workflow execution, without
+    starting a new call after 45 minutes; a daily non-quota-waking
     catalogue refresh recovers partial/failed source scans, and an hourly
     trigger resumes due/backoff work without rerunning the catalogue sync;
   - `PV Wiki - Homepage Refresh` daily at 02:35 Asia/Shanghai.
@@ -139,10 +164,15 @@ deliberately review-gated:
 1. Copy and fill `deploy/n8n/.env.example` and
    `deploy/n8n/worker.env.example`; keep both actual files mode `0600`.
 2. Configure `EXA_API_KEYS` (or `EXA_API_KEY`), then select `AI_BASE_URL`,
-   `AI_API_KEY`, and `AI_MODEL`. Optionally configure
-   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` with known public-manufacturer domain
-   overrides to speed up source verification. AI-discovered manufacturer names
-   take precedence over possibly stale internal brand codes.
+   `AI_API_KEY`, and `AI_MODEL`. Configure
+   `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` for catalogue brands that need an
+   operator-approved public manufacturer identity. Optionally configure
+   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`, keyed by the exact catalogue brand or
+   public alias, with narrow trusted hosts. AI output cannot select or replace
+   either mapping. A trusted-domain override also requires the corresponding
+   public brand alias so the runtime has an operator-approved manufacturer
+   identity. Set the optional global daily/monthly credit limits before
+   unattended operation; their default `0` values disable those stop-losses.
 3. Start the Compose project or attach only the worker to an existing n8n
    network.
 4. Import the workflows while inactive.
@@ -159,21 +189,27 @@ they are silently audited and scheduled for an appropriate retry. They do not
 open issues. Notifications are reserved for failures that stop or materially
 impair a workflow batch, such as provider, configuration, database, or service
 outages. Five consecutive invalid decisions affecting distinct products inside
-30 minutes open one batch-level decision circuit before more products are
-leased. A recent AI 401/402/403/404 opens a six-hour
-provider-configuration circuit, and AI 429 opens a one-hour rate-limit circuit,
-so the loop stops before spending search budget on more products through a
-known-bad AI path. Invalid AI output on three distinct products within the same
-one-hour provider scope opens the same pre-search batch stop. Configuration
-rejections and repeated invalid output return a service error after recording
-the product outcome, so n8n's bounded retries end in one batch-level alert.
-The 429 circuit is expected transient state and returns a clean automatic stop.
+30 minutes open one batch-level decision circuit before more paid research. A
+recent AI 401/402/403/404 or Exa 401/403/404 opens a six-hour provider circuit,
+either provider's 429 opens a one-hour rate-limit circuit, and exhausted Exa
+keys open through the next UTC month. Invalid AI output on three distinct products
+within the same one-hour provider scope opens the same pre-search batch stop.
+These gates are checked after local-only handling but before paid research.
+While open they audit `system_paused`, restore the product's prior queue state,
+and return a clean `processed=false` response. Exact resume times are returned
+for provider rejection/rate-limit and quota gates; decision/output gates expose
+their bounded windows in authenticated status. n8n does not automatically
+retry `Run One Product`; a request failure stops that execution for one
+batch-level alert.
 If an explicit quota/4xx response follows an earlier completed subrequest, the
 known partial credits are audited and the action remains automatically
 retryable; only genuinely ambiguous paid requests are replay-suppressed.
 
-n8n remains the outer supervisor: it schedules batches and repeatedly calls
-the fixed `/run-one` endpoint. The worker owns the inner evidence feedback
+n8n remains the outer supervisor: it schedules bounded batches and repeatedly
+calls the fixed `/run-one` endpoint at most 15 times, stopping before a new
+call once 45 minutes has elapsed. `Run One Product` has no automatic retry,
+because another call can lease a different queue item. The worker owns the
+inner evidence feedback
 loop, leases, paid-call ledger, source trust, and final Wiki.js permission, so
 n8n does not need search, AI, catalogue, or Wiki.js credentials.
 
@@ -185,12 +221,16 @@ deployment level; this is not a per-product approval step.
 The worker exposes only:
 
 - `GET /healthz`
+- `GET /status`
 - `POST /sync-catalogue`
 - `POST /refresh-catalogue`
 - `POST /run-one`
 - `POST /publish-home`
 
-All POST operations require the separate `PV_WIKI_WORKER_TOKEN`. An overlapping
+`GET /status` and all POST operations require the separate
+`PV_WIKI_WORKER_TOKEN`; only `/healthz` is public. The authenticated status
+response reports redacted queue, global-budget, and circuit readiness without
+making paid probes. An overlapping
 scheduled `/run-one` stops cleanly with `worker_busy`. Catalogue synchronization
 has its own serialized lock and may safely overlap research; source changes
 invalidate the leased snapshot and are rescheduled. A shared publication fence
@@ -201,10 +241,15 @@ serialized lock because it targets a different Wiki path. This fence is
 process-local: the supported deployment runs exactly one worker replica, and
 scheduled mutations must use its authenticated HTTP endpoints rather than a
 concurrent direct CLI process. Other same-operation conflicts are rejected.
-Exa HTTP 402 responses rotate to the next configured key.
-The product workflow stops cleanly only when no product is due or all configured
-keys are out of monthly credits; HTTP 429 remains a transient request-rate
-limit.
+Exa HTTP 402 responses rotate to the next configured key. AI and Exa
+provider-global rejection/rate-limit circuits, Exa monthly quota, decision and
+invalid-output circuits, and the global daily/monthly Exa research budget are
+checked after local-only handling but before another paid call. A pause writes
+an audit-only `system_paused` attempt and restores the product without changing
+its failure count or last outcome. This still allows empty-identity handling,
+content quarantine, and same-source Wiki-only publication recovery. The
+product workflow also stops cleanly for an open circuit, no due product, or the
+n8n 15-call/45-minute batch boundary.
 
 Catalogue sync is intentionally history-preserving. A product absent from a
 later PostgreSQL snapshot is not automatically deleted, archived, or removed

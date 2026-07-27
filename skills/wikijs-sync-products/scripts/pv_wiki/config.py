@@ -283,6 +283,31 @@ class ResearchSettings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class GlobalResearchBudgetSettings:
+    """UTC stop-loss limits across all products; zero disables one window."""
+
+    daily_credit_limit: int
+    monthly_credit_limit: int
+
+    @classmethod
+    def from_env(cls) -> "GlobalResearchBudgetSettings":
+        return cls(
+            daily_credit_limit=_int_env(
+                "PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT",
+                0,
+                0,
+                1_000_000,
+            ),
+            monthly_credit_limit=_int_env(
+                "PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT",
+                0,
+                0,
+                10_000_000,
+            ),
+        )
+
+
 def min_publish_confidence() -> float:
     return _float_env("PV_WIKI_AUTO_PUBLISH_MIN_CONFIDENCE", 0.85, 0.5, 1.0)
 
@@ -344,6 +369,94 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             )
         result[key] = value
     return result
+
+
+def _unique_public_alias_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON has duplicate keys"
+            )
+        result[key] = value
+    return result
+
+
+def public_brand_alias_map() -> dict[str, str]:
+    """Return operator-approved public manufacturer names by catalogue brand.
+
+    Catalogue brand codes are internal authority boundaries.  The configured
+    value is the public manufacturer identity that may be sent to providers
+    and used for automatic manufacturer-domain verification.
+    """
+
+    raw = os.getenv("PV_WIKI_PUBLIC_BRAND_ALIASES_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_unique_public_alias_object,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ConfigError(
+            "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON must be a JSON object"
+        ) from exc
+    if not isinstance(value, dict) or len(value) > 500:
+        raise ConfigError(
+            "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON must be a JSON object "
+            "with at most 500 entries"
+        )
+
+    mapping: dict[str, str] = {}
+    for raw_brand, raw_alias in value.items():
+        if (
+            not isinstance(raw_brand, str)
+            or not raw_brand.strip()
+            or len(raw_brand.strip()) > 200
+            or any(ord(character) < 32 for character in raw_brand)
+        ):
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON keys must be non-empty "
+                "catalogue brand strings"
+            )
+        brand = raw_brand.strip().casefold()
+        if brand in mapping:
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON has duplicate "
+                "case-insensitive catalogue brands"
+            )
+        if (
+            not isinstance(raw_alias, str)
+            or not raw_alias.strip()
+            or len(raw_alias.strip()) > 200
+            or any(ord(character) < 32 for character in raw_alias)
+            or not any(character.isalpha() for character in raw_alias)
+            or len(
+                "".join(
+                    character
+                    for character in raw_alias.casefold()
+                    if character.isalnum()
+                )
+            ) < 2
+            or "://" in raw_alias
+            or any(character in raw_alias for character in "{}[]<>")
+        ):
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON values must be bounded "
+                "public manufacturer names"
+            )
+        mapping[brand] = " ".join(raw_alias.split())
+    return mapping
+
+
+def public_brand_alias(brand_code: str | None) -> str:
+    """Resolve an explicitly approved public name for one catalogue brand."""
+
+    brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
+    return public_brand_alias_map().get(brand, "") if brand else ""
 
 
 def trusted_source_domain_map() -> dict[str, frozenset[str]]:
@@ -418,24 +531,27 @@ def trusted_source_domains_for_product(
     brand_code: str | None,
     discovered_manufacturer: str | None,
 ) -> frozenset[str]:
-    """Return the override bound to the best available public identity.
+    """Return the override bound to the operator-owned catalogue identity.
 
-    The AI-discovered manufacturer takes precedence and is never unioned with
-    a possibly stale internal brand code.  The brand code is only a fallback
-    before a public manufacturer is available.  Missing entries are normal;
-    the decision validator can independently verify a manufacturer host from
-    current evidence, so this is not a per-brand approval queue.
+    ``discovered_manufacturer`` remains in the signature for compatibility,
+    but model output is never allowed to select or replace a trusted-domain
+    entry.  Operators can map legacy brand codes directly in the trusted
+    domain map and publish a separate public name via the explicit alias map.
     """
 
     mapping = trusted_source_domain_map()
     brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
-    manufacturer = (
-        discovered_manufacturer.strip().casefold()
-        if isinstance(discovered_manufacturer, str)
-        else ""
-    )
-    identity = manufacturer or brand
-    return mapping.get(identity, frozenset()) if identity else frozenset()
+    if not brand:
+        return frozenset()
+    alias = public_brand_alias_map().get(brand, "").casefold()
+    brand_domains = mapping.get(brand, frozenset())
+    alias_domains = mapping.get(alias, frozenset()) if alias else frozenset()
+    if brand_domains and alias_domains and brand_domains != alias_domains:
+        raise ConfigError(
+            "trusted source domains conflict between the catalogue brand "
+            "and its explicit public alias"
+        )
+    return brand_domains or alias_domains
 
 
 def missing_environment(names: list[str] | tuple[str, ...]) -> list[str]:
@@ -449,6 +565,7 @@ def missing_environment(names: list[str] | tuple[str, ...]) -> list[str]:
 
 __all__ = [
     "ConfigError",
+    "GlobalResearchBudgetSettings",
     "ResearchSettings",
     "TrustedSourceNotConfigured",
     "WikiSettings",
@@ -460,6 +577,8 @@ __all__ = [
     "min_fact_confidence",
     "min_publish_confidence",
     "missing_environment",
+    "public_brand_alias",
+    "public_brand_alias_map",
     "redact_environment_secrets",
     "state_path",
     "trusted_source_domain_map",

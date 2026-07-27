@@ -8,7 +8,9 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -66,6 +68,77 @@ class WorkerSettingsTests(unittest.TestCase):
         self.assertEqual("failed [REDACTED] then [REDACTED]", message)
 
 
+class WorkerStatusTests(unittest.TestCase):
+    def test_open_circuits_make_readiness_false_without_exposing_config(
+        self,
+    ) -> None:
+        store = mock.MagicMock()
+        store.schema_version = 9
+        store.status_counts.return_value = {
+            "due": 2,
+            "leased": 0,
+            "backoff": 3,
+            "synced": 4,
+        }
+        store.due_count.return_value = 3
+        store.recent_distinct_outcome_streak.return_value = 5
+        rate_limit_event = SimpleNamespace(
+            http_status=429,
+            expires_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=30)
+            ),
+        )
+        store.recent_ai_provider_rejection_event.side_effect = [
+            None,
+            rate_limit_event,
+        ]
+        store.recent_ai_provider_error_products.return_value = 3
+        store.recent_exa_provider_rejection.return_value = None
+        store.recent_exa_provider_error.return_value = None
+        context = mock.MagicMock()
+        context.__enter__.return_value = store
+
+        api_key = "sk-" + ("z" * 40)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PV_WIKI_STATE_PATH": "/tmp/not-opened.sqlite3",
+                    "AI_BASE_URL": "https://api.deepseek.com",
+                    "AI_API_KEY": api_key,
+                    "AI_MODEL": "deepseek-chat",
+                    "EXA_API_KEY": "exa-test-key",
+                },
+                clear=True,
+            ),
+            mock.patch.object(server, "StateStore", return_value=context),
+        ):
+            payload = server.status()
+
+        self.assertFalse(payload["ready"])
+        self.assertEqual(3, payload["queue"]["due_now"])
+        self.assertTrue(payload["circuits"]["decision"]["open"])
+        self.assertTrue(payload["circuits"]["ai_provider"]["open"])
+        self.assertEqual(
+            "rate_limit",
+            payload["circuits"]["ai_provider"]["reason"],
+        )
+        self.assertTrue(payload["circuits"]["ai_output"]["open"])
+        self.assertEqual({"paused": False}, payload["research_budget"])
+        self.assertEqual(
+            {
+                "decision_circuit_open",
+                "ai_provider_circuit_open",
+                "ai_output_circuit_open",
+            },
+            {
+                issue["type"]
+                for issue in payload["readiness_issues"]
+            },
+        )
+        self.assertNotIn(api_key, json.dumps(payload))
+
+
 class WorkerHTTPTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -74,7 +147,11 @@ class WorkerHTTPTests(unittest.TestCase):
             {
                 "PV_WIKI_STATE_PATH": str(
                     Path(self.tempdir.name) / "state.sqlite3"
-                )
+                ),
+                "AI_BASE_URL": "https://api.deepseek.com",
+                "AI_API_KEY": "sk-" + ("a" * 40),
+                "AI_MODEL": "deepseek-chat",
+                "EXA_API_KEY": "exa-test-key",
             },
             clear=True,
         )
@@ -174,6 +251,92 @@ class WorkerHTTPTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(payload["ok"])
         self.assertEqual(1, self.calls)
+
+    def test_status_requires_auth_and_exposes_redacted_readiness(self) -> None:
+        status_code, payload = self.request("GET", "/status")
+        self.assertEqual(401, status_code)
+        self.assertEqual("unauthorized", payload["error"])
+
+        status_code, payload = self.request(
+            "GET",
+            "/status",
+            authorized=True,
+        )
+        self.assertEqual(200, status_code)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["ready"])
+        self.assertEqual(
+            {"due": 0, "leased": 0, "backoff": 0, "synced": 0},
+            payload["queue"]["counts"],
+        )
+        self.assertEqual(0, payload["queue"]["due_now"])
+        self.assertEqual(
+            {"decision", "ai_provider", "ai_output", "exa_provider"},
+            set(payload["circuits"]),
+        )
+        self.assertEqual({"paused": False}, payload["research_budget"])
+        self.assertEqual(
+            {
+                "run_one_busy": False,
+                "catalogue_busy": False,
+                "homepage_busy": False,
+            },
+            payload["operations"],
+        )
+        self.assertNotIn(
+            os.environ["AI_API_KEY"],
+            json.dumps(payload),
+        )
+
+    def test_status_reports_ai_configuration_failure_without_a_secret(
+        self,
+    ) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AI_API_KEY": "secret-that-must-not-be-returned",
+                "AI_MODEL": "",
+            },
+        ):
+            status_code, payload = self.request(
+                "GET",
+                "/status",
+                authorized=True,
+            )
+        self.assertEqual(200, status_code)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["ready"])
+        self.assertIsNone(payload["circuits"]["ai_provider"]["open"])
+        self.assertEqual(
+            "ai_configuration_invalid",
+            payload["readiness_issues"][0]["type"],
+        )
+        self.assertNotIn(
+            "secret-that-must-not-be-returned",
+            json.dumps(payload),
+        )
+
+    def test_status_reports_invalid_global_budget_configuration(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT": "invalid"},
+        ):
+            status_code, payload = self.request(
+                "GET",
+                "/status",
+                authorized=True,
+            )
+
+        self.assertEqual(200, status_code)
+        self.assertFalse(payload["ready"])
+        self.assertIsNone(payload["research_budget"]["paused"])
+        self.assertIn(
+            "global_research_budget_configuration_invalid",
+            {
+                issue["type"]
+                for issue in payload["readiness_issues"]
+            },
+        )
 
     def test_unknown_paths_and_nonempty_inputs_fail_closed(self) -> None:
         status, _ = self.request(

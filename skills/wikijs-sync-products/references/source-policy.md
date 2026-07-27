@@ -13,6 +13,12 @@ not public product categories and must not be used to infer product type. A
 shared family name or partial model is not enough. If two variants remain
 plausible, return `ambiguous`.
 
+`brand_code` is not itself a public identity. The operator may map it to a
+public manufacturer with `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON`; only that
+explicit alias may be used as a manufacturer search hint when internal hints
+are enabled, or as the hard manufacturer boundary for publication. AI output
+cannot replace the alias.
+
 Bounded search titles/snippets are untrusted discovery hints; their URLs are
 withheld from the model. Successful extracts are used to discover the public
 manufacturer and product type. Keep
@@ -67,48 +73,57 @@ official document. A mirror may substitute only when explicitly enabled and
 corroborated by a second independent source.
 
 `source_type` is an AI proposal, not an authorization decision.
-`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` is an optional public-manufacturer alias
-override and verification fast path; it is not a required complete registry.
-The AI-discovered manufacturer takes precedence over internal brand codes and
-the two identities are never unioned. When no configured entry matches, the
-runtime may accept a manufacturer source only when all of these conditions
-hold:
+`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` is an optional narrow-host override and
+verification fast path keyed by an exact catalogue brand or by that brand's
+configured public alias. If both keys are configured with different domain
+sets, configuration fails closed. AI output never selects or replaces this
+mapping, and a domain override is usable only when the catalogue brand also
+has an explicit public alias. When no configured entry matches, the runtime
+may accept a manufacturer source only when all of these conditions hold:
 
 - the URL uses HTTPS;
 - neither identity source is an IP literal or a shared tenant-hosting domain;
-- the manufacturer hostname is consistent with the public manufacturer name
-  discovered by AI;
+- the manufacturer hostname is consistent with the public manufacturer name;
 - the same bounded extract contains both that manufacturer and the complete
   normalized catalogue product model;
 - a second independent HTTPS registrable organization has an extract that
-  corroborates the same manufacturer and model; and
-- every published fact has an exact supporting quote on both the manufacturer
-  candidate and that second non-community domain.
+  corroborates the same manufacturer and complete model; and
+- every published specification fact has an exact supporting quote from the
+  verified primary manufacturer datasheet.
 
 The model cannot grant trust on its own. If the automatic gate cannot establish
 all conditions, the runtime returns `source_unverified`, publishes
 nothing, records the result, and schedules an automatic retry without opening a
 per-product issue or asking for manual escalation. This automatic path is a
 cross-source confidence rule rather than cryptographic proof of domain
-ownership; configured overrides remain the deterministic fast path. Every
-specification must cite a verified source; explicitly enabled mirror fallback
-requires two independent mirror domains for every fact. A bounded extract may
-cover sibling models in the same series, but the model cannot grant product
-identity.
+ownership; configured overrides remain the deterministic fast path. The
+independent identity source need not duplicate every specification fact.
+Every specification must cite a verified primary source; explicitly enabled
+mirror fallback requires two independent mirror domains for every fact. A
+bounded extract may cover sibling models in the same series, but the model
+cannot grant product identity.
 
 ## Evidence
 
 Every fact is a compact object with `name`, `value`, optional `unit`,
 optional datasheet section `category`, `confidence`, `evidence_urls`, and
-`evidence_quotes`. Keep `name` equal to the exact source field label. Each
-short quote is grounded back to an actual contiguous span from the cited
-bounded extract and must contain
-the full target model, field label, and selected value, without a sibling
-model or revision in that span; translated labels belong in surrounding prose,
-not the verified fact name. Extract the complete target-specific row or cell
-context; do not infer a missing value from a nearby model column. If the search
-provider's flattened text cannot preserve an unambiguous target-model span,
-return `ambiguous`. Capture detailed official specifications across
+`evidence_quotes`. Keep `name` equal to the exact source field label. Two
+fail-closed evidence forms are accepted:
+
+- ordinary prose or a target-only row uses `{url, quote}`; the grounded
+  contiguous quote must contain the complete target model, field label, and
+  selected value without a sibling model/revision;
+- a Markdown-pipe or TSV multi-model table uses
+  `{url, model_quote, quote}`. `model_quote` is the exact model-header row and
+  `quote` the exact parameter row from the same extracted URL. They must have
+  the same explicit cell count, the complete target model must occur in one
+  unique header cell, the fact label in one non-target cell, and the selected
+  value/unit unambiguously in the same target column.
+
+Translated labels belong in surrounding prose, not the verified fact name. Do
+not infer a value from a nearby model column or treat prose spacing as table
+structure. If the extract cannot preserve an unambiguous binding, return
+`ambiguous`. Capture detailed official specifications across
 efficiency, input, output, storage, protection, communication, and physical or
 environmental sections when present. Publication requires at least five cited
 specification facts. If sources conflict, add a `conflicts` entry and omit the

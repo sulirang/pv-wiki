@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy" / "n8n"
+BACKUP_DEPLOY = ROOT / "deploy" / "backup"
 
 
 class ComposeTests(unittest.TestCase):
@@ -106,6 +108,7 @@ class WorkflowTemplateTests(unittest.TestCase):
             "n8n-nodes-base.scheduleTrigger",
             "n8n-nodes-base.httpRequest",
             "n8n-nodes-base.if",
+            "n8n-nodes-base.set",
         }
         paths = sorted((DEPLOY / "workflows").glob("*.json"))
         self.assertEqual(2, len(paths))
@@ -182,7 +185,7 @@ class WorkflowTemplateTests(unittest.TestCase):
         self.assertEqual(1, hourly_interval["hoursInterval"])
         self.assertEqual(47, hourly_interval["triggerAtMinute"])
         self.assertEqual(
-            "Run One Product",
+            "Initialize Batch",
             product["connections"]["Hourly Due Recovery"]["main"][0][0][
                 "node"
             ],
@@ -204,8 +207,27 @@ class WorkflowTemplateTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            "Run One Product",
+            "Initialize Batch",
             product["connections"]["Refresh Catalogue"]["main"][0][0]["node"],
+        )
+        self.assertEqual(
+            "Initialize Batch",
+            product["connections"]["Sync Catalogue"]["main"][0][0]["node"],
+        )
+        initialize_batch = next(
+            node
+            for node in product["nodes"]
+            if node["name"] == "Initialize Batch"
+        )
+        assignments = initialize_batch["parameters"]["assignments"][
+            "assignments"
+        ]
+        self.assertEqual(1, len(assignments))
+        self.assertEqual("batchStartedAt", assignments[0]["name"])
+        self.assertEqual("={{ $now.toMillis() }}", assignments[0]["value"])
+        self.assertEqual(
+            "Run One Product",
+            product["connections"]["Initialize Batch"]["main"][0][0]["node"],
         )
 
         continue_node = next(
@@ -214,7 +236,11 @@ class WorkflowTemplateTests(unittest.TestCase):
             if node["name"] == "Continue While Processed"
         )
         condition = continue_node["parameters"]["conditions"]["conditions"][0]
-        self.assertEqual("={{ $json.processed }}", condition["leftValue"])
+        expression = condition["leftValue"]
+        self.assertIn("$json.processed === true", expression)
+        self.assertIn("$runIndex < 14", expression)
+        self.assertIn("< 2700000", expression)
+        self.assertIn("$('Initialize Batch').first()", expression)
         self.assertEqual("true", condition["operator"]["operation"])
         loop_outputs = product["connections"]["Continue While Processed"]["main"]
         self.assertEqual("Run One Product", loop_outputs[0][0]["node"])
@@ -242,13 +268,31 @@ class WorkflowTemplateTests(unittest.TestCase):
                 node["parameters"]["options"]["timeout"],
                 600_000,
             )
-        self.assertTrue(run_one["retryOnFail"])
-        self.assertEqual(3, run_one["maxTries"])
-        self.assertEqual(60000, run_one["waitBetweenTries"])
+        self.assertNotIn("retryOnFail", run_one)
+        self.assertNotIn("maxTries", run_one)
+        self.assertNotIn("waitBetweenTries", run_one)
         self.assertGreaterEqual(
             run_one["parameters"]["options"]["timeout"],
             2_400_000,
         )
+
+
+class BackupDeploymentTests(unittest.TestCase):
+    def test_backup_script_is_bounded_and_syntax_valid(self) -> None:
+        script = BACKUP_DEPLOY / "pv-wiki-backup"
+        subprocess.run(
+            ["bash", "-n", str(script)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        body = script.read_text(encoding="utf-8")
+        self.assertIn("source.backup(destination)", body)
+        self.assertIn("PRAGMA quick_check", body)
+        self.assertIn("n8n export:workflow --all", body)
+        self.assertIn("n8n-config", body)
+        self.assertNotIn("rm -rf", body)
+        self.assertNotIn("find ", body)
 
 
 if __name__ == "__main__":

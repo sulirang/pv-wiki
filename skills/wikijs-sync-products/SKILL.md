@@ -1,7 +1,7 @@
 ---
 name: wikijs-sync-products
 description: Install, upgrade, repair, or remove the PV Wiki n8n automation on a user-authorized VPS. Discover an existing n8n or deploy a dedicated instance, deploy the internal PV Wiki worker, collect user-selected search/AI/Wiki/database settings, import inactive workflows, and run acceptance checks. Do not use this skill as the recurring product updater and do not create a Hermes cron job.
-version: 0.2.0
+version: 0.3.0
 author: sulirang
 license: MIT
 platforms:

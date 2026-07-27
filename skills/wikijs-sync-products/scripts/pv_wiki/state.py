@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 BACKOFF_DAYS = (30, 90, 180)
 TRANSIENT_BACKOFF_HOURS = (1, 6, 24)
 INVALID_DECISION_BACKOFF_HOURS = (24, 72, 168, 720)
@@ -87,6 +87,33 @@ _RESEARCH_AI_OUTCOMES = frozenset(
         "out_of_scope",
     }
 )
+_RESEARCH_AI_ERROR_CATEGORIES = frozenset(
+    {
+        "empty_content",
+        "invalid_json",
+        "provider_envelope",
+        "incomplete_response",
+        "decision_contract",
+        "action_contract",
+        "search_query_contract",
+    }
+)
+_RESEARCH_AI_USAGE_KEYS = frozenset(
+    {
+        "accepted_prediction_tokens",
+        "cache_hit_tokens",
+        "cache_miss_tokens",
+        "cached_tokens",
+        "completion_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "prompt_tokens",
+        "reasoning_tokens",
+        "rejected_prediction_tokens",
+        "total_tokens",
+    }
+)
+MAX_RESEARCH_AI_TOKEN_USAGE = 1_000_000_000
 TRANSIENT_OUTCOMES = frozenset(
     {
         "tavily_error",  # Legacy persisted value from pre-Exa workers.
@@ -110,6 +137,21 @@ PRODUCT_SOURCE_FIELDS = (
     "updated_at",
 )
 PRODUCT_STATUSES = ("due", "leased", "backoff", "synced")
+DUE_QUEUE_WEIGHT = 4
+BACKOFF_QUEUE_WEIGHT = 1
+CONTENT_FAILURE_OUTCOMES = frozenset(
+    {
+        "ambiguous",
+        "insufficient_identity",
+        "invalid_decision",
+        "no_datasheet",
+        "out_of_scope",
+        "source_unverified",
+    }
+)
+MAX_REQUEUE_OUTCOMES = 32
+MAX_REQUEUE_REASON_LENGTH = 200
+MAX_SYSTEM_PAUSE_REASON_LENGTH = 200
 
 _CREATE_SCHEMA = (
     """
@@ -212,6 +254,30 @@ _CREATE_RESEARCH_ACTION_SCHEMA = (
     """,
 )
 
+_CREATE_REQUEUE_EVENT_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS requeue_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id TEXT NOT NULL
+            REFERENCES products(product_id) ON DELETE CASCADE,
+        cutoff_attempt_id INTEGER NOT NULL
+            REFERENCES attempts(attempt_id),
+        previous_status TEXT NOT NULL
+            CHECK (previous_status IN ('backoff', 'synced')),
+        previous_outcome TEXT NOT NULL,
+        reason TEXT NOT NULL
+            CHECK (length(reason) BETWEEN 1 AND 200),
+        attempted_after TEXT,
+        attempted_before TEXT,
+        requeued_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS requeue_events_product_idx
+        ON requeue_events(product_id, event_id)
+    """,
+)
+
 
 class StateError(RuntimeError):
     """Base class for durable scheduler state errors."""
@@ -261,6 +327,9 @@ class ProductState:
     last_success_at: datetime | None
     last_outcome: str | None
     last_error: str | None
+    content_failure_cutoff_attempt_id: int
+    leased_from_status: str | None
+    leased_from_next_run_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,6 +404,21 @@ class AttemptRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class RequeueEventRecord:
+    """One successful operator requeue and its content-policy boundary."""
+
+    event_id: int
+    product_id: str
+    cutoff_attempt_id: int
+    previous_status: str
+    previous_outcome: str
+    reason: str
+    attempted_after: datetime | None
+    attempted_before: datetime | None
+    requeued_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchActionRecord:
     """One at-most-once paid or externally visible research action."""
 
@@ -351,6 +435,30 @@ class ResearchActionRecord:
     result_summary: Any
     credits: float | None
     error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRejectionRecord:
+    """Latest provider-global rejection and its exact circuit expiry."""
+
+    action: str
+    research_status: str
+    http_status: int
+    error_type: str | None
+    finished_at: datetime
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderErrorRecord:
+    """Latest provider error, including errors without an HTTP response."""
+
+    action: str
+    research_status: str
+    error_type: str
+    http_status: int | None
+    finished_at: datetime
+    expires_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -377,6 +485,119 @@ def _utc(value: datetime | None = None) -> datetime:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _strict_utc_datetime(value: Any, *, name: str) -> datetime:
+    """Validate an operator-supplied instant and normalize it to UTC."""
+
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _outcome_filter(values: Any, *, name: str = "outcomes") -> tuple[str, ...]:
+    if isinstance(values, (str, bytes, bytearray)) or not isinstance(
+        values,
+        Iterable,
+    ):
+        raise TypeError(f"{name} must be an iterable of outcome strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must contain only strings")
+        outcome = value.strip().casefold()
+        if not re.fullmatch(r"[a-z][a-z0-9_:-]{0,99}", outcome):
+            raise ValueError(
+                f"{name} must contain bounded lowercase outcome identifiers"
+            )
+        if outcome not in seen:
+            seen.add(outcome)
+            normalized.append(outcome)
+    if not normalized:
+        raise ValueError(f"{name} must not be empty")
+    if len(normalized) > MAX_REQUEUE_OUTCOMES:
+        raise ValueError(
+            f"{name} may contain at most {MAX_REQUEUE_OUTCOMES} values"
+        )
+    return tuple(normalized)
+
+
+def _research_action_filter(
+    values: Any,
+    *,
+    name: str = "actions",
+) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes, bytearray)) or not isinstance(
+        values,
+        Iterable,
+    ):
+        raise TypeError(f"{name} must be an iterable of research actions")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        action = _research_action_name(value)
+        if action not in seen:
+            seen.add(action)
+            normalized.append(action)
+    if not normalized:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(normalized)
+
+
+def _http_status_filter(
+    values: Any,
+    *,
+    name: str = "http_statuses",
+) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes, bytearray)) or not isinstance(
+        values,
+        Iterable,
+    ):
+        raise TypeError(f"{name} must be an iterable of integers")
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 100 <= value <= 599
+        ):
+            raise ValueError(f"{name} must contain HTTP statuses from 100 to 599")
+        if value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    if not normalized:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(normalized)
+
+
+def _error_type_filter(
+    values: Any,
+    *,
+    name: str = "error_types",
+) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes, bytearray)) or not isinstance(
+        values,
+        Iterable,
+    ):
+        raise TypeError(f"{name} must be an iterable of strings")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must contain only strings")
+        error_type = value.strip()
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", error_type) is None:
+            raise ValueError(f"{name} must contain bounded class names")
+        if error_type not in seen:
+            seen.add(error_type)
+            normalized.append(error_type)
+    if not normalized:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(normalized)
 
 
 def next_month_start(value: datetime | None = None) -> datetime:
@@ -620,7 +841,18 @@ def _research_result_summary_json(
     if not isinstance(value, Mapping):
         raise TypeError("research result_summary must be a mapping")
     summary = dict(value)
+    # Token metadata uses names such as ``prompt_tokens`` that deliberately
+    # overlap the generic response-body key detector. Remove this one
+    # explicitly bounded field while scanning all other summary values, then
+    # restore it for the numeric whitelist validation below.
+    usage_totals_marker = object()
+    raw_usage_totals = summary.pop(
+        "usage_totals",
+        usage_totals_marker,
+    )
     _reject_research_bodies(summary)
+    if raw_usage_totals is not usage_totals_marker:
+        summary["usage_totals"] = raw_usage_totals
     allowed_fields = {
         "search": frozenset(
             {
@@ -630,6 +862,9 @@ def _research_result_summary_json(
                 "provider_requests",
                 "completed_provider_requests",
                 "known_partial_credits",
+                "provider_fingerprint",
+                "http_status",
+                "error_type",
             }
         ),
         "extract": frozenset(
@@ -639,6 +874,9 @@ def _research_result_summary_json(
                 "provider_requests",
                 "completed_provider_requests",
                 "known_partial_credits",
+                "provider_fingerprint",
+                "http_status",
+                "error_type",
             }
         ),
         "ai": frozenset(
@@ -652,6 +890,9 @@ def _research_result_summary_json(
                 "provider_fingerprint",
                 "http_status",
                 "error_type",
+                "error_category",
+                "finish_reasons",
+                "usage_totals",
             }
         ),
     }[action]
@@ -752,6 +993,58 @@ def _research_result_summary_json(
             is None
         ):
             raise ValueError("error_type must be a bounded class name")
+    if "error_category" in summary:
+        summary["error_category"] = _bounded_summary_text(
+            summary["error_category"],
+            name="error_category",
+            maximum=50,
+            allowed=_RESEARCH_AI_ERROR_CATEGORIES,
+        )
+    if "finish_reasons" in summary:
+        finish_reasons = summary["finish_reasons"]
+        if (
+            isinstance(finish_reasons, (str, bytes, bytearray))
+            or not isinstance(finish_reasons, Sequence)
+        ):
+            raise TypeError("finish_reasons must be an array of strings")
+        if len(finish_reasons) > 2:
+            raise ValueError("finish_reasons may contain at most 2 items")
+        normalized_reasons: list[str] = []
+        for reason in finish_reasons:
+            if not isinstance(reason, str):
+                raise TypeError("finish_reasons must be an array of strings")
+            normalized_reason = reason.strip().casefold()
+            if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", normalized_reason) is None:
+                raise ValueError(
+                    "finish_reasons must contain bounded identifiers"
+                )
+            normalized_reasons.append(normalized_reason)
+        summary["finish_reasons"] = normalized_reasons
+    if "usage_totals" in summary:
+        usage_totals = summary["usage_totals"]
+        if not isinstance(usage_totals, Mapping):
+            raise TypeError("usage_totals must be a mapping")
+        unsupported_usage = set(usage_totals) - _RESEARCH_AI_USAGE_KEYS
+        if unsupported_usage:
+            raise ValueError(
+                "usage_totals contains unsupported token fields: "
+                + ", ".join(
+                    sorted(str(field) for field in unsupported_usage)
+                )
+            )
+        normalized_usage: dict[str, int] = {}
+        for field, value in usage_totals.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 0 <= value <= MAX_RESEARCH_AI_TOKEN_USAGE
+            ):
+                raise ValueError(
+                    "usage_totals values must be integer token counts between "
+                    f"0 and {MAX_RESEARCH_AI_TOKEN_USAGE}"
+                )
+            normalized_usage[str(field)] = value
+        summary["usage_totals"] = normalized_usage
     if (
         action == "extract"
         and require_successful_urls
@@ -903,6 +1196,8 @@ def retry_delay(outcome: str, consecutive_failures: int) -> timedelta:
     if outcome == "wikijs_conflict":
         return timedelta(hours=24)
     if outcome == "out_of_scope":
+        return timedelta(days=SYNC_REFRESH_DAYS)
+    if outcome == "content_quarantined":
         return timedelta(days=SYNC_REFRESH_DAYS)
     if outcome == "source_unverified":
         index = min(
@@ -1126,6 +1421,77 @@ class StateStore:
                 )
                 connection.execute("PRAGMA user_version = 7")
                 current = 7
+            if current < 8:
+                # An operator requeue starts a new content-policy epoch without
+                # deleting immutable attempts. The event ledger preserves why
+                # the boundary was moved and which completed attempt it follows.
+                connection.execute(
+                    """
+                    ALTER TABLE products
+                    ADD COLUMN content_failure_cutoff_attempt_id
+                        INTEGER NOT NULL DEFAULT 0
+                        CHECK (content_failure_cutoff_attempt_id >= 0)
+                    """
+                )
+                for statement in _CREATE_REQUEUE_EVENT_SCHEMA:
+                    connection.execute(statement)
+                # Older workers recorded every AI exception as ``uncertain``.
+                # AIInvalidOutputError is narrower: parsing/contract validation
+                # happens only after the provider response arrived, so delivery
+                # is known and replay suppression must not treat it like an
+                # ambiguous network outcome. Preserve the original audit body,
+                # error, and timestamps while making unknown legacy credits
+                # explicitly zero, matching the current failure contract.
+                connection.execute(
+                    """
+                    UPDATE research_actions
+                    SET status = 'failed', credits = COALESCE(credits, 0)
+                    WHERE action = 'ai'
+                      AND status = 'uncertain'
+                      AND CASE
+                          WHEN json_valid(result_summary_json)
+                          THEN json_extract(
+                              result_summary_json,
+                              '$.error_type'
+                          )
+                          ELSE NULL
+                      END = 'AIInvalidOutputError'
+                    """
+                )
+                connection.execute("PRAGMA user_version = 8")
+                current = 8
+            if current < 9:
+                # A system-wide provider pause may be discovered only after a
+                # product is leased. Persist the exact runnable queue class and
+                # due time so releasing that lease is product-neutral. Existing
+                # active v8 leases have no class snapshot; treating them as due
+                # is the conservative recovery that cannot hide runnable work.
+                connection.execute(
+                    """
+                    ALTER TABLE products
+                    ADD COLUMN leased_from_status TEXT
+                        CHECK (
+                            leased_from_status IS NULL
+                            OR leased_from_status IN ('due', 'backoff', 'synced')
+                        )
+                    """
+                )
+                connection.execute(
+                    """
+                    ALTER TABLE products
+                    ADD COLUMN leased_from_next_run_at TEXT
+                    """
+                )
+                connection.execute(
+                    """
+                    UPDATE products
+                    SET leased_from_status = 'due',
+                        leased_from_next_run_at = next_run_at
+                    WHERE status = 'leased'
+                    """
+                )
+                connection.execute("PRAGMA user_version = 9")
+                current = 9
         return current
 
     @property
@@ -1270,7 +1636,8 @@ class StateStore:
             SET source_hash = ?, source_updated_at = ?, payload_json = ?,
                 status = 'due', next_run_at = ?, consecutive_failures = 0,
                 lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-                leased_source_hash = NULL, reschedule_requested = 0,
+                leased_source_hash = NULL, leased_from_status = NULL,
+                leased_from_next_run_at = NULL, reschedule_requested = 0,
                 last_outcome = 'source_changed', last_error = NULL,
                 updated_at = ?
             WHERE product_id = ?
@@ -1312,6 +1679,157 @@ class StateStore:
                 (now_text, now_text),
             )
         return max(cursor.rowcount, 0)
+
+    def requeue_products(
+        self,
+        outcomes: Iterable[str],
+        *,
+        reason: str,
+        attempted_after: datetime | None = None,
+        attempted_before: datetime | None = None,
+        limit: int = 1000,
+        now: datetime | None = None,
+    ) -> int:
+        """Selectively wake old finished outcomes without rewriting their audit.
+
+        The optional attempt window applies to the latest finished attempt for
+        each product. ``attempted_after`` is inclusive and
+        ``attempted_before`` is exclusive. Only ``backoff`` or ``synced``
+        products without a lease are changed, which makes repeated calls
+        idempotent and prevents an operator action from stealing active work.
+
+        ``reason`` is a bounded operator policy marker stored in an append-only
+        requeue event. Each successful requeue also advances the product's
+        content-failure cutoff to its latest completed attempt. Old attempts
+        remain immutable and queryable, but no longer count toward the new
+        content-policy epoch.
+        """
+
+        normalized_outcomes = _outcome_filter(outcomes)
+        if not isinstance(reason, str):
+            raise TypeError("reason must be a string")
+        normalized_reason = " ".join(reason.split())
+        if not normalized_reason:
+            raise ValueError("reason must be non-empty")
+        if len(normalized_reason) > MAX_REQUEUE_REASON_LENGTH:
+            raise ValueError(
+                f"reason must contain at most {MAX_REQUEUE_REASON_LENGTH} characters"
+            )
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        lower = (
+            None
+            if attempted_after is None
+            else _strict_utc_datetime(
+                attempted_after,
+                name="attempted_after",
+            )
+        )
+        upper = (
+            None
+            if attempted_before is None
+            else _strict_utc_datetime(
+                attempted_before,
+                name="attempted_before",
+            )
+        )
+        if lower is not None and upper is not None and lower >= upper:
+            raise ValueError("attempted_after must be earlier than attempted_before")
+
+        timestamp = _utc(now)
+        now_text = _time_text(timestamp)
+        placeholders = ", ".join("?" for _ in normalized_outcomes)
+        clauses = [
+            "p.status IN ('backoff', 'synced')",
+            "p.lease_token IS NULL",
+            f"p.last_outcome IN ({placeholders})",
+            "latest.outcome = p.last_outcome",
+        ]
+        parameters: list[Any] = list(normalized_outcomes)
+        if lower is not None:
+            clauses.append("latest.started_at >= ?")
+            parameters.append(_time_text(lower))
+        if upper is not None:
+            clauses.append("latest.started_at < ?")
+            parameters.append(_time_text(upper))
+        parameters.append(limit)
+
+        with self._write_transaction() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    p.product_id,
+                    p.status AS previous_status,
+                    p.last_outcome AS previous_outcome,
+                    latest.attempt_id AS cutoff_attempt_id
+                FROM products AS p
+                JOIN attempts AS latest
+                  ON latest.attempt_id = (
+                      SELECT candidate.attempt_id
+                      FROM attempts AS candidate
+                      WHERE candidate.product_id = p.product_id
+                        AND candidate.finished_at IS NOT NULL
+                        AND candidate.outcome NOT GLOB 'system_*'
+                      ORDER BY candidate.attempt_id DESC
+                      LIMIT 1
+                  )
+                WHERE {' AND '.join(clauses)}
+                ORDER BY latest.started_at, latest.attempt_id, p.product_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            if not rows:
+                return 0
+            updated_count = 0
+            attempted_after_text = (
+                None if lower is None else _time_text(lower)
+            )
+            attempted_before_text = (
+                None if upper is None else _time_text(upper)
+            )
+            for row in rows:
+                updated = connection.execute(
+                    """
+                    UPDATE products
+                    SET status = 'due', next_run_at = ?, updated_at = ?,
+                        content_failure_cutoff_attempt_id = ?
+                    WHERE product_id = ?
+                      AND status IN ('backoff', 'synced')
+                      AND lease_token IS NULL
+                    """,
+                    (
+                        now_text,
+                        now_text,
+                        int(row["cutoff_attempt_id"]),
+                        str(row["product_id"]),
+                    ),
+                )
+                if updated.rowcount != 1:
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO requeue_events (
+                        product_id, cutoff_attempt_id, previous_status,
+                        previous_outcome, reason, attempted_after,
+                        attempted_before, requeued_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(row["product_id"]),
+                        int(row["cutoff_attempt_id"]),
+                        str(row["previous_status"]),
+                        str(row["previous_outcome"]),
+                        normalized_reason,
+                        attempted_after_text,
+                        attempted_before_text,
+                        now_text,
+                    ),
+                )
+                updated_count += 1
+        return updated_count
 
     def list_due(
         self,
@@ -1445,19 +1963,41 @@ class StateStore:
 
         with self._write_transaction() as connection:
             self._reclaim_expired(connection, timestamp)
+            sequence_row = connection.execute(
+                """
+                SELECT seq
+                FROM sqlite_sequence
+                WHERE name = 'attempts'
+                """
+            ).fetchone()
+            lease_sequence = (
+                int(sequence_row["seq"])
+                if sequence_row is not None
+                else 0
+            )
+            cycle_size = DUE_QUEUE_WEIGHT + BACKOFF_QUEUE_WEIGHT
+            preferred_status = (
+                "backoff"
+                if lease_sequence % cycle_size >= DUE_QUEUE_WEIGHT
+                else "due"
+            )
             row = connection.execute(
                 """
                 SELECT * FROM products
                 WHERE status IN ('due', 'backoff', 'synced')
                   AND next_run_at <= ?
                 ORDER BY
-                    CASE status WHEN 'due' THEN 0 WHEN 'backoff' THEN 1 ELSE 2 END,
+                    CASE
+                        WHEN status = ? THEN 0
+                        WHEN status IN ('due', 'backoff') THEN 1
+                        ELSE 2
+                    END,
                     next_run_at,
                     updated_at,
                     product_id
                 LIMIT 1
                 """,
-                (now_text,),
+                (now_text, preferred_status),
             ).fetchone()
             if row is None:
                 return None
@@ -1468,6 +2008,8 @@ class StateStore:
                 UPDATE products
                 SET status = 'leased', lease_token = ?, lease_owner = ?,
                     lease_until = ?, leased_source_hash = source_hash,
+                    leased_from_status = status,
+                    leased_from_next_run_at = next_run_at,
                     reschedule_requested = 0, last_attempt_at = ?, updated_at = ?
                 WHERE product_id = ?
                   AND status IN ('due', 'backoff', 'synced')
@@ -1582,7 +2124,10 @@ class StateStore:
                 a.*,
                 p.source_hash AS current_source_hash,
                 p.leased_source_hash AS current_leased_source_hash,
-                p.reschedule_requested AS current_reschedule_requested
+                p.reschedule_requested AS current_reschedule_requested,
+                p.leased_from_status AS current_leased_from_status,
+                p.leased_from_next_run_at
+                    AS current_leased_from_next_run_at
             FROM attempts AS a
             JOIN products AS p ON p.product_id = a.product_id
             WHERE a.lease_token = ?
@@ -1608,6 +2153,115 @@ class StateStore:
         ):
             raise LeaseLostError("lease identity does not match durable state")
         return row
+
+    def defer_lease(
+        self,
+        lease_or_token: Lease | str,
+        reason: str,
+        *,
+        now: datetime | None = None,
+    ) -> ProductState:
+        """Release active work for a product-independent system pause.
+
+        The attempt remains an immutable audit row with the fixed
+        ``system_paused`` outcome. The product is restored to the runnable
+        queue class and due time captured when it was leased, without changing
+        its failure count, publication metadata, or last product outcome.
+        """
+
+        if not isinstance(reason, str):
+            raise TypeError("reason must be a string")
+        normalized_reason = " ".join(reason.split())
+        if not normalized_reason:
+            raise ValueError("reason must be non-empty")
+        if len(normalized_reason) > MAX_SYSTEM_PAUSE_REASON_LENGTH:
+            raise ValueError(
+                "reason must contain at most "
+                f"{MAX_SYSTEM_PAUSE_REASON_LENGTH} characters"
+            )
+
+        timestamp = _utc(now)
+        now_text = _time_text(timestamp)
+        # Persist ordinary expiry recovery before reporting the requested lease
+        # as lost; an expired worker must never receive penalty-free deferral.
+        self.reclaim_expired_leases(now=timestamp)
+        with self._write_transaction() as connection:
+            row = self._active_attempt(
+                connection,
+                lease_or_token,
+                timestamp,
+            )
+            restored_status = row["current_leased_from_status"]
+            restored_next_run_at = row["current_leased_from_next_run_at"]
+            if restored_status is None or restored_next_run_at is None:
+                # Defensive compatibility for a partially upgraded legacy
+                # active lease. The v9 migration normally backfills both.
+                restored_status = "due"
+                restored_next_run_at = now_text
+            if restored_status not in {"due", "backoff", "synced"}:
+                raise StateError("leased runnable status snapshot is invalid")
+            try:
+                restored_next_run = _parse_time(restored_next_run_at)
+            except (TypeError, ValueError) as exc:
+                raise StateError(
+                    "leased runnable time snapshot is invalid"
+                ) from exc
+            if restored_next_run is None:
+                raise StateError("leased runnable time snapshot is missing")
+
+            self._mark_started_research_actions_uncertain(
+                connection,
+                int(row["attempt_id"]),
+                finished_at=now_text,
+                error="attempt paused before research action completion",
+            )
+            finished = connection.execute(
+                """
+                UPDATE attempts
+                SET finished_at = ?, outcome = 'system_paused', error = ?
+                WHERE attempt_id = ? AND finished_at IS NULL
+                """,
+                (
+                    now_text,
+                    normalized_reason,
+                    int(row["attempt_id"]),
+                ),
+            )
+            if finished.rowcount != 1:
+                raise LeaseLostError("lease attempt was already completed")
+
+            restored = connection.execute(
+                """
+                UPDATE products
+                SET status = ?, next_run_at = ?,
+                    lease_token = NULL, lease_owner = NULL, lease_until = NULL,
+                    leased_source_hash = NULL, leased_from_status = NULL,
+                    leased_from_next_run_at = NULL, reschedule_requested = 0,
+                    updated_at = ?
+                WHERE product_id = ?
+                  AND status = 'leased'
+                  AND lease_token = ?
+                  AND leased_source_hash = source_hash
+                  AND reschedule_requested = 0
+                """,
+                (
+                    restored_status,
+                    _time_text(restored_next_run),
+                    now_text,
+                    row["product_id"],
+                    row["lease_token"],
+                ),
+            )
+            if restored.rowcount != 1:
+                raise LeaseLostError("lease source changed while it was deferred")
+            product_row = connection.execute(
+                "SELECT * FROM products WHERE product_id = ?",
+                (row["product_id"],),
+            ).fetchone()
+            if product_row is None:  # defensive; the foreign key owns the attempt
+                raise StateError("deferred product disappeared")
+            result = self._product_state(product_row)
+        return result
 
     def begin_search(
         self,
@@ -2391,6 +3045,261 @@ class StateStore:
             ).fetchall()
         return [self._research_action_record(row) for row in rows]
 
+    def recent_provider_rejection(
+        self,
+        provider_fingerprint: str,
+        *,
+        actions: Iterable[str],
+        http_statuses: Iterable[int],
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> ProviderRejectionRecord | None:
+        """Return the latest matching provider rejection and exact expiry."""
+
+        normalized_fingerprint = _research_request_fingerprint(
+            provider_fingerprint
+        )
+        normalized_actions = _research_action_filter(actions)
+        if not isinstance(within, timedelta) or within <= timedelta(0):
+            raise ValueError("within must be a positive timedelta")
+        normalized_statuses = _http_status_filter(http_statuses)
+        current = _utc(now)
+        cutoff = _time_text(current - within)
+        action_placeholders = ", ".join("?" for _ in normalized_actions)
+        status_placeholders = ", ".join("?" for _ in normalized_statuses)
+        parameters: list[Any] = [
+            *normalized_actions,
+            cutoff,
+            _time_text(current),
+            normalized_fingerprint,
+            *normalized_statuses,
+        ]
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT
+                    action,
+                    status,
+                    finished_at,
+                    result_summary_json
+                FROM research_actions
+                WHERE action IN ({action_placeholders})
+                  AND status IN ('failed', 'uncertain')
+                  AND finished_at > ?
+                  AND finished_at <= ?
+                  AND result_summary_json IS NOT NULL
+                  AND CASE
+                      WHEN json_valid(result_summary_json)
+                      THEN json_extract(
+                          result_summary_json,
+                          '$.provider_fingerprint'
+                      )
+                      ELSE NULL
+                  END = ?
+                  AND CASE
+                      WHEN json_valid(result_summary_json)
+                      THEN json_extract(
+                          result_summary_json,
+                          '$.http_status'
+                      )
+                      ELSE NULL
+                  END IN ({status_placeholders})
+                ORDER BY finished_at DESC, action_id DESC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            summary = json.loads(row["result_summary_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StateError("provider rejection audit is invalid") from exc
+        if not isinstance(summary, Mapping):
+            raise StateError("provider rejection audit is invalid")
+        raw_status = summary.get("http_status")
+        if (
+            isinstance(raw_status, bool)
+            or not isinstance(raw_status, int)
+            or raw_status not in normalized_statuses
+        ):
+            raise StateError("provider rejection HTTP status audit is invalid")
+        raw_error_type = summary.get("error_type")
+        if raw_error_type is not None and (
+            not isinstance(raw_error_type, str)
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", raw_error_type)
+            is None
+        ):
+            raise StateError("provider rejection error type audit is invalid")
+        try:
+            finished_at = _parse_time(row["finished_at"])
+        except (TypeError, ValueError) as exc:
+            raise StateError(
+                "provider rejection completion time is invalid"
+            ) from exc
+        if finished_at is None:
+            raise StateError("provider rejection completion time is missing")
+        return ProviderRejectionRecord(
+            action=str(row["action"]),
+            research_status=str(row["status"]),
+            http_status=raw_status,
+            error_type=raw_error_type,
+            finished_at=finished_at,
+            expires_at=finished_at + within,
+        )
+
+    def recent_exa_provider_rejection(
+        self,
+        provider_fingerprint: str,
+        *,
+        http_statuses: Iterable[int],
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> ProviderRejectionRecord | None:
+        """Return the latest Search/Extract provider-global rejection."""
+
+        return self.recent_provider_rejection(
+            provider_fingerprint,
+            actions=("search", "extract"),
+            http_statuses=http_statuses,
+            within=within,
+            now=now,
+        )
+
+    def recent_provider_error(
+        self,
+        provider_fingerprint: str,
+        *,
+        actions: Iterable[str],
+        error_types: Iterable[str],
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> ProviderErrorRecord | None:
+        """Return the latest matching provider error and exact expiry."""
+
+        normalized_fingerprint = _research_request_fingerprint(
+            provider_fingerprint
+        )
+        normalized_actions = _research_action_filter(actions)
+        normalized_error_types = _error_type_filter(error_types)
+        if not isinstance(within, timedelta) or within <= timedelta(0):
+            raise ValueError("within must be a positive timedelta")
+        current = _utc(now)
+        action_placeholders = ", ".join("?" for _ in normalized_actions)
+        error_placeholders = ", ".join("?" for _ in normalized_error_types)
+        parameters: list[Any] = [
+            *normalized_actions,
+            _time_text(current - within),
+            _time_text(current),
+            normalized_fingerprint,
+            *normalized_error_types,
+        ]
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT
+                    action,
+                    status,
+                    finished_at,
+                    result_summary_json
+                FROM research_actions
+                WHERE action IN ({action_placeholders})
+                  AND status IN ('failed', 'uncertain')
+                  AND finished_at > ?
+                  AND finished_at <= ?
+                  AND result_summary_json IS NOT NULL
+                  AND CASE
+                      WHEN json_valid(result_summary_json)
+                      THEN json_extract(
+                          result_summary_json,
+                          '$.provider_fingerprint'
+                      )
+                      ELSE NULL
+                  END = ?
+                  AND CASE
+                      WHEN json_valid(result_summary_json)
+                      THEN json_extract(
+                          result_summary_json,
+                          '$.error_type'
+                      )
+                      ELSE NULL
+                  END IN ({error_placeholders})
+                ORDER BY finished_at DESC, action_id DESC
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            summary = json.loads(row["result_summary_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StateError("provider error audit is invalid") from exc
+        if not isinstance(summary, Mapping):
+            raise StateError("provider error audit is invalid")
+        raw_error_type = summary.get("error_type")
+        if raw_error_type not in normalized_error_types:
+            raise StateError("provider error type audit is invalid")
+        raw_status = summary.get("http_status")
+        if raw_status is not None and (
+            isinstance(raw_status, bool)
+            or not isinstance(raw_status, int)
+            or not 100 <= raw_status <= 599
+        ):
+            raise StateError("provider error HTTP status audit is invalid")
+        try:
+            finished_at = _parse_time(row["finished_at"])
+        except (TypeError, ValueError) as exc:
+            raise StateError(
+                "provider error completion time is invalid"
+            ) from exc
+        if finished_at is None:
+            raise StateError("provider error completion time is missing")
+        return ProviderErrorRecord(
+            action=str(row["action"]),
+            research_status=str(row["status"]),
+            error_type=raw_error_type,
+            http_status=raw_status,
+            finished_at=finished_at,
+            expires_at=finished_at + within,
+        )
+
+    def recent_exa_provider_error(
+        self,
+        provider_fingerprint: str,
+        *,
+        error_types: Iterable[str],
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> ProviderErrorRecord | None:
+        """Return the latest Search/Extract provider error, with no HTTP need."""
+
+        return self.recent_provider_error(
+            provider_fingerprint,
+            actions=("search", "extract"),
+            error_types=error_types,
+            within=within,
+            now=now,
+        )
+
+    def recent_ai_provider_rejection_event(
+        self,
+        provider_fingerprint: str,
+        *,
+        http_statuses: Iterable[int],
+        within: timedelta,
+        now: datetime | None = None,
+    ) -> ProviderRejectionRecord | None:
+        """Return an AI rejection with its real completion time and expiry."""
+
+        return self.recent_provider_rejection(
+            provider_fingerprint,
+            actions=("ai",),
+            http_statuses=http_statuses,
+            within=within,
+            now=now,
+        )
+
     def recent_ai_provider_rejection(
         self,
         provider_fingerprint: str,
@@ -2399,64 +3308,22 @@ class StateStore:
         within: timedelta,
         now: datetime | None = None,
     ) -> int | None:
-        """Return a recent provider-global AI rejection for this configuration."""
+        """Compatibility accessor returning only the matching AI HTTP status."""
 
-        normalized_fingerprint = _research_request_fingerprint(
-            provider_fingerprint
+        event = self.recent_ai_provider_rejection_event(
+            provider_fingerprint,
+            http_statuses=http_statuses,
+            within=within,
+            now=now,
         )
-        if not isinstance(within, timedelta) or within <= timedelta(0):
-            raise ValueError("within must be a positive timedelta")
-        normalized_statuses = {
-            int(status)
-            for status in http_statuses
-            if (
-                not isinstance(status, bool)
-                and isinstance(status, int)
-                and 100 <= status <= 599
-            )
-        }
-        if not normalized_statuses:
-            raise ValueError("http_statuses must contain an HTTP status")
-        cutoff = _time_text(_utc(now) - within)
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT result_summary_json
-                FROM research_actions
-                WHERE action = 'ai'
-                  AND status IN ('failed', 'uncertain')
-                  AND finished_at >= ?
-                  AND result_summary_json IS NOT NULL
-                ORDER BY action_id DESC
-                LIMIT 1000
-                """,
-                (cutoff,),
-            ).fetchall()
-        for row in rows:
-            try:
-                summary = json.loads(row["result_summary_json"])
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise StateError(
-                    "AI provider rejection audit is invalid"
-                ) from exc
-            if not isinstance(summary, Mapping):
-                raise StateError("AI provider rejection audit is invalid")
-            status = summary.get("http_status")
-            if (
-                summary.get("provider_fingerprint")
-                == normalized_fingerprint
-                and isinstance(status, int)
-                and not isinstance(status, bool)
-                and status in normalized_statuses
-            ):
-                return status
-        return None
+        return None if event is None else event.http_status
 
     def recent_ai_provider_error_products(
         self,
         provider_fingerprint: str,
         *,
         error_types: Iterable[str],
+        categories: Iterable[str] | None = None,
         within: timedelta,
         now: datetime | None = None,
     ) -> int:
@@ -2467,45 +3334,89 @@ class StateStore:
         )
         if not isinstance(within, timedelta) or within <= timedelta(0):
             raise ValueError("within must be a positive timedelta")
-        normalized_error_types = {
-            value.strip()
-            for value in error_types
-            if isinstance(value, str)
-            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", value.strip())
-        }
-        if not normalized_error_types:
-            raise ValueError("error_types must contain a valid class name")
-        cutoff = _time_text(_utc(now) - within)
-        with self._connection() as connection:
-            rows = connection.execute(
+        normalized_error_types = _error_type_filter(error_types)
+        normalized_categories: set[str] | None = None
+        if categories is not None:
+            if isinstance(categories, (str, bytes, bytearray)) or not isinstance(
+                categories,
+                Iterable,
+            ):
+                raise TypeError("categories must be an iterable of strings")
+            normalized_categories = set()
+            for value in categories:
+                if not isinstance(value, str):
+                    raise TypeError("categories must contain only strings")
+                category = value.strip().casefold()
+                if category not in _RESEARCH_AI_ERROR_CATEGORIES:
+                    raise ValueError(
+                        "categories contains an unsupported AI error category"
+                    )
+                normalized_categories.add(category)
+            if not normalized_categories:
+                raise ValueError("categories must not be empty")
+        current = _utc(now)
+        error_placeholders = ", ".join("?" for _ in normalized_error_types)
+        clauses = [
+            "ra.action = 'ai'",
+            "ra.status IN ('failed', 'uncertain')",
+            "ra.finished_at > ?",
+            "ra.finished_at <= ?",
+            "ra.result_summary_json IS NOT NULL",
+            """
+            CASE
+                WHEN json_valid(ra.result_summary_json)
+                THEN json_extract(
+                    ra.result_summary_json,
+                    '$.provider_fingerprint'
+                )
+                ELSE NULL
+            END = ?
+            """,
+            f"""
+            CASE
+                WHEN json_valid(ra.result_summary_json)
+                THEN json_extract(
+                    ra.result_summary_json,
+                    '$.error_type'
+                )
+                ELSE NULL
+            END IN ({error_placeholders})
+            """,
+        ]
+        parameters: list[Any] = [
+            _time_text(current - within),
+            _time_text(current),
+            normalized_fingerprint,
+            *normalized_error_types,
+        ]
+        if normalized_categories is not None:
+            category_placeholders = ", ".join(
+                "?" for _ in normalized_categories
+            )
+            clauses.append(
+                f"""
+                CASE
+                    WHEN json_valid(ra.result_summary_json)
+                    THEN json_extract(
+                        ra.result_summary_json,
+                        '$.error_category'
+                    )
+                    ELSE NULL
+                END IN ({category_placeholders})
                 """
-                SELECT a.product_id, ra.result_summary_json
+            )
+            parameters.extend(sorted(normalized_categories))
+        with self._connection() as connection:
+            row = connection.execute(
+                f"""
+                SELECT COUNT(DISTINCT a.product_id) AS count
                 FROM research_actions AS ra
                 JOIN attempts AS a ON a.attempt_id = ra.attempt_id
-                WHERE ra.action = 'ai'
-                  AND ra.status IN ('failed', 'uncertain')
-                  AND ra.finished_at >= ?
-                  AND ra.result_summary_json IS NOT NULL
-                ORDER BY ra.action_id DESC
-                LIMIT 1000
+                WHERE {' AND '.join(clauses)}
                 """,
-                (cutoff,),
-            ).fetchall()
-        products: set[str] = set()
-        for row in rows:
-            try:
-                summary = json.loads(row["result_summary_json"])
-            except (TypeError, json.JSONDecodeError) as exc:
-                raise StateError("AI provider error audit is invalid") from exc
-            if not isinstance(summary, Mapping):
-                raise StateError("AI provider error audit is invalid")
-            if (
-                summary.get("provider_fingerprint")
-                == normalized_fingerprint
-                and summary.get("error_type") in normalized_error_types
-            ):
-                products.add(str(row["product_id"]))
-        return len(products)
+                parameters,
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
 
     def research_action_stats(
         self,
@@ -2600,6 +3511,118 @@ class StateStore:
                 else None
             ),
             "by_status": by_status,
+            "by_action": by_action,
+        }
+
+    def research_usage_between(
+        self,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> dict[str, Any]:
+        """Return global search/extract spend started in ``[start, end)``.
+
+        Both the current action ledger and legacy one-shot audit columns are
+        counted. A missing credit value is reported separately from an
+        ``uncertain`` terminal state so a caller can fail closed for either
+        condition while still accounting for every known partial credit.
+        """
+
+        lower = _strict_utc_datetime(start, name="start")
+        upper = _strict_utc_datetime(end, name="end")
+        if lower >= upper:
+            raise ValueError("start must be earlier than end")
+        lower_text = _time_text(lower)
+        upper_text = _time_text(upper)
+
+        def empty_bucket() -> dict[str, int | float]:
+            return {
+                "actions": 0,
+                "known_credits": 0.0,
+                "unknown_credit_actions": 0,
+                "uncertain_actions": 0,
+                "unknown_or_uncertain_actions": 0,
+            }
+
+        by_action = {
+            "search": empty_bucket(),
+            "extract": empty_bucket(),
+        }
+
+        with self._connection() as connection:
+            action_rows = connection.execute(
+                """
+                SELECT action, status, credits
+                FROM research_actions
+                WHERE action IN ('search', 'extract')
+                  AND started_at >= ?
+                  AND started_at < ?
+                ORDER BY action_id
+                """,
+                (lower_text, upper_text),
+            ).fetchall()
+            legacy_rows = connection.execute(
+                """
+                SELECT
+                    search_started_at,
+                    search_usage_json,
+                    extract_started_at,
+                    extract_usage_json
+                FROM attempts
+                WHERE (
+                    search_started_at >= ? AND search_started_at < ?
+                ) OR (
+                    extract_started_at >= ? AND extract_started_at < ?
+                )
+                ORDER BY attempt_id
+                """,
+                (lower_text, upper_text, lower_text, upper_text),
+            ).fetchall()
+
+        for row in action_rows:
+            action = str(row["action"])
+            bucket = by_action[action]
+            bucket["actions"] += 1
+            unknown = row["credits"] is None
+            uncertain = row["status"] == "uncertain"
+            if unknown:
+                bucket["unknown_credit_actions"] += 1
+            else:
+                bucket["known_credits"] += float(row["credits"])
+            if uncertain:
+                bucket["uncertain_actions"] += 1
+            if unknown or uncertain:
+                bucket["unknown_or_uncertain_actions"] += 1
+
+        for row in legacy_rows:
+            for action in ("search", "extract"):
+                started_at = row[f"{action}_started_at"]
+                if (
+                    started_at is None
+                    or started_at < lower_text
+                    or started_at >= upper_text
+                ):
+                    continue
+                bucket = by_action[action]
+                bucket["actions"] += 1
+                usage_json = row[f"{action}_usage_json"]
+                if usage_json is None:
+                    bucket["unknown_credit_actions"] += 1
+                    bucket["unknown_or_uncertain_actions"] += 1
+                else:
+                    bucket["known_credits"] += _audited_usage_credits(
+                        usage_json,
+                        name=f"legacy {action}",
+                    )
+
+        totals = empty_bucket()
+        for bucket in by_action.values():
+            for key in totals:
+                totals[key] += bucket[key]
+        return {
+            "start": lower.isoformat(),
+            "end": upper.isoformat(),
+            **totals,
             "by_action": by_action,
         }
 
@@ -2765,7 +3788,8 @@ class StateStore:
                 SET status = ?, next_run_at = ?,
                     consecutive_failures = ?,
                     lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-                    leased_source_hash = NULL, reschedule_requested = 0,
+                    leased_source_hash = NULL, leased_from_status = NULL,
+                    leased_from_next_run_at = NULL, reschedule_requested = 0,
                     last_outcome = ?, last_error = ?, updated_at = ?
                 WHERE product_id = ? AND status = 'leased' AND lease_token = ?
                 """,
@@ -2882,7 +3906,8 @@ class StateStore:
                     UPDATE products
                     SET status = 'due', next_run_at = ?,
                         lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-                        leased_source_hash = NULL, reschedule_requested = 0,
+                        leased_source_hash = NULL, leased_from_status = NULL,
+                        leased_from_next_run_at = NULL, reschedule_requested = 0,
                         last_outcome = 'stale_source', last_error = NULL,
                         updated_at = ?
                     WHERE product_id = ? AND lease_token = ?
@@ -2919,7 +3944,9 @@ class StateStore:
                     """
                     SELECT outcome
                     FROM attempts
-                    WHERE product_id = ? AND finished_at IS NOT NULL
+                    WHERE product_id = ?
+                      AND finished_at IS NOT NULL
+                      AND outcome NOT GLOB 'system_*'
                     ORDER BY attempt_id DESC
                     LIMIT 32
                     """,
@@ -2967,7 +3994,8 @@ class StateStore:
                 UPDATE products
                 SET status = ?, next_run_at = ?, consecutive_failures = ?,
                     lease_token = NULL, lease_owner = NULL, lease_until = NULL,
-                    leased_source_hash = NULL, reschedule_requested = 0,
+                    leased_source_hash = NULL, leased_from_status = NULL,
+                    leased_from_next_run_at = NULL, reschedule_requested = 0,
                     last_success_at = ?, last_outcome = ?, last_error = ?,
                     updated_at = ?
                 WHERE product_id = ? AND lease_token = ?
@@ -3012,6 +4040,40 @@ class StateStore:
                 ).fetchall()
         return [self._attempt_record(row) for row in rows]
 
+    def requeue_event_history(
+        self,
+        product_id: Any | None = None,
+        *,
+        limit: int = 1000,
+    ) -> list[RequeueEventRecord]:
+        """Return append-only operator requeue events in creation order."""
+
+        parameters: list[Any] = []
+        where = ""
+        if product_id is not None:
+            product_text = str(product_id).strip()
+            if not product_text:
+                raise ValueError("product_id must be non-empty")
+            where = "WHERE product_id = ?"
+            parameters.append(product_text)
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+        parameters.append(limit)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM requeue_events
+                {where}
+                ORDER BY event_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+        return [self._requeue_event_record(row) for row in rows]
+
     def status_counts(
         self,
         *,
@@ -3030,6 +4092,23 @@ class StateStore:
             return {status: counts.get(status, 0) for status in PRODUCT_STATUSES}
         return counts
 
+    def due_count(self, *, now: datetime | None = None) -> int:
+        """Count runnable products without materializing queue payloads."""
+
+        timestamp = _utc(now)
+        self.reclaim_expired_leases(now=timestamp)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM products
+                WHERE status IN ('due', 'backoff', 'synced')
+                  AND next_run_at <= ?
+                """,
+                (_time_text(timestamp),),
+            ).fetchone()
+        return int(row["count"]) if row is not None else 0
+
     def outcome_counts(self) -> dict[str, int]:
         """Return aggregate finished-attempt counts without exposing evidence."""
 
@@ -3044,6 +4123,72 @@ class StateStore:
                 """
             ).fetchall()
         return {str(row["outcome"]): int(row["count"]) for row in rows}
+
+    def content_failure_streak(
+        self,
+        product_id: Any,
+        *,
+        outcomes: Iterable[str] = CONTENT_FAILURE_OUTCOMES,
+        limit: int = 32,
+    ) -> int:
+        """Count consecutive content failures for the current source revision.
+
+        Unlike per-outcome backoff, alternating content outcomes still count
+        toward this streak. The method is read-only and leaves the quarantine
+        threshold and scheduling policy to the caller.
+        """
+
+        product_text = str(product_id).strip()
+        if not product_text:
+            raise ValueError("product_id must be non-empty")
+        normalized_outcomes = set(
+            _outcome_filter(outcomes, name="outcomes")
+        )
+        if isinstance(limit, bool) or not isinstance(limit, int):
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= 10_000:
+            raise ValueError("limit must be between 1 and 10000")
+
+        with self._connection() as connection:
+            product_row = connection.execute(
+                """
+                SELECT source_hash, content_failure_cutoff_attempt_id
+                FROM products
+                WHERE product_id = ?
+                """,
+                (product_text,),
+            ).fetchone()
+            if product_row is None:
+                raise UnknownProductError(
+                    f"unknown product: {product_text}"
+                )
+            rows = connection.execute(
+                """
+                SELECT outcome
+                FROM attempts
+                WHERE product_id = ?
+                  AND source_hash = ?
+                  AND attempt_id > ?
+                  AND finished_at IS NOT NULL
+                  AND outcome IS NOT NULL
+                  AND outcome NOT GLOB 'system_*'
+                ORDER BY attempt_id DESC
+                LIMIT ?
+                """,
+                (
+                    product_text,
+                    product_row["source_hash"],
+                    int(product_row["content_failure_cutoff_attempt_id"]),
+                    limit,
+                ),
+            ).fetchall()
+
+        streak = 0
+        for row in rows:
+            if str(row["outcome"]).casefold() not in normalized_outcomes:
+                break
+            streak += 1
+        return streak
 
     def recent_distinct_outcome_streak(
         self,
@@ -3067,7 +4212,9 @@ class StateStore:
                 """
                 SELECT product_id, outcome
                 FROM attempts
-                WHERE finished_at IS NOT NULL AND finished_at >= ?
+                WHERE finished_at IS NOT NULL
+                  AND finished_at >= ?
+                  AND outcome NOT GLOB 'system_*'
                 ORDER BY attempt_id DESC
                 """,
                 (_time_text(cutoff),),
@@ -3188,6 +4335,27 @@ class StateStore:
             last_success_at=_parse_time(row["last_success_at"]),
             last_outcome=row["last_outcome"],
             last_error=row["last_error"],
+            content_failure_cutoff_attempt_id=int(
+                row["content_failure_cutoff_attempt_id"]
+            ),
+            leased_from_status=row["leased_from_status"],
+            leased_from_next_run_at=_parse_time(
+                row["leased_from_next_run_at"]
+            ),
+        )
+
+    @staticmethod
+    def _requeue_event_record(row: sqlite3.Row) -> RequeueEventRecord:
+        return RequeueEventRecord(
+            event_id=int(row["event_id"]),
+            product_id=row["product_id"],
+            cutoff_attempt_id=int(row["cutoff_attempt_id"]),
+            previous_status=row["previous_status"],
+            previous_outcome=row["previous_outcome"],
+            reason=row["reason"],
+            attempted_after=_parse_time(row["attempted_after"]),
+            attempted_before=_parse_time(row["attempted_before"]),
+            requeued_at=_parse_time(row["requeued_at"]),  # type: ignore[arg-type]
         )
 
     @staticmethod

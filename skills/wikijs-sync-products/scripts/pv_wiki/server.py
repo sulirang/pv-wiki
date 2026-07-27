@@ -7,7 +7,7 @@ import json
 import os
 import threading
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +22,7 @@ from .config import (
     redact_environment_secrets,
     state_path,
 )
+from .exa import ExaConfigError
 from .state import StateStore
 
 
@@ -120,6 +121,287 @@ def health() -> dict[str, Any]:
     }
 
 
+def status() -> dict[str, Any]:
+    """Return authenticated queue and circuit readiness without paid probes."""
+
+    # Importing the CLI constants lazily avoids the server/CLI import cycle at
+    # module load time. These helpers calculate opaque fingerprints; neither
+    # credentials nor fingerprints are returned by this endpoint.
+    from .ai import AISettings
+    from .cli import (
+        AI_INVALID_OUTPUT_CIRCUIT_CATEGORIES,
+        AI_INVALID_OUTPUT_CIRCUIT_ERROR_TYPES,
+        AI_INVALID_OUTPUT_CIRCUIT_THRESHOLD,
+        AI_INVALID_OUTPUT_CIRCUIT_WINDOW,
+        AI_PROVIDER_CIRCUIT_HTTP_STATUSES,
+        AI_PROVIDER_CIRCUIT_WINDOW,
+        AI_RATE_LIMIT_CIRCUIT_HTTP_STATUSES,
+        AI_RATE_LIMIT_CIRCUIT_WINDOW,
+        EXA_PROVIDER_CIRCUIT_HTTP_STATUSES,
+        EXA_PROVIDER_CIRCUIT_WINDOW,
+        EXA_RATE_LIMIT_CIRCUIT_HTTP_STATUSES,
+        EXA_RATE_LIMIT_CIRCUIT_WINDOW,
+        INVALID_DECISION_CIRCUIT_THRESHOLD,
+        INVALID_DECISION_CIRCUIT_WINDOW,
+        _ai_output_fingerprint,
+        _ai_provider_fingerprint,
+        _exa_provider_fingerprint,
+        _global_research_budget_pause,
+        _make_search_client,
+    )
+    from .exa import ExaError
+    from .state import next_month_start
+
+    readiness_issues: list[dict[str, Any]] = []
+    with StateStore(state_path()) as store:
+        counts = store.status_counts()
+        due_now = store.due_count()
+        invalid_decisions = store.recent_distinct_outcome_streak(
+            "invalid_decision",
+            limit=INVALID_DECISION_CIRCUIT_THRESHOLD,
+            within=INVALID_DECISION_CIRCUIT_WINDOW,
+        )
+        decision_open = (
+            invalid_decisions >= INVALID_DECISION_CIRCUIT_THRESHOLD
+        )
+        circuits: dict[str, dict[str, Any]] = {
+            "decision": {
+                "open": decision_open,
+                "distinct_products": invalid_decisions,
+                "threshold": INVALID_DECISION_CIRCUIT_THRESHOLD,
+                "window_seconds": int(
+                    INVALID_DECISION_CIRCUIT_WINDOW.total_seconds()
+                ),
+            }
+        }
+        if decision_open:
+            readiness_issues.append({"type": "decision_circuit_open"})
+
+        try:
+            ai_settings = AISettings.from_env()
+        except AIError as exc:
+            safe_configuration_error = {
+                "open": None,
+                "reason": "configuration_invalid",
+            }
+            circuits["ai_provider"] = dict(safe_configuration_error)
+            circuits["ai_output"] = dict(safe_configuration_error)
+            readiness_issues.append(
+                {
+                    "type": "ai_configuration_invalid",
+                    "error": _safe_error(exc),
+                }
+            )
+        else:
+            provider_fingerprint = _ai_provider_fingerprint(ai_settings)
+            provider_event = store.recent_ai_provider_rejection_event(
+                provider_fingerprint,
+                http_statuses=AI_PROVIDER_CIRCUIT_HTTP_STATUSES,
+                within=AI_PROVIDER_CIRCUIT_WINDOW,
+            )
+            provider_window = AI_PROVIDER_CIRCUIT_WINDOW
+            provider_reason = "definitive_rejection"
+            if provider_event is None:
+                provider_event = store.recent_ai_provider_rejection_event(
+                    provider_fingerprint,
+                    http_statuses=AI_RATE_LIMIT_CIRCUIT_HTTP_STATUSES,
+                    within=AI_RATE_LIMIT_CIRCUIT_WINDOW,
+                )
+                provider_window = AI_RATE_LIMIT_CIRCUIT_WINDOW
+                provider_reason = "rate_limit"
+            provider_open = provider_event is not None
+            circuits["ai_provider"] = {
+                "open": provider_open,
+                "reason": provider_reason if provider_open else None,
+                "http_status": (
+                    provider_event.http_status
+                    if provider_event is not None
+                    else None
+                ),
+                "resume_at": (
+                    provider_event.expires_at.isoformat()
+                    if provider_event is not None
+                    else None
+                ),
+                "window_seconds": int(provider_window.total_seconds()),
+            }
+            if provider_open:
+                readiness_issues.append(
+                    {
+                        "type": "ai_provider_circuit_open",
+                        "http_status": provider_event.http_status,
+                        "resume_at": provider_event.expires_at.isoformat(),
+                    }
+                )
+
+            invalid_output_products = (
+                store.recent_ai_provider_error_products(
+                    _ai_output_fingerprint(ai_settings),
+                    error_types=AI_INVALID_OUTPUT_CIRCUIT_ERROR_TYPES,
+                    categories=AI_INVALID_OUTPUT_CIRCUIT_CATEGORIES,
+                    within=AI_INVALID_OUTPUT_CIRCUIT_WINDOW,
+                )
+            )
+            output_open = (
+                invalid_output_products
+                >= AI_INVALID_OUTPUT_CIRCUIT_THRESHOLD
+            )
+            circuits["ai_output"] = {
+                "open": output_open,
+                "distinct_products": invalid_output_products,
+                "threshold": AI_INVALID_OUTPUT_CIRCUIT_THRESHOLD,
+                "window_seconds": int(
+                    AI_INVALID_OUTPUT_CIRCUIT_WINDOW.total_seconds()
+                ),
+            }
+            if output_open:
+                readiness_issues.append(
+                    {"type": "ai_output_circuit_open"}
+                )
+
+        try:
+            exa_client = _make_search_client(timeout=1.0)
+        except ExaError as exc:
+            circuits["exa_provider"] = {
+                "open": None,
+                "reason": "configuration_invalid",
+            }
+            readiness_issues.append(
+                {
+                    "type": "exa_configuration_invalid",
+                    "error": _safe_error(exc),
+                }
+            )
+        else:
+            exa_fingerprint = _exa_provider_fingerprint(exa_client)
+            exa_event = store.recent_exa_provider_rejection(
+                exa_fingerprint,
+                http_statuses=EXA_PROVIDER_CIRCUIT_HTTP_STATUSES,
+                within=EXA_PROVIDER_CIRCUIT_WINDOW,
+            )
+            exa_window = EXA_PROVIDER_CIRCUIT_WINDOW
+            exa_reason = "definitive_rejection"
+            if exa_event is None:
+                exa_event = store.recent_exa_provider_rejection(
+                    exa_fingerprint,
+                    http_statuses=EXA_RATE_LIMIT_CIRCUIT_HTTP_STATUSES,
+                    within=EXA_RATE_LIMIT_CIRCUIT_WINDOW,
+                )
+                exa_window = EXA_RATE_LIMIT_CIRCUIT_WINDOW
+                exa_reason = "rate_limit"
+
+            now = datetime.now(timezone.utc)
+            month_start = datetime(
+                now.year,
+                now.month,
+                1,
+                tzinfo=timezone.utc,
+            )
+            quota_event = store.recent_exa_provider_error(
+                exa_fingerprint,
+                error_types={"ExaQuotaExhaustedError"},
+                within=max(now - month_start, timedelta(microseconds=1)),
+                now=now,
+            )
+            quota_open = (
+                quota_event is not None
+                and quota_event.finished_at >= month_start
+            )
+            exa_open = exa_event is not None or quota_open
+            if quota_open:
+                exa_reason = "monthly_quota_exhausted"
+                exa_resume_at = next_month_start(now).isoformat()
+            elif exa_event is not None:
+                exa_resume_at = exa_event.expires_at.isoformat()
+            else:
+                exa_resume_at = None
+            circuits["exa_provider"] = {
+                "open": exa_open,
+                "reason": exa_reason if exa_open else None,
+                "http_status": (
+                    exa_event.http_status
+                    if exa_event is not None
+                    else None
+                ),
+                "resume_at": exa_resume_at,
+                "window_seconds": (
+                    int(exa_window.total_seconds())
+                    if not quota_open
+                    else None
+                ),
+            }
+            if exa_open:
+                readiness_issues.append(
+                    {
+                        "type": (
+                            "exa_quota_exhausted"
+                            if quota_open
+                            else "exa_provider_circuit_open"
+                        ),
+                        "http_status": (
+                            exa_event.http_status
+                            if exa_event is not None
+                            else None
+                        ),
+                        "resume_at": exa_resume_at,
+                    }
+                )
+
+        try:
+            budget_pause = _global_research_budget_pause(store)
+        except ConfigError as exc:
+            research_budget = {
+                "paused": None,
+                "reason": "configuration_invalid",
+            }
+            readiness_issues.append(
+                {
+                    "type": "global_research_budget_configuration_invalid",
+                    "error": _safe_error(exc),
+                }
+            )
+        else:
+            research_budget = {
+                "paused": budget_pause is not None,
+            }
+            if budget_pause is not None:
+                research_budget.update(
+                    {
+                        key: value
+                        for key, value in budget_pause.items()
+                        if key not in {"ok", "processed", "published"}
+                    }
+                )
+                readiness_issues.append(
+                    {
+                        "type": str(budget_pause["reason"]),
+                        "resume_at": budget_pause["resume_at"],
+                    }
+                )
+
+        schema_version = store.schema_version
+
+    return {
+        "ok": True,
+        "ready": not readiness_issues,
+        "service": "pv-wiki-worker",
+        "version": __version__,
+        "state_schema_version": schema_version,
+        "queue": {
+            "counts": counts,
+            "due_now": due_now,
+        },
+        "circuits": circuits,
+        "research_budget": research_budget,
+        "operations": {
+            "run_one_busy": _RUN_LOCK.locked(),
+            "catalogue_busy": _CATALOGUE_LOCK.locked(),
+            "homepage_busy": _HOMEPAGE_LOCK.locked(),
+        },
+        "readiness_issues": readiness_issues,
+    }
+
+
 def _read_empty_json_object(handler: BaseHTTPRequestHandler) -> None:
     raw_length = handler.headers.get("Content-Length", "0")
     try:
@@ -185,11 +467,26 @@ def _handler(
 
         def do_GET(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
-            if path != "/healthz":
+            if path == "/healthz":
+                try:
+                    self._send(HTTPStatus.OK, health())
+                except Exception as exc:
+                    self._send(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"ok": False, "error": _safe_error(exc)},
+                    )
+                return
+            if path != "/status":
                 self._send(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not found"})
                 return
+            if not self._authorized():
+                self._send(
+                    HTTPStatus.UNAUTHORIZED,
+                    {"ok": False, "error": "unauthorized"},
+                )
+                return
             try:
-                self._send(HTTPStatus.OK, health())
+                self._send(HTTPStatus.OK, status())
             except Exception as exc:
                 self._send(
                     HTTPStatus.SERVICE_UNAVAILABLE,
@@ -242,7 +539,12 @@ def _handler(
                 return
             try:
                 result = operation()
-            except (AIError, ConfigError, WorkerConfigError) as exc:
+            except (
+                AIError,
+                ConfigError,
+                ExaConfigError,
+                WorkerConfigError,
+            ) as exc:
                 self._send(
                     HTTPStatus.SERVICE_UNAVAILABLE,
                     {
@@ -308,5 +610,6 @@ __all__ = [
     "WorkerSettings",
     "build_server",
     "health",
+    "status",
     "serve",
 ]

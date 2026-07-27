@@ -14,11 +14,14 @@ sys.path.insert(0, str(SCRIPTS))
 
 from pv_wiki.config import (  # noqa: E402
     ConfigError,
+    GlobalResearchBudgetSettings,
     ResearchSettings,
     TrustedSourceNotConfigured,
     WikiSettings,
     allow_mirrors,
     missing_environment,
+    public_brand_alias,
+    public_brand_alias_map,
     state_path,
     trusted_source_domain_map,
     trusted_source_domains,
@@ -174,7 +177,38 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     ResearchSettings.from_env()
 
-    def test_optional_override_prefers_discovered_manufacturer(self) -> None:
+    def test_global_research_budget_is_opt_in_and_bounded(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            settings = GlobalResearchBudgetSettings.from_env()
+        self.assertEqual(0, settings.daily_credit_limit)
+        self.assertEqual(0, settings.monthly_credit_limit)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT": "500",
+                "PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT": "10000",
+            },
+            clear=True,
+        ):
+            settings = GlobalResearchBudgetSettings.from_env()
+        self.assertEqual(500, settings.daily_credit_limit)
+        self.assertEqual(10_000, settings.monthly_credit_limit)
+
+        for name, value in (
+            ("PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT", "-1"),
+            ("PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT", "10000001"),
+            ("PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT", "not-an-integer"),
+        ):
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                {name: value},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    GlobalResearchBudgetSettings.from_env()
+
+    def test_trusted_override_is_bound_to_catalogue_brand(self) -> None:
         environment = {
             "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON": (
                 '{"Acme":["maker.example"],"CAT-7":["catalogue.example"]}'
@@ -182,15 +216,15 @@ class ConfigTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, environment, clear=True):
             self.assertEqual(
-                frozenset({"maker.example"}),
+                frozenset(),
                 trusted_source_domains_for_product("", "  acME "),
             )
             self.assertEqual(
-                frozenset({"maker.example"}),
+                frozenset({"catalogue.example"}),
                 trusted_source_domains_for_product("CAT-7", "Acme"),
             )
             self.assertEqual(
-                frozenset({"maker.example"}),
+                frozenset(),
                 trusted_source_domains_for_product("UNKNOWN", "Acme"),
             )
             self.assertEqual(
@@ -202,7 +236,7 @@ class ConfigTests(unittest.TestCase):
                 trusted_source_domains_for_product("CAT-7", ""),
             )
             self.assertEqual(
-                frozenset(),
+                frozenset({"maker.example"}),
                 trusted_source_domains_for_product("Acme", "Contoso"),
             )
 
@@ -214,6 +248,69 @@ class ConfigTests(unittest.TestCase):
             )
 
         self.assertFalse(issubclass(TrustedSourceNotConfigured, ConfigError))
+
+    def test_public_brand_aliases_are_explicit_and_strict(self) -> None:
+        environment = {
+            "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON": (
+                '{"FOX":"Fox ESS","HUAWEI":" Huawei "}'
+            )
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                {"fox": "Fox ESS", "huawei": "Huawei"},
+                public_brand_alias_map(),
+            )
+            self.assertEqual("Fox ESS", public_brand_alias(" fox "))
+            self.assertEqual("", public_brand_alias("UNKNOWN"))
+            self.assertEqual("", public_brand_alias(None))
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON":
+                    '{"FOX":"Fox ESS"}',
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON":
+                    '{"Fox ESS":["foxess.example"]}',
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                frozenset({"foxess.example"}),
+                trusted_source_domains_for_product("FOX", "Malicious Override"),
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON":
+                    '{"FOX":"Fox ESS"}',
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON": (
+                    '{"FOX":["catalogue.example"],'
+                    '"Fox ESS":["manufacturer.example"]}'
+                ),
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ConfigError, "conflict"):
+                trusted_source_domains_for_product("FOX", "Fox ESS")
+
+        invalid_values = (
+            '["FOX","Fox ESS"]',
+            '{"FOX":""}',
+            '{"FOX":"https://foxess.example"}',
+            '{"FOX":"12345"}',
+            '{"FOX":"Fox\\nESS"}',
+            '{"FOX":"Fox ESS","fox":"Different"}',
+            '{"FOX":"Fox ESS","FOX":"Different"}',
+        )
+        for configured in invalid_values:
+            with self.subTest(configured=configured), mock.patch.dict(
+                os.environ,
+                {"PV_WIKI_PUBLIC_BRAND_ALIASES_JSON": configured},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    public_brand_alias_map()
 
     def test_malformed_trusted_source_map_is_not_a_product_lookup_miss(self) -> None:
         with mock.patch.dict(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 import unittest
 from pathlib import Path
@@ -285,6 +286,33 @@ class DecisionTests(unittest.TestCase):
             ),
         )
 
+    def test_public_model_hint_rejects_company_and_numeric_catalogue_names(
+        self,
+    ) -> None:
+        for name in (
+            "AREA 46 SRL",
+            "SEARCH4SOLAR BV",
+            "2020",
+            "Acme Holdings",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    "",
+                    preferred_catalogue_model("INTERNAL-42", name),
+                )
+        self.assertEqual(
+            "PV-42 solar inverter",
+            preferred_catalogue_model("INTERNAL-42", "PV-42 solar inverter"),
+        )
+        self.assertEqual(
+            "H3-8.0-E",
+            preferred_catalogue_model(
+                "H3-8.0-E",
+                "8000W Three Phase hybrid inverter",
+                allow_product_id=True,
+            ),
+        )
+
     def test_accepts_cited_official_publish(self) -> None:
         result = validate_decision(
             valid_decision(),
@@ -431,6 +459,103 @@ class DecisionTests(unittest.TestCase):
                 trusted_source_domains={"solar.huawei.com"},
                 expected_product_name=target,
                 evidence_text_by_url={url: f"{body}\n{variant_row}"},
+            )
+
+    def test_multimodel_table_uses_explicit_same_column_binding(self) -> None:
+        item = valid_decision()
+        url = "https://foxess.example/h1-series.pdf"
+        target = "H1-3.7-E"
+        model_row = (
+            "| Parameter | H1-3.7-E | H1-5.0-E |"
+        )
+        specifications = (
+            ("Rated output power", "Output", 3700, "W", "5000 W"),
+            ("Maximum apparent power", "Output", 4070, "VA", "5500 VA"),
+            ("Maximum efficiency", "Efficiency", 97.8, "%", "98.0 %"),
+            ("Protection degree", "General", "IP65", "", "IP65"),
+            ("Weight", "General", 21, "kg", "22 kg"),
+        )
+        fact_rows = []
+        item.update(
+            {
+                "product_id": target,
+                "manufacturer": "Fox ESS",
+                "model": target,
+                "datasheets": [
+                    {
+                        "url": url,
+                        "title": "H1 series datasheet",
+                        "source_type": "manufacturer",
+                        "is_primary": True,
+                    }
+                ],
+            }
+        )
+        for fact, (name, category, value, unit, sibling_value) in zip(
+            item["facts"],
+            specifications,
+            strict=True,
+        ):
+            target_value = f"{value} {unit}".strip()
+            fact_row = f"| {name} | {target_value} | {sibling_value} |"
+            fact.update(
+                {
+                    "name": name,
+                    "category": category,
+                    "value": value,
+                    "unit": unit,
+                    "evidence_urls": [url],
+                    "evidence_quotes": [
+                        {
+                            "url": url,
+                            "model_quote": model_row,
+                            "quote": fact_row,
+                        }
+                    ],
+                }
+            )
+            fact_rows.append(fact_row)
+        body = "\n".join([model_row, *fact_rows])
+
+        result = _validate_decision(
+            item,
+            expected_product_id=target,
+            expected_lease_token="1234567890abcdef",
+            expected_product_name=target,
+            trusted_source_domains={"foxess.example"},
+            evidence_text_by_url={url: body},
+        )
+        self.assertEqual("publish", result["outcome"])
+        self.assertEqual(
+            model_row,
+            result["facts"][0]["evidence_quotes"][0]["model_quote"],
+        )
+
+        sibling_value = copy.deepcopy(item)
+        sibling_value["facts"][0]["value"] = 5000
+        with self.assertRaisesRegex(DecisionError, "exact supporting"):
+            _validate_decision(
+                sibling_value,
+                expected_product_id=target,
+                expected_lease_token="1234567890abcdef",
+                expected_product_name=target,
+                trusted_source_domains={"foxess.example"},
+                evidence_text_by_url={url: body},
+            )
+
+        ambiguous_target_cell = copy.deepcopy(item)
+        ambiguous_row = "| Rated output power | 3700 W / 5000 W | 5000 W |"
+        ambiguous_target_cell["facts"][0]["evidence_quotes"][0]["quote"] = (
+            ambiguous_row
+        )
+        with self.assertRaisesRegex(DecisionError, "exact supporting"):
+            _validate_decision(
+                ambiguous_target_cell,
+                expected_product_id=target,
+                expected_lease_token="1234567890abcdef",
+                expected_product_name=target,
+                trusted_source_domains={"foxess.example"},
+                evidence_text_by_url={url: f"{body}\n{ambiguous_row}"},
             )
 
     def test_rejects_lease_mismatch_and_low_confidence(self) -> None:
@@ -681,14 +806,6 @@ class DecisionTests(unittest.TestCase):
                 "source_type": "authorized",
             }
         ]
-        corroborating_rows = []
-        for fact in item["facts"]:
-            quote = fact["evidence_quotes"][0]["quote"]
-            fact["evidence_urls"].append(corroborating_url)
-            fact["evidence_quotes"].append(
-                {"url": corroborating_url, "quote": quote}
-            )
-            corroborating_rows.append(quote)
         body = (
             "Acme official product documentation\n"
             "PV-42 Power 42 W\nPV-42 Input voltage 48 V\n"
@@ -704,9 +821,7 @@ class DecisionTests(unittest.TestCase):
             expected_product_name="PV-42",
             evidence_text_by_url={
                 "https://acme.example/PV-42.pdf": body,
-                corroborating_url: "\n".join(
-                    ["Independent listing: Acme model PV-42.", *corroborating_rows]
-                ),
+                corroborating_url: "Independent listing: Acme model PV-42.",
             },
         )
 
@@ -724,6 +839,45 @@ class DecisionTests(unittest.TestCase):
                     "https://acme.example/PV-42.pdf": body,
                 },
             )
+
+    def test_operator_manufacturer_identity_is_a_hard_publish_boundary(self) -> None:
+        item = valid_decision()
+        with self.assertRaisesRegex(
+            SourceVerificationError,
+            "operator-approved",
+        ):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="PV-42",
+                operator_manufacturer_identity="Contoso",
+                trusted_source_domains={"acme.example"},
+                evidence_text_by_url={
+                    "https://acme.example/PV-42.pdf": (
+                        "PV-42 Power 42 W\nPV-42 Input voltage 48 V\n"
+                        "PV-42 Efficiency 98.5%\n"
+                        "PV-42 Ingress protection IP65\nPV-42 Weight 12 kg"
+                    )
+                },
+            )
+
+        result = _validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            expected_product_name="PV-42",
+            operator_manufacturer_identity="ACME",
+            trusted_source_domains={"acme.example"},
+            evidence_text_by_url={
+                "https://acme.example/PV-42.pdf": (
+                    "PV-42 Power 42 W\nPV-42 Input voltage 48 V\n"
+                    "PV-42 Efficiency 98.5%\n"
+                    "PV-42 Ingress protection IP65\nPV-42 Weight 12 kg"
+                )
+            },
+        )
+        self.assertEqual("publish", result["outcome"])
 
     def test_manufacturer_named_subdomain_cannot_impersonate_official_domain(self) -> None:
         for spoof_url in (
@@ -918,7 +1072,7 @@ class DecisionTests(unittest.TestCase):
                     ).strip(),
                 }
             ]
-        with self.assertRaisesRegex(DecisionError, "verified manufacturer"):
+        with self.assertRaisesRegex(DecisionError, "primary manufacturer"):
             validate_decision(
                 item,
                 expected_product_id="P-42",
@@ -1068,6 +1222,38 @@ class DecisionTests(unittest.TestCase):
                         },
                     )
 
+    def test_fact_values_use_numeric_and_token_boundaries(self) -> None:
+        cases = (
+            (0, 42, "W", "PV-42 Power 420 W"),
+            (0, 42, "W", "PV-42 Power 42 W / 420 W"),
+            (0, 4.2, "kW", "PV-42 Power 14.2 kW"),
+            (3, "IP65", "", "PV-42 Ingress protection IP650"),
+            (3, "IP65", "", "PV-42 Ingress protection IP65/IP66"),
+        )
+        for fact_index, value, unit, bad_quote in cases:
+            item = valid_decision()
+            fact = item["facts"][fact_index]
+            fact["value"] = value
+            fact["unit"] = unit
+            fact["evidence_quotes"][0]["quote"] = bad_quote
+            body = "\n".join(
+                quote["quote"]
+                for candidate in item["facts"]
+                for quote in candidate["evidence_quotes"]
+            )
+            with self.subTest(bad_quote=bad_quote), self.assertRaisesRegex(
+                DecisionError,
+                "exact supporting",
+            ):
+                validate_decision(
+                    item,
+                    expected_product_id="P-42",
+                    expected_lease_token="1234567890abcdef",
+                    evidence_text_by_url={
+                        "https://acme.example/PV-42.pdf": body
+                    },
+                )
+
         for revision in ("rev B", "Rev.B", "Revision B"):
             item = valid_decision()
             body = "\n".join(
@@ -1094,6 +1280,8 @@ class DecisionTests(unittest.TestCase):
         item = valid_decision()
         item["outcome"] = "ambiguous"
         item["confidence"] = 0.6
+        item["datasheets"][0]["is_primary"] = False
+        item["facts"] = []
 
         result = _validate_decision(
             item,
@@ -1105,6 +1293,68 @@ class DecisionTests(unittest.TestCase):
         )
 
         self.assertEqual("ambiguous", result["outcome"])
+
+    def test_nonpublish_outcomes_reject_contradictory_publish_material(self) -> None:
+        item = valid_decision()
+        item["outcome"] = "no_datasheet"
+        item["facts"] = []
+        with self.assertRaisesRegex(DecisionError, "primary datasheet"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="PV-42",
+            )
+
+        item["datasheets"][0]["is_primary"] = False
+        with self.assertRaisesRegex(DecisionError, "datasheet candidates"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="PV-42",
+            )
+
+        item["datasheets"] = []
+        result = _validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            expected_product_name="PV-42",
+        )
+        self.assertEqual("no_datasheet", result["outcome"])
+
+        item["outcome"] = "ambiguous"
+        result = _validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            expected_product_name="PV-42",
+        )
+        self.assertEqual("ambiguous", result["outcome"])
+
+        item["outcome"] = "insufficient_identity"
+        item["conflicts"] = [
+            {
+                "field": "Model identity",
+                "values": ["PV-42", "PV-43"],
+                "source_urls": ["https://acme.example/PV-42.pdf"],
+            }
+        ]
+        item["sources"] = [
+            {
+                "url": "https://acme.example/PV-42.pdf",
+                "title": "Candidate",
+                "source_type": "manufacturer",
+            }
+        ]
+        with self.assertRaisesRegex(DecisionError, "use ambiguous"):
+            _validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+                expected_product_name="PV-42",
+            )
 
     def test_out_of_scope_requires_high_confidence_matching_extract_evidence(self) -> None:
         url = "https://catalog.example/flange-nut-m8"

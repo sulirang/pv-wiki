@@ -4,10 +4,10 @@
 
 n8n is the only recurring scheduler. `PV Wiki - Product Cycle` starts at
 08:05 Asia/Shanghai (00:05 UTC) on the first day of every month, preserving the
-first-day quota cadence. It calls the worker serially until no product is due
-or every configured Exa key has exhausted its
-allowance. A separate hourly trigger enters directly at
-`Run One Product`, so due/backoff work resumes without waiting for another
+first-day quota cadence. It calls the worker serially until a clean stop or the
+batch boundary, with at most 15 `/run-one` calls per workflow execution and no
+new call after 45 minutes. A separate hourly trigger enters at
+`Initialize Batch`, so due/backoff work resumes without waiting for another
 catalogue sync or a person. A daily 03:17 catalogue recovery calls
 `Refresh Catalogue`, which retries source ingestion without waking
 quota-paused products. `PV Wiki - Homepage Refresh` runs daily at 02:35
@@ -30,14 +30,16 @@ the homepage. Destructive retirement requires an explicit future policy.
 The worker exposes fixed authenticated HTTP operations and no shell. Keep it
 on the n8n Docker network without a published host port. n8n Execute Command
 and Local File Trigger remain excluded, and the Docker socket must never be
-mounted.
+mounted. `GET /healthz` is public liveness only. Authenticated `GET /status`
+uses the same Bearer token as the fixed POST operations and returns redacted
+queue, circuit, and global-budget readiness without paid probes.
 
 ## Cadence and cost
 
 One product cycle starts with a fixed search/extract pass. The AI may then
 return either a final proposal or one of six fixed evidence gaps with one or
 two supplemental queries. The default budgets allow at most three AI actions,
-seven search queries, five unique extract URLs, and a 20-unit provider-neutral
+seven search queries, five unique extract URLs, and a 20-unit Exa
 admission budget. Before a call starts, the worker reserves one unit per Search
 query or two units per Extract batch. No new research
 action starts after 600 seconds. Configure these with
@@ -47,20 +49,37 @@ runtime ranges cannot exceed the compiled safety ceilings. A run-one lease must
 also cover the research deadline plus the bounded AI repair and Wiki mutation
 tail; an incompatible short lease is rejected before a product is leased.
 
-The default workflow immediately starts the next due product after a completed
-cycle, consuming the available search budget as quickly as the
-bounded inner research loop permits. It stops without an n8n error when the
-queue is empty or all keys are out of credits. The Run One HTTP timeout is 45
-minutes, covering the maximum allowed 20-minute research admission window plus
-the bounded AI-repair and duplicate-create-safe Wiki mutation tail. Set
-provider-side search and AI spend alerts before activating the workflow.
+After a completed product, the workflow starts another `/run-one` only while
+the previous result has `processed=true`, the zero-based run index remains
+below 14, and less than 45 minutes has elapsed since batch initialization.
+Thus one execution makes at most 15 calls; one already-running request may
+finish after the batch time boundary. `Run One Product` has a 45-minute HTTP
+timeout and no automatic n8n retry, because a new call may lease a different
+product rather than retry the failed one. A request failure ends that workflow
+execution for the Error Workflow.
+
+Set optional UTC-wide stop-losses with
+`PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT` and
+`PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT`; `0` disables the corresponding window.
+Each non-zero limit must be at least `PV_WIKI_RESEARCH_MAX_CREDITS`.
+Immediately before paid research, the worker reserves that full per-product
+maximum; a window pauses when known Exa usage plus the reservation would exceed
+its limit. Any unknown or uncertain Exa usage in an enabled window also pauses
+fail-closed rather than being invented as a credit value. The leased product
+is restored to its exact prior queue class/time, and the clean response
+includes `blocked_windows` plus the latest UTC boundary needed when both
+windows are blocked. These counters do not price or cap AI tokens; set
+provider-account AI spend limits and alerts as a second control before
+activation.
 
 HTTP 429 is a short request-rate limit and retains bounded Retry-After
 handling. Exa HTTP 402 permanently skips that key for
 the current worker call; another configured key is tried
 immediately. When every key is exhausted, the active product is scheduled for
 the first instant of the next UTC month without increasing its failure count,
-and the n8n loop ends. The next monthly catalogue sync, or a manual sync after
+and the n8n loop ends. That first response reports
+`pause_scope=product_and_provider`; subsequent products are restored with
+`pause_scope=system`. The next monthly catalogue sync, or a manual sync after
 installing a new key, wakes quota-paused products before processing resumes. If
 an earlier query in the same action completed before the explicit quota
 response, its known credits are audited and the action remains retryable after
@@ -109,16 +128,25 @@ manufacturer and product type without receiving or routing on `family_code`.
 The runtime strips/overwrites model attempts to
 set `schema_version`, `product_id`, or `lease_token`, requires the proposed
 model to match the catalogue name, allows series documents containing sibling
-models into analysis, and requires a short exact target-model-only
-model/label/value span for every unique fact. The optional
-`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` is an explicit override and fast path for
-known domains, not a required complete registry. If no entry matches, the local
-gate can automatically verify only an HTTPS manufacturer host whose name is
-consistent with the AI-discovered manufacturer and whose extracted body
-contains both that manufacturer and the complete catalogue model. A second
-independent HTTPS extract must corroborate the identity, and every fact needs
-exact quotes from both non-community domains. The model cannot grant trust by
-itself. A failed check becomes `source_unverified`, is
+models into analysis, and requires grounded fact evidence. A prose or
+target-only row uses one exact model/label/value quote. A Markdown-pipe or TSV
+table may instead provide an exact `model_quote` header row and exact parameter
+`quote` row; the runtime verifies one unique target-model column and the
+selected value in that same column.
+
+`PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` explicitly maps a catalogue `brand_code` to
+the public manufacturer identity allowed in search and decision validation.
+`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` maps that exact brand or alias to narrow
+trusted hosts. A domain override is usable only with the corresponding public
+alias, and AI output cannot select or replace either operator mapping. If no
+trusted-domain entry matches, the local gate can automatically verify only
+an HTTPS manufacturer host whose name is consistent with the public
+manufacturer and whose extract contains both that manufacturer and the
+complete catalogue model. A second independent HTTPS extract must corroborate
+the identity. Each specification fact needs its exact quote from the verified
+primary manufacturer datasheet, but not a duplicate quote from the independent
+identity source. The model cannot grant trust by itself. A failed check becomes
+`source_unverified`, is
 audited, and receives automatic backoff without a manual escalation. The local
 decision validator runs before any Wiki.js mutation.
 
@@ -126,15 +154,23 @@ Changing provider URL or model is an operator configuration change. Run one
 private/unpublished product at the final prefix and re-review quality before
 continuing a published schedule. Use a separate state volume for a different
 staging prefix. Rotate the key independently of all other credentials. A
-definitive AI 401/402/403/404 opens a provider-global circuit for six hours,
-and AI 429 opens one for an hour. Matching later products stop before web
-research instead of repeatedly spending credits against a known-bad AI path;
+definitive AI 401/402/403/404 or Exa 401/403/404 opens a provider-global
+circuit for six hours, and either provider's 429 opens one for an hour. Exa
+402 rotates to another configured key; exhaustion of every key opens a circuit
+through the next UTC month. Matching later products stop before
+web research instead of repeatedly spending credits against a known-bad path;
 three distinct products with invalid AI output in one hour also open a
 provider-scoped output circuit. Changing endpoint, account key, or model
-creates a different circuit scope. Configuration rejection and repeated
-invalid-output circuits return HTTP 503 after durably recording the outcome,
-so n8n's bounded retries can produce one systemic alert. The 429 circuit
-returns a clean stop and relies on automatic backoff.
+creates a different circuit scope. Decision, provider-rejection, rate-limit,
+quota, and invalid-output circuits are checked after local-only work and before
+paid research. An open circuit finishes the short lease as audit-only
+`system_paused`, restores the exact prior queue state, and returns a clean
+`processed=false` stop. Provider rejection/quota responses include their exact
+resume time; decision/output responses expose their bounded window through
+authenticated status. No unrelated product is marked failed and no n8n retry
+is needed. Empty-identity handling, content quarantine, and same-source
+Wiki-only publication recovery remain available while a research circuit is
+open.
 
 ## PostgreSQL boundaries and transport
 
@@ -163,7 +199,7 @@ The default local state is
 catalogue rows become due, claims have finite leases, and expired claims are
 audited.
 
-Each attempt has a schema-v7 `research_actions` ledger. Before every Search,
+Each attempt has a schema-v9 `research_actions` ledger. Before every Search,
 Extract, or AI action, the worker stores its round, action name, and request
 fingerprint as `started`. A completed action stores only bounded URLs, request
 IDs, outcome/gap metadata, physical AI request counts, and known credit
@@ -191,11 +227,13 @@ accessory mentions and negation fail closed. If the catalogue identity itself
 names the hardware, a quote may mention its solar-mounting use only when it
 also explicitly states that the item is a nut, bolt, or fastener. The publish
 path independently rejects a generic-hardware model or public category.
-Every publication citation must be
-in that exact-match set. A series document may contain sibling models, but every
-published fact still needs an exact target-model-only span. Ambiguous
-multi-model table rows fail closed into an audited non-publish outcome and
-automatic retry rather than guessing a column or opening a review issue.
+Every publication citation must be in that exact-match set. A series document
+may contain sibling models. Ordinary prose still requires a target-only
+model/label/value span; an explicit Markdown/TSV table may use separate
+`model_quote` and parameter `quote` rows only when their cell counts match, the
+target occurs in one unique header cell, and the selected value is unambiguous
+in the same column. Other multi-model rows fail closed into an audited
+non-publish outcome rather than guessing a column.
 The low-level `publish` command therefore requires `--evidence-file` for a
 publish outcome. The fixed n8n `run-one` operation passes the bounded evidence
 in memory and does not persist source bodies.
@@ -203,6 +241,16 @@ in memory and does not persist source bodies.
 `pv-wiki status` reports aggregate research action/credit counts. With
 `--product-id`, it also returns the bounded per-action ledger alongside the
 last attempts.
+
+When both fresh `due` items and matured `backoff` items are available,
+`lease_next` uses a 4:1 weighted preference and falls back to the other class
+when the preferred class is empty. Alternating content outcomes still count
+toward one source-revision streak. After six consecutive content failures
+(`ambiguous`, `insufficient_identity`, `invalid_decision`, `no_datasheet`,
+`out_of_scope`, or `source_unverified`), the next queue visit records
+`content_quarantined` without another paid provider call. It is scheduled for
+the annual refresh; any catalogue source-hash change resets the relevant
+revision history and makes the product immediately due.
 
 Retry behavior:
 
@@ -216,6 +264,9 @@ Retry behavior:
 - source verification failure: about 7, 30, 90, then 365 days;
 - matching generic hardware or another out-of-scope item: recheck after 365
   days;
+- six consecutive content failures for one source revision:
+  `content_quarantined`, recheck after 365 days or immediately after a source
+  change;
 - search provider, AI, Wiki.js, or another transient service error: about 1, 6, then 24
   hours for the same outcome;
 - invalid AI decision contract: about 24 hours, 3 days, 7 days, then 30 days;
@@ -250,15 +301,18 @@ exists.
 ## n8n monitoring
 
 Use `/healthz/readiness` for n8n readiness because it includes database
-connection/migration state. Use the worker's `/healthz` for its local process
-and state schema. Configure an n8n Error Workflow with the operator's chosen
+connection/migration state. Use the worker's public `/healthz` only for local
+process/state-schema liveness. Query authenticated `GET /status` with
+`Authorization: Bearer <PV_WIKI_WORKER_TOKEN>` for redacted due counts, global
+budget pauses, AI configuration, and circuit readiness. Configure an n8n Error
+Workflow with the operator's chosen
 email/chat/incident channel only for a failed workflow execution or a systemic
 provider, configuration, database, or service condition. Treat the execution as
 one batch-level incident; do not route normal product outcomes to an issue
 tracker or notification channel. Five consecutive `invalid_decision` outcomes
-inside 30 minutes open the decision circuit before another product is leased;
-this converts a likely model/contract regression into one stopped batch rather
-than thousands of product alerts.
+inside 30 minutes open the decision circuit before another paid research
+action; this converts a likely model/contract regression into one cleanly
+stopped batch rather than thousands of product alerts.
 
 Run `docker compose --env-file .env -f compose.yaml exec -T n8n n8n audit`
 after installation and upgrades (or the discovered instance's equivalent).

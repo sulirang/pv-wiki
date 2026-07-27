@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Consistent local recovery backup for the PV Wiki worker and its shared n8n
+# supervisor. Override these paths in /etc/default/pv-wiki-backup when the
+# deployment layout differs.
+BACKUP_ROOT="${PV_WIKI_BACKUP_ROOT:-/var/backups/pv-wiki}"
+PV_WIKI_STATE_FILE="${PV_WIKI_STATE_FILE:-/var/lib/docker/volumes/pv-wiki-worker_pv_wiki_state/_data/state.sqlite3}"
+N8N_DATA_DIR="${N8N_DATA_DIR:-/opt/ai-agents/n8n/data}"
+N8N_CONTAINER="${N8N_CONTAINER:-n8n}"
+
+case "${BACKUP_ROOT}" in
+  /*) ;;
+  *) echo "PV_WIKI_BACKUP_ROOT must be an absolute path" >&2; exit 2 ;;
+esac
+BACKUP_ROOT="$(realpath -m -- "${BACKUP_ROOT}")"
+if [[ "${BACKUP_ROOT}" == "/" || "${BACKUP_ROOT}" == "/root" ]]; then
+  echo "PV_WIKI_BACKUP_ROOT is too broad" >&2
+  exit 2
+fi
+case "${PV_WIKI_STATE_FILE}" in
+  /*) ;;
+  *) echo "PV_WIKI_STATE_FILE must be an absolute path" >&2; exit 2 ;;
+esac
+case "${N8N_DATA_DIR}" in
+  /*) ;;
+  *) echo "N8N_DATA_DIR must be an absolute path" >&2; exit 2 ;;
+esac
+
+install -d -m 0700 "${BACKUP_ROOT}"
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+snapshot_dir="$(mktemp -d "${BACKUP_ROOT}/.snapshot-${timestamp}-XXXXXXXX.partial")"
+chmod 0700 "${snapshot_dir}"
+
+sqlite_backup() {
+  local source_path="$1"
+  local destination_path="$2"
+  python3 - "${source_path}" "${destination_path}" <<'PY'
+import sqlite3
+import sys
+
+source_path, destination_path = sys.argv[1:3]
+source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+destination = sqlite3.connect(destination_path)
+try:
+    source.backup(destination)
+    result = destination.execute("PRAGMA quick_check").fetchone()
+    if result is None or result[0] != "ok":
+        raise RuntimeError(f"SQLite quick_check failed: {result!r}")
+finally:
+    destination.close()
+    source.close()
+PY
+  chmod 0600 "${destination_path}"
+}
+
+sqlite_backup "${PV_WIKI_STATE_FILE}" "${snapshot_dir}/pv-wiki-state.sqlite3"
+sqlite_backup "${N8N_DATA_DIR}/database.sqlite" "${snapshot_dir}/n8n-database.sqlite"
+install -m 0600 "${N8N_DATA_DIR}/config" "${snapshot_dir}/n8n-config"
+
+container_export="/tmp/pv-wiki-workflows-${timestamp}-$$.json"
+cleanup_container_export() {
+  docker exec "${N8N_CONTAINER}" rm -f "${container_export}" >/dev/null 2>&1 || true
+}
+trap cleanup_container_export EXIT
+docker exec "${N8N_CONTAINER}" \
+  n8n export:workflow --all --output="${container_export}"
+docker cp \
+  "${N8N_CONTAINER}:${container_export}" \
+  "${snapshot_dir}/n8n-workflows.json"
+cleanup_container_export
+trap - EXIT
+chmod 0600 "${snapshot_dir}/n8n-workflows.json"
+
+(
+  cd "${snapshot_dir}"
+  sha256sum \
+    n8n-config \
+    n8n-database.sqlite \
+    n8n-workflows.json \
+    pv-wiki-state.sqlite3 > SHA256SUMS
+)
+chmod 0600 "${snapshot_dir}/SHA256SUMS"
+
+completed_name="$(basename -- "${snapshot_dir}")"
+completed_name="${completed_name#.}"
+completed_name="${completed_name%.partial}"
+completed_dir="${BACKUP_ROOT}/${completed_name}"
+mv -- "${snapshot_dir}" "${completed_dir}"
+echo "${completed_dir}"

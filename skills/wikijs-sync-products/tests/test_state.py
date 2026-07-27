@@ -69,6 +69,18 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(first.source_hash, replay.source_hash)
         self.assertTrue(self.store.is_due("P-1", now=T0))
         self.assertEqual(self.store.status_counts(now=T0)["due"], 1)
+        self.assertEqual(self.store.due_count(now=T0), 1)
+        self.assertEqual(
+            0,
+            self.store.get_product("P-1").content_failure_cutoff_attempt_id,
+        )
+        self.assertIsNone(
+            self.store.get_product("P-1").leased_from_status,
+        )
+        self.assertIsNone(
+            self.store.get_product("P-1").leased_from_next_run_at,
+        )
+        self.assertEqual([], self.store.requeue_event_history())
 
     def test_changed_database_row_is_rescheduled_immediately(self):
         self.store.upsert_product(product(), now=T0)
@@ -101,6 +113,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertTrue(self.store.precheck(lease, now=T0).ready)
         looked_up = self.store.get_by_lease(lease.token, now=T0)
         self.assertEqual(looked_up, lease)
+        self.assertEqual(self.store.due_count(now=T0), 0)
         self.assertIsNone(self.store.lease_next("worker-b", now=T0))
 
         outcome = self.store.record_outcome(
@@ -129,6 +142,254 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(history[0].outcome, "synced")
         self.assertEqual(history[0].details["wiki_path"], "/products/p-1")
         self.assertEqual(history[0].payload["product_name"], "Panel")
+        completed = self.store.get_product("P-1")
+        self.assertIsNone(completed.leased_from_status)
+        self.assertIsNone(completed.leased_from_next_run_at)
+
+    def test_defer_lease_restores_backoff_without_product_penalty(self):
+        self.store.upsert_product(product(), now=T0)
+        first = self.store.lease_next("worker-first", now=T0)
+        failed = self.store.record_outcome(
+            first,
+            "no_datasheet",
+            error="no official source",
+            now=T0 + timedelta(seconds=1),
+        )
+        original = self.store.get_product("P-1")
+        self.assertEqual("backoff", original.status)
+
+        leased = self.store.lease_next(
+            "worker-paused",
+            now=failed.next_run_at,
+        )
+        leased_state = self.store.get_product("P-1")
+        self.assertEqual("leased", leased_state.status)
+        self.assertEqual("backoff", leased_state.leased_from_status)
+        self.assertEqual(
+            original.next_run_at,
+            leased_state.leased_from_next_run_at,
+        )
+
+        deferred_at = failed.next_run_at + timedelta(seconds=1)
+        deferred = self.store.defer_lease(
+            leased,
+            "  Exa   provider circuit open  ",
+            now=deferred_at,
+        )
+
+        self.assertEqual("backoff", deferred.status)
+        self.assertEqual(original.next_run_at, deferred.next_run_at)
+        self.assertEqual(
+            leased_state.consecutive_failures,
+            deferred.consecutive_failures,
+        )
+        self.assertEqual(leased_state.last_outcome, deferred.last_outcome)
+        self.assertEqual(leased_state.last_error, deferred.last_error)
+        self.assertEqual(
+            leased_state.last_attempt_at,
+            deferred.last_attempt_at,
+        )
+        self.assertEqual(
+            leased_state.last_success_at,
+            deferred.last_success_at,
+        )
+        self.assertIsNone(deferred.lease_token)
+        self.assertIsNone(deferred.leased_from_status)
+        self.assertIsNone(deferred.leased_from_next_run_at)
+
+        history = self.store.attempt_history("P-1")
+        self.assertEqual(["no_datasheet", "system_paused"], [
+            attempt.outcome for attempt in history
+        ])
+        self.assertEqual("Exa provider circuit open", history[-1].error)
+        self.assertEqual(deferred_at, history[-1].finished_at)
+        self.assertEqual(1, self.store.content_failure_streak("P-1"))
+        self.assertEqual(
+            1,
+            self.store.requeue_products(
+                ("no_datasheet",),
+                reason="content-policy-v2",
+                now=deferred_at,
+            ),
+        )
+
+        replacement = self.store.lease_next(
+            "worker-after-pause",
+            now=deferred_at,
+        )
+        retried = self.store.record_outcome(
+            replacement,
+            "no_datasheet",
+            now=deferred_at + timedelta(seconds=1),
+        )
+        self.assertEqual(2, retried.consecutive_failures)
+        self.assertEqual(
+            deferred_at + timedelta(seconds=1, days=90),
+            retried.next_run_at,
+        )
+
+    def test_defer_lease_preserves_synced_publication_metadata(self):
+        self.store.upsert_product(product(), now=T0)
+        first = self.store.lease_next("publisher", now=T0)
+        published_at = T0 + timedelta(seconds=1)
+        published = self.store.record_outcome(
+            first,
+            "synced",
+            payload={
+                "decision": {
+                    "manufacturer": "Acme Public",
+                    "model": "Panel One",
+                }
+            },
+            wiki_path="products/p-1-a1",
+            now=published_at,
+        )
+        before = self.store.published_products()
+        refresh = self.store.lease_next(
+            "refresh-worker",
+            now=published.next_run_at,
+        )
+        deferred = self.store.defer_lease(
+            refresh,
+            "AI provider unavailable",
+            now=published.next_run_at + timedelta(seconds=1),
+        )
+
+        self.assertEqual("synced", deferred.status)
+        self.assertEqual(published.next_run_at, deferred.next_run_at)
+        self.assertEqual("synced", deferred.last_outcome)
+        self.assertEqual(published_at, deferred.last_success_at)
+        self.assertEqual(before, self.store.published_products())
+
+    def test_defer_lease_is_single_winner_across_store_instances(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("paused-worker", now=T0)
+        other = state.StateStore(self.path)
+
+        def defer(store):
+            try:
+                store.defer_lease(
+                    lease,
+                    "provider circuit open",
+                    now=T0 + timedelta(seconds=1),
+                )
+            except state.LeaseLostError:
+                return "lost"
+            return "deferred"
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(defer, (self.store, other)))
+            self.assertCountEqual(["deferred", "lost"], results)
+            self.assertEqual(
+                ["system_paused"],
+                [
+                    attempt.outcome
+                    for attempt in self.store.attempt_history("P-1")
+                ],
+            )
+            current = self.store.get_product("P-1")
+            self.assertEqual("due", current.status)
+            self.assertIsNone(current.lease_token)
+        finally:
+            other.close()
+
+    def test_defer_lease_fails_closed_after_source_change(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("paused-worker", now=T0)
+        changed_at = T0 + timedelta(seconds=1)
+        self.store.upsert_product(
+            product(
+                name="Panel revision B",
+                updated_at=changed_at,
+            ),
+            now=changed_at,
+        )
+
+        with self.assertRaisesRegex(state.LeaseLostError, "source changed"):
+            self.store.defer_lease(
+                lease,
+                "provider circuit open",
+                now=changed_at + timedelta(seconds=1),
+            )
+
+        unchanged = self.store.get_product("P-1")
+        self.assertEqual("leased", unchanged.status)
+        self.assertTrue(unchanged.reschedule_requested)
+        self.assertIsNone(self.store.attempt_history("P-1")[0].finished_at)
+        stale = self.store.record_outcome(
+            lease,
+            "no_datasheet",
+            now=changed_at + timedelta(seconds=2),
+        )
+        self.assertEqual("stale_source", stale.outcome)
+        self.assertEqual(
+            ["stale_source"],
+            [
+                attempt.outcome
+                for attempt in self.store.attempt_history("P-1")
+            ],
+        )
+
+    def test_defer_lease_seals_started_action_as_uncertain(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("paused-worker", now=T0)
+        fingerprint = state.research_request_fingerprint(
+            "search",
+            {"queries": ["panel datasheet"]},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=fingerprint,
+            now=T0,
+        )
+
+        self.store.defer_lease(
+            lease,
+            "provider circuit opened",
+            now=T0 + timedelta(seconds=1),
+        )
+
+        action = self.store.get_research_action(
+            lease.attempt_id,
+            0,
+            "search",
+        )
+        self.assertEqual("uncertain", action.status)
+        self.assertEqual(
+            "attempt paused before research action completion",
+            action.error,
+        )
+        self.assertEqual(
+            "system_paused",
+            self.store.attempt_history("P-1")[0].outcome,
+        )
+
+    def test_defer_lease_at_expiry_reclaims_instead_of_restoring(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next(
+            "expired-worker",
+            lease_seconds=10,
+            now=T0,
+        )
+
+        with self.assertRaises(state.LeaseLostError):
+            self.store.defer_lease(
+                lease,
+                "provider circuit opened",
+                now=T0 + timedelta(seconds=10),
+            )
+
+        current = self.store.get_product("P-1")
+        self.assertEqual("backoff", current.status)
+        self.assertEqual(1, current.consecutive_failures)
+        self.assertIsNone(current.leased_from_status)
+        self.assertIsNone(current.leased_from_next_run_at)
+        history = self.store.attempt_history("P-1")
+        self.assertEqual("lease_expired", history[0].outcome)
+        self.assertNotEqual("system_paused", history[0].outcome)
 
     def test_published_products_uses_latest_success_not_queue_status(self):
         self.store.upsert_product(product(), now=T0)
@@ -189,6 +450,22 @@ class StateStoreTests(unittest.TestCase):
         lease = self.store.lease_next("scope-worker", now=T0)
 
         outcome = self.store.record_outcome(lease, "out_of_scope", now=T0)
+
+        self.assertEqual("backoff", outcome.status)
+        self.assertEqual(
+            T0 + timedelta(days=state.SYNC_REFRESH_DAYS),
+            outcome.next_run_at,
+        )
+
+    def test_content_quarantine_waits_for_annual_or_source_refresh(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("quarantine-worker", now=T0)
+
+        outcome = self.store.record_outcome(
+            lease,
+            "content_quarantined",
+            now=T0,
+        )
 
         self.assertEqual("backoff", outcome.status)
         self.assertEqual(
@@ -319,6 +596,193 @@ class StateStoreTests(unittest.TestCase):
             1,
             self.store.resume_search_quota_waits(now=resumed_at),
         )
+
+    def test_lease_next_fairly_interleaves_mature_backoff_and_defers_synced(self):
+        for product_id in [f"D-{index}" for index in range(8)]:
+            self.store.upsert_product(product(product_id), now=T0)
+        for product_id in ("B-1", "B-2", "S-1"):
+            self.store.upsert_product(product(product_id), now=T0)
+        with sqlite3.connect(self.path) as connection:
+            connection.execute(
+                """
+                UPDATE products
+                SET status = 'backoff'
+                WHERE product_id IN ('B-1', 'B-2')
+                """
+            )
+            connection.execute(
+                """
+                UPDATE products
+                SET status = 'synced'
+                WHERE product_id = 'S-1'
+                """
+            )
+
+        leased_ids: list[str] = []
+        for index in range(10):
+            lease = self.store.lease_next(
+                f"fair-worker-{index}",
+                now=T0 + timedelta(seconds=index),
+            )
+            self.assertIsNotNone(lease)
+            leased_ids.append(lease.product_id)
+            self.store.record_outcome(
+                lease,
+                "synced",
+                now=T0 + timedelta(seconds=index, microseconds=1),
+            )
+            if index == 4:
+                # The fairness phase belongs to durable attempt history, not
+                # process memory.
+                self.store.close()
+                self.store = state.StateStore(self.path)
+
+        self.assertEqual(
+            [
+                "D-0",
+                "D-1",
+                "D-2",
+                "D-3",
+                "B-1",
+                "D-4",
+                "D-5",
+                "D-6",
+                "D-7",
+                "B-2",
+            ],
+            leased_ids,
+        )
+        refresh = self.store.lease_next(
+            "refresh-worker",
+            now=T0 + timedelta(seconds=20),
+        )
+        self.assertEqual("S-1", refresh.product_id)
+
+    def test_selective_requeue_uses_latest_attempt_cutover_and_preserves_audit(self):
+        self.store.upsert_product(product("ACTIVE"), now=T0 - timedelta(hours=2))
+        active_previous = self.store.lease_next(
+            "active-old",
+            now=T0 - timedelta(hours=2),
+        )
+        self.store.record_outcome(
+            active_previous,
+            "ai_error",
+            error="old provider failure",
+            now=T0 - timedelta(hours=2),
+        )
+        active_lease = self.store.lease_next(
+            "active-current",
+            lease_seconds=21_600,
+            now=T0 - timedelta(minutes=30),
+        )
+        self.assertEqual("ACTIVE", active_lease.product_id)
+
+        attempts = (
+            ("OLD-INVALID", "invalid_decision", T0, "old contract"),
+            (
+                "OLD-AI",
+                "ai_error",
+                T0 + timedelta(minutes=1),
+                "old prompt",
+            ),
+            (
+                "OTHER",
+                "no_datasheet",
+                T0 + timedelta(minutes=2),
+                "not selected",
+            ),
+            (
+                "NEW-INVALID",
+                "invalid_decision",
+                T0 + timedelta(hours=2),
+                "new contract",
+            ),
+        )
+        for product_id, outcome, attempted_at, error in attempts:
+            self.store.upsert_product(product(product_id), now=attempted_at)
+            lease = self.store.lease_next(
+                f"worker-{product_id}",
+                now=attempted_at,
+            )
+            self.assertEqual(product_id, lease.product_id)
+            self.store.record_outcome(
+                lease,
+                outcome,
+                error=error,
+                now=attempted_at + timedelta(seconds=1),
+            )
+
+        requeue_at = T0 + timedelta(days=1)
+        self.assertEqual(
+            1,
+            self.store.requeue_products(
+                {"invalid_decision", "ai_error"},
+                reason="prompt-v3 evidence-policy-v2 cutover",
+                attempted_after=T0 - timedelta(hours=3),
+                attempted_before=T0 + timedelta(hours=1),
+                limit=1,
+                now=requeue_at,
+            ),
+        )
+        self.assertEqual("due", self.store.get_product("OLD-INVALID").status)
+        self.assertEqual(
+            "invalid_decision",
+            self.store.get_product("OLD-INVALID").last_outcome,
+        )
+        self.assertEqual(
+            "old contract",
+            self.store.get_product("OLD-INVALID").last_error,
+        )
+        self.assertEqual(
+            1,
+            self.store.requeue_products(
+                ("invalid_decision", "ai_error"),
+                reason="prompt-v3 evidence-policy-v2 cutover",
+                attempted_after=T0 - timedelta(hours=3),
+                attempted_before=T0 + timedelta(hours=1),
+                limit=10,
+                now=requeue_at,
+            ),
+        )
+        self.assertEqual("due", self.store.get_product("OLD-AI").status)
+        self.assertEqual("backoff", self.store.get_product("OTHER").status)
+        self.assertEqual(
+            "backoff",
+            self.store.get_product("NEW-INVALID").status,
+        )
+        self.assertEqual("leased", self.store.get_product("ACTIVE").status)
+        self.assertEqual(
+            0,
+            self.store.requeue_products(
+                ("invalid_decision", "ai_error"),
+                reason="prompt-v3 evidence-policy-v2 cutover",
+                attempted_after=T0 - timedelta(hours=3),
+                attempted_before=T0 + timedelta(hours=1),
+                now=requeue_at,
+            ),
+        )
+        self.assertEqual(1, len(self.store.attempt_history("OLD-INVALID")))
+
+        with self.assertRaisesRegex(TypeError, "iterable"):
+            self.store.requeue_products(
+                "ai_error",
+                reason="invalid outcomes container",
+            )
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            self.store.requeue_products(("ai_error",), reason=" ")
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            self.store.requeue_products(
+                ("ai_error",),
+                reason="cutover",
+                attempted_after=datetime(2026, 1, 1),
+            )
+        with self.assertRaisesRegex(ValueError, "earlier"):
+            self.store.requeue_products(
+                ("ai_error",),
+                reason="cutover",
+                attempted_after=T0,
+                attempted_before=T0,
+            )
 
     def test_search_and_extract_audit_bind_completed_evidence(self):
         self.store.upsert_product(product(), now=T0)
@@ -845,6 +1309,538 @@ class StateStoreTests(unittest.TestCase):
             stats["by_action"]["search"],
         )
 
+    def test_global_research_usage_counts_known_unknown_and_uncertain_actions(self):
+        evidence_url = "https://manufacturer.example/panel.pdf"
+        self.store.upsert_product(product("R-KNOWN"), now=T0)
+        known = self.store.lease_next(
+            "known-worker",
+            lease_seconds=20_000,
+            now=T0,
+        )
+        search_fingerprint = state.research_request_fingerprint(
+            "search",
+            {"queries": ["known"]},
+        )
+        self.store.begin_research_action(
+            known,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            now=T0,
+        )
+        self.store.finish_research_action(
+            known,
+            round_number=0,
+            action="search",
+            request_fingerprint=search_fingerprint,
+            status="completed",
+            result_summary={
+                "queries": ["known"],
+                "candidate_urls": [evidence_url],
+            },
+            credits=3,
+            now=T0 + timedelta(seconds=1),
+        )
+        extract_fingerprint = state.research_request_fingerprint(
+            "extract",
+            {"urls": [evidence_url]},
+        )
+        self.store.begin_research_action(
+            known,
+            round_number=0,
+            action="extract",
+            request_fingerprint=extract_fingerprint,
+            now=T0 + timedelta(seconds=2),
+        )
+        self.store.finish_research_action(
+            known,
+            round_number=0,
+            action="extract",
+            request_fingerprint=extract_fingerprint,
+            status="completed",
+            result_summary={
+                "submitted_urls": [evidence_url],
+                "successful_urls": [evidence_url],
+            },
+            credits=1,
+            now=T0 + timedelta(seconds=3),
+        )
+
+        self.store.upsert_product(
+            product("R-UNCERTAIN"),
+            now=T0 + timedelta(hours=1),
+        )
+        uncertain = self.store.lease_next(
+            "uncertain-worker",
+            lease_seconds=20_000,
+            now=T0 + timedelta(hours=1),
+        )
+        uncertain_fingerprint = state.research_request_fingerprint(
+            "search",
+            {"queries": ["uncertain"]},
+        )
+        self.store.begin_research_action(
+            uncertain,
+            round_number=0,
+            action="search",
+            request_fingerprint=uncertain_fingerprint,
+            now=T0 + timedelta(hours=1),
+        )
+        self.store.finish_research_action(
+            uncertain,
+            round_number=0,
+            action="search",
+            request_fingerprint=uncertain_fingerprint,
+            status="uncertain",
+            error="response status unknown",
+            now=T0 + timedelta(hours=1, seconds=1),
+        )
+
+        self.store.upsert_product(
+            product("LEGACY"),
+            now=T0 + timedelta(hours=2),
+        )
+        legacy = self.store.lease_next(
+            "legacy-worker",
+            lease_seconds=20_000,
+            now=T0 + timedelta(hours=2),
+        )
+        self.store.begin_search(legacy, now=T0 + timedelta(hours=2))
+        self.store.finish_search(
+            legacy,
+            [evidence_url],
+            {"credits": 2},
+            now=T0 + timedelta(hours=2, seconds=1),
+        )
+        self.store.begin_extract(
+            legacy,
+            [evidence_url],
+            now=T0 + timedelta(hours=2, seconds=2),
+        )
+
+        usage = self.store.research_usage_between(
+            start=T0,
+            end=T0 + timedelta(days=1),
+        )
+        self.assertEqual(5, usage["actions"])
+        self.assertEqual(6.0, usage["known_credits"])
+        self.assertEqual(2, usage["unknown_credit_actions"])
+        self.assertEqual(1, usage["uncertain_actions"])
+        self.assertEqual(2, usage["unknown_or_uncertain_actions"])
+        self.assertEqual(
+            {
+                "actions": 3,
+                "known_credits": 5.0,
+                "unknown_credit_actions": 1,
+                "uncertain_actions": 1,
+                "unknown_or_uncertain_actions": 1,
+            },
+            usage["by_action"]["search"],
+        )
+        self.assertEqual(
+            {
+                "actions": 2,
+                "known_credits": 1.0,
+                "unknown_credit_actions": 1,
+                "uncertain_actions": 0,
+                "unknown_or_uncertain_actions": 1,
+            },
+            usage["by_action"]["extract"],
+        )
+        narrow = self.store.research_usage_between(
+            start=T0,
+            end=T0 + timedelta(minutes=30),
+        )
+        self.assertEqual(2, narrow["actions"])
+        self.assertEqual(4.0, narrow["known_credits"])
+
+        with self.assertRaisesRegex(TypeError, "datetime"):
+            self.store.research_usage_between(
+                start="2026-01-01",  # type: ignore[arg-type]
+                end=T0,
+            )
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            self.store.research_usage_between(
+                start=datetime(2026, 1, 1),
+                end=T0,
+            )
+        with self.assertRaisesRegex(ValueError, "earlier"):
+            self.store.research_usage_between(start=T0, end=T0)
+
+    def test_ai_research_summary_accepts_only_bounded_numeric_metadata(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next(
+            "ai-metadata-worker",
+            lease_seconds=3600,
+            now=T0,
+        )
+
+        def reserve(round_number: int) -> str:
+            fingerprint = state.research_request_fingerprint(
+                "ai",
+                {"round": round_number},
+            )
+            self.store.begin_research_action(
+                lease,
+                round_number=round_number,
+                action="ai",
+                request_fingerprint=fingerprint,
+                now=T0 + timedelta(seconds=round_number),
+            )
+            return fingerprint
+
+        accepted_fingerprint = reserve(0)
+        accepted = self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="ai",
+            request_fingerprint=accepted_fingerprint,
+            status="completed",
+            result_summary={
+                "action_type": "final",
+                "finish_reasons": ["STOP", "length"],
+                "usage_totals": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "reasoning_tokens": 10,
+                    "total_tokens": 150,
+                },
+            },
+            credits=0,
+            now=T0 + timedelta(seconds=1),
+        )
+        self.assertEqual(
+            ["stop", "length"],
+            accepted.result_summary["finish_reasons"],
+        )
+        self.assertEqual(
+            150,
+            accepted.result_summary["usage_totals"]["total_tokens"],
+        )
+
+        invalid_fingerprint = reserve(1)
+        invalid_summaries = (
+            {"finish_reasons": ["stop", "stop", "stop"]},
+            {"finish_reasons": ["provider said: done"]},
+            {"usage_totals": {"provider_text": 1}},
+            {"usage_totals": {"prompt_tokens": "120"}},
+            {
+                "usage_totals": {
+                    "prompt_tokens": state.MAX_RESEARCH_AI_TOKEN_USAGE + 1
+                }
+            },
+            {"usage_totals": {"prompt_tokens": {"value": 120}}},
+            {"error_category": "DECISION_CONTRACT"},
+            {"error_category": "unknown_contract"},
+        )
+        for summary in invalid_summaries:
+            with self.subTest(summary=summary), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                self.store.finish_research_action(
+                    lease,
+                    round_number=1,
+                    action="ai",
+                    request_fingerprint=invalid_fingerprint,
+                    status="completed",
+                    result_summary={
+                        "action_type": "final",
+                        **summary,
+                    },
+                    credits=0,
+                    now=T0 + timedelta(seconds=2),
+                )
+        failed = self.store.finish_research_action(
+            lease,
+            round_number=1,
+            action="ai",
+            request_fingerprint=invalid_fingerprint,
+            status="failed",
+            result_summary={
+                "provider_fingerprint": "a" * 64,
+                "provider_requests": 1,
+                "error_type": "AIInvalidOutputError",
+                "error_category": "action_contract",
+            },
+            credits=0,
+            error="invalid output after repair",
+            now=T0 + timedelta(seconds=2),
+        )
+        self.assertEqual(
+            "action_contract",
+            failed.result_summary["error_category"],
+        )
+
+    def test_provider_rejection_accessors_return_true_finish_and_expiry(self):
+        exa_fingerprint = "b" * 64
+        ai_fingerprint = "c" * 64
+        window = timedelta(hours=1)
+
+        def record_rejection(
+            product_id,
+            action,
+            provider_fingerprint,
+            http_status,
+            finished_at,
+        ):
+            started_at = finished_at - timedelta(seconds=1)
+            self.store.upsert_product(
+                product(product_id),
+                now=started_at,
+            )
+            lease = self.store.lease_next(
+                f"worker-{product_id}",
+                lease_seconds=7200,
+                now=started_at,
+            )
+            request_fingerprint = state.research_request_fingerprint(
+                action,
+                {"product_id": product_id},
+            )
+            self.store.begin_research_action(
+                lease,
+                round_number=0,
+                action=action,
+                request_fingerprint=request_fingerprint,
+                now=started_at,
+            )
+            result = self.store.finish_research_action(
+                lease,
+                round_number=0,
+                action=action,
+                request_fingerprint=request_fingerprint,
+                status="failed",
+                result_summary={
+                    "provider_fingerprint": provider_fingerprint,
+                    "provider_requests": 1,
+                    "http_status": http_status,
+                    "error_type": (
+                        "AIHTTPError" if action == "ai" else "ExaHTTPError"
+                    ),
+                },
+                credits=0,
+                error="definitive provider rejection",
+                now=finished_at,
+            )
+            return result
+
+        search_finished = T0 + timedelta(seconds=10)
+        extract_finished = T0 + timedelta(seconds=20)
+        ai_finished = T0 + timedelta(seconds=30)
+        search = record_rejection(
+            "P-SEARCH",
+            "search",
+            exa_fingerprint,
+            429,
+            search_finished,
+        )
+        extract = record_rejection(
+            "P-EXTRACT",
+            "extract",
+            exa_fingerprint,
+            403,
+            extract_finished,
+        )
+        record_rejection(
+            "P-AI",
+            "ai",
+            ai_fingerprint,
+            503,
+            ai_finished,
+        )
+        quota_finished = T0 + timedelta(seconds=25)
+        quota_started = quota_finished - timedelta(seconds=1)
+        self.store.upsert_product(
+            product("P-QUOTA"),
+            now=quota_started,
+        )
+        quota_lease = self.store.lease_next(
+            "worker-P-QUOTA",
+            lease_seconds=7200,
+            now=quota_started,
+        )
+        quota_request = state.research_request_fingerprint(
+            "search",
+            {"product_id": "P-QUOTA"},
+        )
+        self.store.begin_research_action(
+            quota_lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=quota_request,
+            now=quota_started,
+        )
+        self.store.finish_research_action(
+            quota_lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=quota_request,
+            status="failed",
+            result_summary={
+                "provider_fingerprint": exa_fingerprint,
+                "provider_requests": 1,
+                "error_type": "ExaQuotaExhaustedError",
+            },
+            credits=0,
+            error="monthly provider quota exhausted",
+            now=quota_finished,
+        )
+        self.assertEqual(exa_fingerprint, search.result_summary[
+            "provider_fingerprint"
+        ])
+        self.assertEqual(403, extract.result_summary["http_status"])
+
+        exa_event = self.store.recent_exa_provider_rejection(
+            exa_fingerprint,
+            http_statuses={403, 429},
+            within=window,
+            now=T0 + timedelta(minutes=1),
+        )
+        self.assertEqual("extract", exa_event.action)
+        self.assertEqual("failed", exa_event.research_status)
+        self.assertEqual(403, exa_event.http_status)
+        self.assertEqual("ExaHTTPError", exa_event.error_type)
+        self.assertEqual(extract_finished, exa_event.finished_at)
+        self.assertEqual(extract_finished + window, exa_event.expires_at)
+
+        search_event = self.store.recent_provider_rejection(
+            exa_fingerprint,
+            actions=("search",),
+            http_statuses=(429,),
+            within=window,
+            now=T0 + timedelta(minutes=1),
+        )
+        self.assertEqual("search", search_event.action)
+        self.assertEqual(search_finished, search_event.finished_at)
+
+        quota_event = self.store.recent_exa_provider_error(
+            exa_fingerprint,
+            error_types={"ExaQuotaExhaustedError"},
+            within=window,
+            now=T0 + timedelta(minutes=1),
+        )
+        self.assertEqual("search", quota_event.action)
+        self.assertEqual("failed", quota_event.research_status)
+        self.assertEqual("ExaQuotaExhaustedError", quota_event.error_type)
+        self.assertIsNone(quota_event.http_status)
+        self.assertEqual(quota_finished, quota_event.finished_at)
+        self.assertEqual(quota_finished + window, quota_event.expires_at)
+        self.assertIsNone(
+            self.store.recent_provider_error(
+                exa_fingerprint,
+                actions=("extract",),
+                error_types={"ExaQuotaExhaustedError"},
+                within=window,
+                now=T0 + timedelta(minutes=1),
+            )
+        )
+
+        ai_event = self.store.recent_ai_provider_rejection_event(
+            ai_fingerprint,
+            http_statuses=(503,),
+            within=window,
+            now=ai_finished + window - timedelta(microseconds=1),
+        )
+        self.assertEqual(ai_finished, ai_event.finished_at)
+        self.assertEqual(ai_finished + window, ai_event.expires_at)
+        self.assertEqual(
+            503,
+            self.store.recent_ai_provider_rejection(
+                ai_fingerprint,
+                http_statuses=(503,),
+                within=window,
+                now=ai_finished + timedelta(minutes=1),
+            ),
+        )
+        self.assertIsNone(
+            self.store.recent_ai_provider_rejection_event(
+                ai_fingerprint,
+                http_statuses=(503,),
+                within=window,
+                now=ai_finished + window,
+            )
+        )
+        self.assertIsNone(
+            self.store.recent_ai_provider_rejection_event(
+                ai_fingerprint,
+                http_statuses=(503,),
+                within=window,
+                now=ai_finished - timedelta(microseconds=1),
+            )
+        )
+        with self.assertRaisesRegex(TypeError, "iterable"):
+            self.store.recent_provider_rejection(
+                exa_fingerprint,
+                actions="search",
+                http_statuses=(429,),
+                within=window,
+            )
+        with self.assertRaisesRegex(ValueError, "100 to 599"):
+            self.store.recent_exa_provider_rejection(
+                exa_fingerprint,
+                http_statuses=(99,),
+                within=window,
+            )
+        with self.assertRaisesRegex(ValueError, "positive"):
+            self.store.recent_exa_provider_error(
+                exa_fingerprint,
+                error_types={"ExaQuotaExhaustedError"},
+                within=timedelta(0),
+            )
+
+    def test_search_provider_metadata_is_strictly_bounded(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("search-metadata-worker", now=T0)
+        request_fingerprint = state.research_request_fingerprint(
+            "search",
+            {"queries": ["panel datasheet"]},
+        )
+        self.store.begin_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=request_fingerprint,
+            now=T0,
+        )
+        invalid_summaries = (
+            {"provider_fingerprint": "not-a-fingerprint"},
+            {"http_status": 99},
+            {"http_status": True},
+            {"error_type": "unsafe error type"},
+        )
+        for summary in invalid_summaries:
+            with self.subTest(summary=summary), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                self.store.finish_research_action(
+                    lease,
+                    round_number=0,
+                    action="search",
+                    request_fingerprint=request_fingerprint,
+                    status="failed",
+                    result_summary=summary,
+                    credits=0,
+                    error="provider rejection",
+                    now=T0 + timedelta(seconds=1),
+                )
+
+        finished = self.store.finish_research_action(
+            lease,
+            round_number=0,
+            action="search",
+            request_fingerprint=request_fingerprint,
+            status="failed",
+            result_summary={
+                "provider_fingerprint": "d" * 64,
+                "http_status": 429,
+                "error_type": "ExaHTTPError",
+            },
+            credits=0,
+            error="provider rejection",
+            now=T0 + timedelta(seconds=1),
+        )
+        self.assertEqual(429, finished.result_summary["http_status"])
+
     def test_completed_research_extracts_extend_legacy_allowed_evidence(self):
         self.store.upsert_product(product(), now=T0)
         lease = self.store.lease_next(
@@ -1135,15 +2131,21 @@ class StateStoreTests(unittest.TestCase):
 
     def test_counts_distinct_products_for_ai_output_circuit(self):
         provider_fingerprint = "e" * 64
-        for index in range(2):
+        cases = (
+            ("AIInvalidOutputError", "action_contract"),
+            ("AIInvalidOutputError", "invalid_json"),
+            ("AIResponseError", None),
+        )
+        for index, (error_type, category) in enumerate(cases):
             product_id = f"P-AI-{index}"
+            started_at = T0 + timedelta(seconds=index * 10)
             self.store.upsert_product(
                 product(product_id=product_id),
-                now=T0 + timedelta(seconds=index),
+                now=started_at,
             )
             lease = self.store.lease_next(
                 f"worker-{index}",
-                now=T0 + timedelta(seconds=index),
+                now=started_at,
             )
             fingerprint = state.research_request_fingerprint(
                 "ai",
@@ -1154,27 +2156,30 @@ class StateStoreTests(unittest.TestCase):
                 round_number=0,
                 action="ai",
                 request_fingerprint=fingerprint,
-                now=T0 + timedelta(seconds=index),
+                now=started_at,
             )
+            summary = {
+                "provider_fingerprint": provider_fingerprint,
+                "provider_requests": 2,
+                "error_type": error_type,
+            }
+            if category is not None:
+                summary["error_category"] = category
             self.store.finish_research_action(
                 lease,
                 round_number=0,
                 action="ai",
                 request_fingerprint=fingerprint,
                 status="uncertain",
-                result_summary={
-                    "provider_fingerprint": provider_fingerprint,
-                    "provider_requests": 2,
-                    "error_type": "AIInvalidOutputError",
-                },
+                result_summary=summary,
                 error="invalid output after repair",
-                now=T0 + timedelta(seconds=index + 1),
+                now=started_at + timedelta(seconds=1),
             )
             self.store.record_outcome(
                 lease,
                 "ai_error",
                 error="invalid output after repair",
-                now=T0 + timedelta(seconds=index + 2),
+                now=started_at + timedelta(seconds=2),
             )
 
         self.assertEqual(
@@ -1184,6 +2189,157 @@ class StateStoreTests(unittest.TestCase):
                 error_types={"AIInvalidOutputError"},
                 within=timedelta(hours=1),
                 now=T0 + timedelta(minutes=1),
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.store.recent_ai_provider_error_products(
+                provider_fingerprint,
+                error_types={"AIInvalidOutputError"},
+                categories={"action_contract"},
+                within=timedelta(hours=1),
+                now=T0 + timedelta(minutes=1),
+            ),
+        )
+        self.assertEqual(
+            1,
+            self.store.recent_ai_provider_error_products(
+                provider_fingerprint,
+                error_types={"AIResponseError"},
+                within=timedelta(hours=1),
+                now=T0 + timedelta(minutes=1),
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.store.recent_ai_provider_error_products(
+                provider_fingerprint,
+                error_types={"AIResponseError"},
+                categories={"action_contract"},
+                within=timedelta(hours=1),
+                now=T0 + timedelta(minutes=1),
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            self.store.recent_ai_provider_error_products(
+                provider_fingerprint,
+                error_types={"AIInvalidOutputError"},
+                categories={"invented_category"},
+                within=timedelta(hours=1),
+                now=T0 + timedelta(minutes=1),
+            )
+
+    def test_ai_provider_error_count_filters_before_high_volume_count(self):
+        target_fingerprint = "1" * 64
+        noise_fingerprint = "f" * 64
+        future_fingerprint = "2" * 64
+        for product_id in ("TARGET", "NOISE", "FUTURE"):
+            self.store.upsert_product(product(product_id), now=T0)
+
+        target_finished = T0 + timedelta(seconds=1)
+        observed_at = T0 + timedelta(minutes=30)
+        future_finished = observed_at + timedelta(seconds=1)
+
+        def insert_action(
+            connection,
+            *,
+            product_id,
+            sequence,
+            provider_fingerprint,
+            finished_at,
+        ):
+            attempt = connection.execute(
+                """
+                INSERT INTO attempts (
+                    product_id, source_hash, lease_token, worker_id,
+                    started_at, lease_until, finished_at, outcome
+                ) VALUES (?, ?, ?, 'audit-worker', ?, ?, ?, 'ai_error')
+                """,
+                (
+                    product_id,
+                    f"source-{product_id}",
+                    f"audit-token-{sequence}",
+                    state._time_text(finished_at - timedelta(seconds=1)),
+                    state._time_text(finished_at + timedelta(minutes=1)),
+                    state._time_text(finished_at),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO research_actions (
+                    attempt_id, round_number, action, status,
+                    request_fingerprint, started_at, finished_at,
+                    result_summary_json, credits, error
+                ) VALUES (?, 0, 'ai', 'failed', ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    int(attempt.lastrowid),
+                    f"{sequence:064x}"[-64:],
+                    state._time_text(finished_at - timedelta(seconds=1)),
+                    state._time_text(finished_at),
+                    (
+                        '{"error_category":"action_contract",'
+                        '"error_type":"AIInvalidOutputError",'
+                        f'"provider_fingerprint":"{provider_fingerprint}"'
+                        "}"
+                    ),
+                    "invalid output after repair",
+                ),
+            )
+
+        with sqlite3.connect(self.path) as connection:
+            insert_action(
+                connection,
+                product_id="TARGET",
+                sequence=1,
+                provider_fingerprint=target_fingerprint,
+                finished_at=target_finished,
+            )
+            # More than 1000 newer rows from another provider would mask the
+            # target if filtering happened after ORDER/LIMIT.
+            for sequence in range(2, 1003):
+                insert_action(
+                    connection,
+                    product_id="NOISE",
+                    sequence=sequence,
+                    provider_fingerprint=noise_fingerprint,
+                    finished_at=T0 + timedelta(seconds=2),
+                )
+            insert_action(
+                connection,
+                product_id="FUTURE",
+                sequence=1003,
+                provider_fingerprint=future_fingerprint,
+                finished_at=future_finished,
+            )
+
+        self.assertEqual(
+            1,
+            self.store.recent_ai_provider_error_products(
+                target_fingerprint,
+                error_types={"AIInvalidOutputError"},
+                categories={"action_contract"},
+                within=timedelta(hours=1),
+                now=observed_at,
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.store.recent_ai_provider_error_products(
+                future_fingerprint,
+                error_types={"AIInvalidOutputError"},
+                within=timedelta(hours=1),
+                now=observed_at,
+            ),
+        )
+        self.assertEqual(
+            0,
+            self.store.recent_ai_provider_error_products(
+                target_fingerprint,
+                error_types={"AIInvalidOutputError"},
+                categories={"invalid_json"},
+                within=timedelta(hours=1),
+                now=observed_at,
             ),
         )
 
@@ -1370,6 +2526,108 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual("uncertain", action.status)
         self.assertIsNone(action.credits)
         self.assertIn("attempt ended", action.error)
+
+    def test_content_failure_streak_counts_alternating_outcomes_per_revision(self):
+        self.store.upsert_product(product(), now=T0)
+        current = T0
+        for outcome in (
+            "no_datasheet",
+            "ambiguous",
+            "insufficient_identity",
+        ):
+            lease = self.store.lease_next("content-worker", now=current)
+            result = self.store.record_outcome(
+                lease,
+                outcome,
+                now=current,
+            )
+            current = result.next_run_at
+
+        self.assertEqual(3, self.store.content_failure_streak("P-1"))
+        self.assertEqual(
+            1,
+            self.store.content_failure_streak(
+                "P-1",
+                outcomes=("insufficient_identity",),
+            ),
+        )
+        self.store.upsert_product(
+            product(
+                name="Panel revision B",
+                updated_at=current + timedelta(days=1),
+            ),
+            now=current + timedelta(days=1),
+        )
+        self.assertEqual(0, self.store.content_failure_streak("P-1"))
+        with self.assertRaises(state.UnknownProductError):
+            self.store.content_failure_streak("MISSING")
+
+    def test_requeue_starts_new_content_failure_epoch_and_audits_reason(self):
+        self.store.upsert_product(product(), now=T0)
+        current = T0
+        latest_attempt_id = 0
+        latest_finished_at = T0
+        for index in range(6):
+            lease = self.store.lease_next(
+                f"content-worker-{index}",
+                now=current,
+            )
+            latest_attempt_id = lease.attempt_id
+            latest_finished_at = current + timedelta(seconds=1)
+            result = self.store.record_outcome(
+                lease,
+                "invalid_decision",
+                now=latest_finished_at,
+            )
+            current = result.next_run_at
+
+        self.assertEqual(6, self.store.content_failure_streak("P-1"))
+        self.assertEqual(6, len(self.store.attempt_history("P-1")))
+
+        requeued_at = latest_finished_at + timedelta(minutes=1)
+        self.assertEqual(
+            1,
+            self.store.requeue_products(
+                ("invalid_decision",),
+                reason="  prompt-v4   evidence-policy-v3  ",
+                now=requeued_at,
+            ),
+        )
+        self.assertEqual(0, self.store.content_failure_streak("P-1"))
+        self.assertEqual(6, len(self.store.attempt_history("P-1")))
+        self.assertEqual(
+            latest_attempt_id,
+            self.store.get_product(
+                "P-1"
+            ).content_failure_cutoff_attempt_id,
+        )
+
+        events = self.store.requeue_event_history("P-1")
+        self.assertEqual(1, len(events))
+        self.assertEqual("P-1", events[0].product_id)
+        self.assertEqual(latest_attempt_id, events[0].cutoff_attempt_id)
+        self.assertEqual("backoff", events[0].previous_status)
+        self.assertEqual("invalid_decision", events[0].previous_outcome)
+        self.assertEqual(
+            "prompt-v4 evidence-policy-v3",
+            events[0].reason,
+        )
+        self.assertEqual(requeued_at, events[0].requeued_at)
+        self.assertIsNone(events[0].attempted_after)
+        self.assertIsNone(events[0].attempted_before)
+
+        new_lease = self.store.lease_next(
+            "content-worker-new-policy",
+            now=requeued_at,
+        )
+        self.store.record_outcome(
+            new_lease,
+            "no_datasheet",
+            now=requeued_at + timedelta(seconds=1),
+        )
+        self.assertEqual(1, self.store.content_failure_streak("P-1"))
+        self.assertEqual(7, len(self.store.attempt_history("P-1")))
+        self.assertEqual(1, len(self.store.requeue_event_history(limit=1)))
 
     def test_expired_lease_is_reclaimed_and_audited(self):
         self.store.upsert_product(product(), now=T0)
@@ -1569,6 +2827,18 @@ class StateStoreTests(unittest.TestCase):
                         "PRAGMA table_info(research_actions)"
                     )
                 }
+                product_columns = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA table_info(products)"
+                    )
+                }
+                requeue_indexes = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA index_list(requeue_events)"
+                    )
+                }
             finally:
                 migrated_connection.close()
             self.assertTrue(
@@ -1587,6 +2857,17 @@ class StateStoreTests(unittest.TestCase):
             self.assertIn("research_actions_status_idx", research_indexes)
             self.assertIn("research_actions_scope_idx", research_indexes)
             self.assertIn("scope_fingerprint", research_columns)
+            self.assertIn("requeue_events", tables)
+            self.assertIn(
+                "content_failure_cutoff_attempt_id",
+                product_columns,
+            )
+            self.assertIn("leased_from_status", product_columns)
+            self.assertIn("leased_from_next_run_at", product_columns)
+            self.assertIn("requeue_events_product_idx", requeue_indexes)
+            legacy_product = migrated.get_product("LEGACY")
+            self.assertEqual("due", legacy_product.leased_from_status)
+            self.assertEqual(T0, legacy_product.leased_from_next_run_at)
 
             fingerprint = state.research_request_fingerprint(
                 "search",
@@ -1601,6 +2882,223 @@ class StateStoreTests(unittest.TestCase):
             )
             self.assertTrue(started.should_execute)
             self.assertEqual("started", started.record.status)
+        finally:
+            migrated.close()
+
+    def test_migrates_v7_requeue_policy_boundary_to_current_schema(self):
+        legacy_path = Path(self.tempdir.name) / "legacy-v7.sqlite3"
+        connection = sqlite3.connect(legacy_path)
+        connection.execute(
+            """
+            CREATE TABLE products (
+                product_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'due',
+                next_run_at TEXT NOT NULL
+                    DEFAULT '2026-01-01T12:00:00.000000Z'
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE attempts (
+                attempt_id INTEGER PRIMARY KEY AUTOINCREMENT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE research_actions (
+                action_id INTEGER PRIMARY KEY,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_summary_json TEXT,
+                credits REAL,
+                error TEXT,
+                finished_at TEXT
+            )
+            """
+        )
+        legacy_rows = (
+            (
+                1,
+                "ai",
+                "uncertain",
+                '{"error_type":"AIInvalidOutputError","provider_requests":1}',
+                None,
+                "legacy invalid output",
+                "2026-01-01T12:00:01.000000Z",
+            ),
+            (
+                2,
+                "ai",
+                "uncertain",
+                '{"error_type":"AIInvalidOutputError","provider_requests":2}',
+                2.5,
+                "legacy invalid output with known credits",
+                "2026-01-01T12:00:02.000000Z",
+            ),
+            (
+                3,
+                "ai",
+                "uncertain",
+                '{"error_type":"AINetworkError","provider_requests":1}',
+                None,
+                "connection reset after request",
+                "2026-01-01T12:00:03.000000Z",
+            ),
+            (
+                4,
+                "ai",
+                "uncertain",
+                '{"error_type":"AIResponseError","provider_requests":1}',
+                None,
+                "legacy generic response error",
+                "2026-01-01T12:00:04.000000Z",
+            ),
+            (
+                5,
+                "ai",
+                "uncertain",
+                "{malformed",
+                None,
+                "corrupt legacy summary",
+                "2026-01-01T12:00:05.000000Z",
+            ),
+            (
+                6,
+                "search",
+                "uncertain",
+                '{"error_type":"AIInvalidOutputError"}',
+                None,
+                "unrelated action",
+                "2026-01-01T12:00:06.000000Z",
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO research_actions (
+                action_id, action, status, result_summary_json,
+                credits, error, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            legacy_rows,
+        )
+        connection.execute("PRAGMA user_version = 7")
+        connection.commit()
+        connection.close()
+
+        migrated = state.StateStore(legacy_path)
+        try:
+            self.assertEqual(state.SCHEMA_VERSION, migrated.schema_version)
+            migrated_connection = sqlite3.connect(legacy_path)
+            try:
+                product_columns = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA table_info(products)"
+                    )
+                }
+                tables = {
+                    row[0]
+                    for row in migrated_connection.execute(
+                        """
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE type = 'table'
+                        """
+                    )
+                }
+                indexes = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA index_list(requeue_events)"
+                    )
+                }
+                action_rows = migrated_connection.execute(
+                    """
+                    SELECT
+                        action_id, action, status, result_summary_json,
+                        credits, error, finished_at
+                    FROM research_actions
+                    ORDER BY action_id
+                    """
+                ).fetchall()
+            finally:
+                migrated_connection.close()
+            self.assertIn(
+                "content_failure_cutoff_attempt_id",
+                product_columns,
+            )
+            self.assertIn("leased_from_status", product_columns)
+            self.assertIn("leased_from_next_run_at", product_columns)
+            self.assertIn("requeue_events", tables)
+            self.assertIn("requeue_events_product_idx", indexes)
+            self.assertEqual("failed", action_rows[0][2])
+            self.assertEqual(0.0, action_rows[0][4])
+            self.assertEqual(legacy_rows[0][3], action_rows[0][3])
+            self.assertEqual(legacy_rows[0][5], action_rows[0][5])
+            self.assertEqual(legacy_rows[0][6], action_rows[0][6])
+            self.assertEqual("failed", action_rows[1][2])
+            self.assertEqual(2.5, action_rows[1][4])
+            for row, legacy in zip(action_rows[2:], legacy_rows[2:]):
+                self.assertEqual(legacy, tuple(row))
+        finally:
+            migrated.close()
+
+    def test_migrates_v8_active_lease_with_conservative_due_snapshot(self):
+        legacy_path = Path(self.tempdir.name) / "legacy-v8.sqlite3"
+        original_next_run = "2026-01-01T11:30:00.000000Z"
+        connection = sqlite3.connect(legacy_path)
+        connection.execute(
+            """
+            CREATE TABLE products (
+                product_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                next_run_at TEXT NOT NULL,
+                content_failure_cutoff_attempt_id
+                    INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO products (product_id, status, next_run_at)
+            VALUES (?, ?, ?)
+            """,
+            (
+                ("ACTIVE", "leased", original_next_run),
+                ("RUNNABLE", "backoff", original_next_run),
+            ),
+        )
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+        connection.close()
+
+        migrated = state.StateStore(legacy_path)
+        try:
+            self.assertEqual(state.SCHEMA_VERSION, migrated.schema_version)
+            migrated_connection = sqlite3.connect(legacy_path)
+            try:
+                rows = migrated_connection.execute(
+                    """
+                    SELECT
+                        product_id,
+                        leased_from_status,
+                        leased_from_next_run_at
+                    FROM products
+                    ORDER BY product_id
+                    """
+                ).fetchall()
+            finally:
+                migrated_connection.close()
+            self.assertEqual(
+                ("ACTIVE", "due", original_next_run),
+                rows[0],
+            )
+            self.assertEqual(
+                ("RUNNABLE", None, None),
+                rows[1],
+            )
         finally:
             migrated.close()
 

@@ -23,6 +23,9 @@ from .ai import (
     AIError,
     AIHTTPError,
     AIInvalidOutputError,
+    AILocalExecutionError,
+    AIOutputErrorCategory,
+    AIResponseError,
     AISettings,
     FinalAction,
     OpenAICompatibleClient,
@@ -32,6 +35,7 @@ from .ai import (
 )
 from .config import (
     ConfigError,
+    GlobalResearchBudgetSettings,
     ResearchSettings,
     WikiSettings,
     allow_mirrors,
@@ -40,6 +44,8 @@ from .config import (
     min_fact_confidence,
     min_publish_confidence,
     missing_environment,
+    public_brand_alias,
+    public_brand_alias_map,
     redact_environment_secrets,
     state_path,
     trusted_source_domain_map,
@@ -112,8 +118,8 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
-VALIDATION_POLICY_VERSION = "2026-07-27.1"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-27.1"
+VALIDATION_POLICY_VERSION = "2026-07-27.2"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-27.2"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
@@ -122,15 +128,53 @@ AI_PROVIDER_CIRCUIT_HTTP_STATUSES = frozenset({401, 402, 403, 404})
 AI_PROVIDER_CIRCUIT_WINDOW = timedelta(hours=6)
 AI_RATE_LIMIT_CIRCUIT_HTTP_STATUSES = frozenset({429})
 AI_RATE_LIMIT_CIRCUIT_WINDOW = timedelta(hours=1)
+EXA_PROVIDER_CIRCUIT_HTTP_STATUSES = frozenset({401, 403, 404})
+EXA_PROVIDER_CIRCUIT_WINDOW = timedelta(hours=6)
+EXA_RATE_LIMIT_CIRCUIT_HTTP_STATUSES = frozenset({429})
+EXA_RATE_LIMIT_CIRCUIT_WINDOW = timedelta(hours=1)
 AI_INVALID_OUTPUT_CIRCUIT_ERROR_TYPES = frozenset(
-    {"AIInvalidOutputError"}
+    {"AIInvalidOutputError", "AIResponseError"}
+)
+AI_INVALID_OUTPUT_CIRCUIT_CATEGORIES = frozenset(
+    {
+        AIOutputErrorCategory.ACTION_CONTRACT.value,
+        AIOutputErrorCategory.DECISION_CONTRACT.value,
+        AIOutputErrorCategory.EMPTY_CONTENT.value,
+        AIOutputErrorCategory.INCOMPLETE_RESPONSE.value,
+        AIOutputErrorCategory.INVALID_JSON.value,
+        AIOutputErrorCategory.PROVIDER_ENVELOPE.value,
+    }
 )
 AI_INVALID_OUTPUT_CIRCUIT_THRESHOLD = 3
 AI_INVALID_OUTPUT_CIRCUIT_WINDOW = timedelta(hours=1)
+CONTENT_FAILURE_QUARANTINE_THRESHOLD = 6
+_AI_TOKEN_USAGE_FIELDS = frozenset(
+    {
+        "accepted_prediction_tokens",
+        "cache_hit_tokens",
+        "cache_miss_tokens",
+        "cached_tokens",
+        "completion_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "prompt_tokens",
+        "reasoning_tokens",
+        "rejected_prediction_tokens",
+        "total_tokens",
+    }
+)
 # Catalogue writes may run while paid research is in flight, but the final
 # source check, Wiki mutation, and durable outcome must form one in-process
 # publication fence. The deployed worker is a single process.
 _SOURCE_PUBLISH_FENCE = threading.Lock()
+_PUBLIC_PRODUCT_ID_HINT_RE = re.compile(
+    r"(?=.{3,64}\Z)(?=.*[A-Za-z])(?=.*[0-9])"
+    r"[A-Za-z0-9][A-Za-z0-9._/+:-]*"
+)
+_COMPANY_IDENTIFIER_SUFFIX_RE = re.compile(
+    r"(?:srl|ltd|llc|gmbh|bv|inc|corp|company)\Z",
+    flags=re.IGNORECASE,
+)
 
 _RESEARCH_GAP_NOTES = {
     "manufacturer_identity": (
@@ -247,10 +291,16 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
 
     public_name = str(product.get("product_name") or "").strip()
     include_internal_hints = include_internal_search_hints()
+    stable_id = " ".join(str(product.get("product_id") or "").split())
+    public_id_approved = bool(
+        include_internal_hints
+        and _PUBLIC_PRODUCT_ID_HINT_RE.fullmatch(stable_id)
+        and not _COMPANY_IDENTIFIER_SUFFIX_RE.search(stable_id)
+    )
     public_model = preferred_catalogue_model(
-        product.get("product_id"),
+        stable_id,
         public_name,
-        allow_product_id=include_internal_hints,
+        allow_product_id=public_id_approved,
     )
     if not public_model:
         raise CLIError(
@@ -261,8 +311,9 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
         identity["product_name"] = public_name
     if include_internal_hints:
         brand = str(product.get("brand_code") or "").strip()
-        if brand:
-            identity["manufacturer"] = brand
+        manufacturer_alias = public_brand_alias(brand)
+        if manufacturer_alias:
+            identity["manufacturer"] = manufacturer_alias
     return identity
 
 
@@ -635,6 +686,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         checks["wikijs_config"] = {"ok": False, "error": _safe_error(exc)}
 
+    public_alias_mapping: dict[str, str] | None = None
+    try:
+        public_alias_mapping = public_brand_alias_map()
+        checks["public_brand_aliases_config"] = {
+            "ok": True,
+            "brand_mappings": len(public_alias_mapping),
+        }
+    except ConfigError as exc:
+        checks["public_brand_aliases_config"] = {
+            "ok": False,
+            "error": _safe_error(exc),
+        }
+
     trusted_domain_mapping: dict[str, frozenset[str]] | None = None
     try:
         trusted_domain_mapping = trusted_source_domain_map()
@@ -651,6 +715,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             "error": _safe_error(exc),
         }
 
+    research_settings: ResearchSettings | None = None
     try:
         research_settings = ResearchSettings.from_env()
         checks["research_config"] = {
@@ -662,6 +727,28 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         }
     except ConfigError as exc:
         checks["research_config"] = {
+            "ok": False,
+            "error": _safe_error(exc),
+        }
+
+    global_budget_settings: GlobalResearchBudgetSettings | None = None
+    try:
+        global_budget_settings = GlobalResearchBudgetSettings.from_env()
+        if research_settings is not None:
+            _validate_global_research_limits(
+                global_budget_settings,
+                research_settings.max_credits,
+            )
+        checks["global_research_budget_config"] = {
+            "ok": True,
+            "daily_credit_limit":
+                global_budget_settings.daily_credit_limit,
+            "monthly_credit_limit":
+                global_budget_settings.monthly_credit_limit,
+            "counts": "exa_search_extract_units_only",
+        }
+    except (CLIError, ConfigError) as exc:
+        checks["global_research_budget_config"] = {
             "ok": False,
             "error": _safe_error(exc),
         }
@@ -699,7 +786,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         and not missing
         and wiki_settings is not None
         and ai_settings is not None
+        and public_alias_mapping is not None
         and trusted_domain_mapping is not None
+        and research_settings is not None
+        and global_budget_settings is not None
         and pg_sslmode
     ):
         generator = ProductReader().iter_products(batch_size=1)
@@ -1099,6 +1189,7 @@ def _research_scope_fingerprints(
             "product_context": search_identity,
             "base_url": ai_settings.base_url,
             "model": ai_settings.model,
+            "json_response_format": ai_settings.json_response_format,
             "credential_fingerprint": hashlib.sha256(
                 ai_settings.api_key.encode("utf-8")
             ).hexdigest(),
@@ -1146,11 +1237,56 @@ def _ai_output_fingerprint(settings: AISettings) -> str:
             {
                 "provider_fingerprint": _ai_provider_fingerprint(settings),
                 "prompt_version": AI_RESEARCH_PROMPT_VERSION,
+                "json_response_format": settings.json_response_format,
+                "max_tokens": settings.max_tokens,
+                "max_response_bytes": settings.max_response_bytes,
+                "max_evidence_chars": settings.max_evidence_chars,
             },
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _exa_provider_fingerprint(client: Any) -> str:
+    """Hash the active Exa endpoint and ordered credential set, never keys."""
+
+    endpoint = getattr(client, "api_base_url", EXA_API_BASE_URL)
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        endpoint = EXA_API_BASE_URL
+    credential = getattr(client, "credential_fingerprint", "")
+    if (
+        not isinstance(credential, str)
+        or re.fullmatch(r"[0-9a-f]{64}", credential) is None
+    ):
+        # The production client always exposes this digest. Keeping a stable
+        # non-secret fallback makes injected offline clients auditable.
+        credential = hashlib.sha256(b"unavailable").hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "base_url": endpoint.strip(),
+                "credential_fingerprint": credential,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _exa_failure_audit(
+    client: Any,
+    exc: BaseException,
+) -> dict[str, Any]:
+    """Return provider-global Exa failure metadata without request content."""
+
+    audit: dict[str, Any] = {
+        "provider_fingerprint": _exa_provider_fingerprint(client),
+        "error_type": exc.__class__.__name__,
+    }
+    if isinstance(exc, ExaHTTPError) and isinstance(exc.status_code, int):
+        audit["http_status"] = exc.status_code
+    return audit
 
 
 def _provider_request_count(
@@ -1163,6 +1299,53 @@ def _provider_request_count(
     if isinstance(value, bool) or not isinstance(value, int):
         return default
     return min(100, max(0, value))
+
+
+def _ai_response_audit(client: Any) -> dict[str, Any]:
+    """Return bounded numeric provider metadata without response text."""
+
+    metadata = getattr(client, "last_response_metadata", ())
+    if not isinstance(metadata, (list, tuple)):
+        return {}
+    finish_reasons: list[str] = []
+    usage_totals: dict[str, int] = {}
+
+    def add_usage(value: Any) -> None:
+        if not isinstance(value, Mapping):
+            return
+        for raw_key, raw_item in list(value.items())[:32]:
+            key = str(raw_key)
+            if isinstance(raw_item, Mapping):
+                add_usage(raw_item)
+                continue
+            if (
+                key not in _AI_TOKEN_USAGE_FIELDS
+                or isinstance(raw_item, bool)
+                or not isinstance(raw_item, (int, float))
+                or not math.isfinite(float(raw_item))
+                or float(raw_item) < 0
+                or not float(raw_item).is_integer()
+            ):
+                continue
+            total = usage_totals.get(key, 0) + int(raw_item)
+            if total <= 1_000_000_000:
+                usage_totals[key] = total
+
+    for item in metadata[:2]:
+        reason = getattr(item, "finish_reason", None)
+        if (
+            isinstance(reason, str)
+            and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", reason)
+        ):
+            finish_reasons.append(reason)
+        add_usage(getattr(item, "usage", None))
+
+    result: dict[str, Any] = {}
+    if finish_reasons:
+        result["finish_reasons"] = finish_reasons
+    if usage_totals:
+        result["usage_totals"] = usage_totals
+    return result
 
 
 def _known_provider_credits(client: Any) -> int | float:
@@ -1197,6 +1380,15 @@ def _search_failure_status(exc: BaseException, client: Any) -> str:
 
 def _ai_failure_status(exc: BaseException, client: Any) -> str:
     del client
+    if isinstance(exc, AILocalExecutionError):
+        # Process isolation failed before a provider request could start.
+        return "failed"
+    if isinstance(exc, AIResponseError):
+        # The provider returned a response that was oversized, malformed, or
+        # still failed the bounded repair/contract. Delivery is known, so a
+        # later bounded retry is safe; reserve ``uncertain`` for genuinely
+        # unknown network outcomes.
+        return "failed"
     if (
         isinstance(exc, AIHTTPError)
         and isinstance(exc.status_code, int)
@@ -1339,6 +1531,7 @@ def _run_research_search(
                     "last_operation_completed_requests",
                 ),
                 "known_partial_credits": _known_provider_credits(client),
+                **_exa_failure_audit(client, exc),
             },
         )
         raise
@@ -1465,6 +1658,7 @@ def _run_research_extract(
                     "last_operation_completed_requests",
                 ),
                 "known_partial_credits": _known_provider_credits(client),
+                **_exa_failure_audit(client, exc),
             },
         )
         raise
@@ -1553,6 +1747,7 @@ def _run_research_ai(
         else:
             raise AIError("AI research action has an unexpected local type")
         summary["provider_requests"] = provider_requests
+        summary.update(_ai_response_audit(client))
         store.finish_research_action(
             lease,
             round_number=round_number,
@@ -1575,11 +1770,18 @@ def _run_research_ai(
             ),
             "provider_fingerprint": (
                 _ai_output_fingerprint(settings)
-                if isinstance(exc, AIInvalidOutputError)
+                if isinstance(exc, AIResponseError)
                 else _ai_provider_fingerprint(settings)
             ),
             "error_type": exc.__class__.__name__,
         }
+        if isinstance(exc, AIInvalidOutputError):
+            failure_summary["error_category"] = exc.category.value
+        elif isinstance(exc, AIResponseError):
+            failure_summary["error_category"] = (
+                AIOutputErrorCategory.PROVIDER_ENVELOPE.value
+            )
+        failure_summary.update(_ai_response_audit(client))
         if isinstance(exc, AIHTTPError) and isinstance(
             exc.status_code,
             int,
@@ -1617,6 +1819,9 @@ def _validate_decision_for_lease(
     """Validate a proposal without mutating the attempt's terminal outcome."""
 
     allowed_urls = set(store.allowed_evidence_urls(lease.token))
+    operator_manufacturer = public_brand_alias(
+        str(lease.payload.get("brand_code") or "")
+    )
     trusted_domains = (
         trusted_source_domains_for_product(
             str(lease.payload.get("brand_code") or ""),
@@ -1627,6 +1832,15 @@ def _validate_decision_for_lease(
         if raw.get("outcome") == "publish"
         else frozenset()
     )
+    if (
+        raw.get("outcome") == "publish"
+        and trusted_domains
+        and not operator_manufacturer
+    ):
+        raise SourceVerificationError(
+            "a trusted catalogue-brand domain override requires an explicit "
+            "public manufacturer alias"
+        )
     return validate_decision(
         raw,
         expected_product_id=lease.product_id,
@@ -1641,6 +1855,7 @@ def _validate_decision_for_lease(
             else allowed_urls
         ),
         trusted_source_domains=trusted_domains,
+        operator_manufacturer_identity=operator_manufacturer or None,
         expected_product_name=str(
             lease.payload.get("product_name") or ""
         ),
@@ -2175,6 +2390,135 @@ def _finish_research_gap(
     )
 
 
+def _validate_global_research_limits(
+    settings: GlobalResearchBudgetSettings,
+    reserved: int,
+) -> None:
+    """Require every enabled global window to admit one complete product."""
+
+    if (
+        isinstance(reserved, bool)
+        or not isinstance(reserved, int)
+        or reserved < 0
+    ):
+        raise CLIError("global research budget reservation must be non-negative")
+    for name, limit in (
+        (
+            "PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT",
+            settings.daily_credit_limit,
+        ),
+        (
+            "PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT",
+            settings.monthly_credit_limit,
+        ),
+    ):
+        if 0 < limit < reserved:
+            raise ConfigError(
+                f"{name} must be zero or at least "
+                "PV_WIKI_RESEARCH_MAX_CREDITS"
+            )
+
+
+def _global_research_budget_pause(
+    store: StateStore,
+    *,
+    now: datetime | None = None,
+    reservation_credits: int | None = None,
+) -> dict[str, Any] | None:
+    """Return one fail-closed UTC stop-loss before paid research starts."""
+
+    settings = GlobalResearchBudgetSettings.from_env()
+    reserved = (
+        ResearchSettings.from_env().max_credits
+        if reservation_credits is None
+        else reservation_credits
+    )
+    _validate_global_research_limits(settings, reserved)
+    timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    day_start = timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    month_start = day_start.replace(day=1)
+    month_end = next_month_start(timestamp)
+    windows = (
+        (
+            "daily",
+            settings.daily_credit_limit,
+            day_start,
+            day_end,
+        ),
+        (
+            "monthly",
+            settings.monthly_credit_limit,
+            month_start,
+            month_end,
+        ),
+    )
+    blocked_windows: list[dict[str, Any]] = []
+    for period, limit, start, end in windows:
+        if limit <= 0:
+            continue
+        usage = store.research_usage_between(start=start, end=end)
+        known_credits = float(usage["known_credits"])
+        unknown_actions = int(usage["unknown_or_uncertain_actions"])
+        reason: str | None = None
+        if known_credits >= limit:
+            reason = f"global_{period}_research_budget_exhausted"
+        elif unknown_actions:
+            reason = f"global_{period}_research_usage_uncertain"
+        elif known_credits + reserved > limit:
+            reason = f"global_{period}_research_budget_reservation_blocked"
+        if reason is None:
+            continue
+        blocked_windows.append(
+            {
+                "period": period,
+                "reason": reason,
+                "known_credits": (
+                    int(known_credits)
+                    if known_credits.is_integer()
+                    else known_credits
+                ),
+                "credit_limit": limit,
+                "reserved_credits": reserved,
+                "unknown_or_uncertain_actions": unknown_actions,
+                "resume_at": end.isoformat(),
+            }
+        )
+    if not blocked_windows:
+        return None
+    primary = blocked_windows[0]
+    return {
+        "ok": True,
+        "processed": False,
+        "published": False,
+        **{
+            key: value
+            for key, value in primary.items()
+            if key != "period"
+        },
+        "resume_at": max(
+            str(window["resume_at"]) for window in blocked_windows
+        ),
+        "blocked_windows": [
+            str(window["period"]) for window in blocked_windows
+        ],
+    }
+
+
+def _defer_research_pause(
+    store: StateStore,
+    lease: Lease,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Release a lease without blaming the product for a system-wide pause."""
+
+    reason = str(payload.get("reason") or "research_system_pause")
+    store.defer_lease(lease, reason[:200])
+    result = dict(payload)
+    result.setdefault("pause_scope", "system")
+    return result
+
+
 def run_one(
     *,
     worker_id: str | None = None,
@@ -2214,16 +2558,12 @@ def run_one(
             "and one final bounded provider call"
         )
     with _store() as store:
-        invalid_streak = store.recent_distinct_outcome_streak(
-            "invalid_decision",
-            limit=INVALID_DECISION_CIRCUIT_THRESHOLD,
-            within=INVALID_DECISION_CIRCUIT_WINDOW,
-        )
-        if invalid_streak >= INVALID_DECISION_CIRCUIT_THRESHOLD:
-            raise CLIError(
-                "AI decision circuit is open after five consecutive invalid "
-                "product decisions in 30 minutes"
-            )
+        if not store.list_due(limit=1):
+            return {
+                "ok": True,
+                "processed": False,
+                "reason": "no_due_product",
+            }
         lease = store.lease_next(
             _worker_id(worker_id),
             lease_seconds=lease_seconds,
@@ -2236,15 +2576,44 @@ def run_one(
             }
 
         try:
-            product_name = " ".join(
-                str(lease.payload.get("product_name") or "").split()
+            content_failure_streak = store.content_failure_streak(
+                lease.product_id
             )
-            product_model = preferred_catalogue_model(
-                lease.product_id,
-                product_name,
-                allow_product_id=include_internal_search_hints(),
-            )
-            if not product_model:
+            if (
+                content_failure_streak
+                >= CONTENT_FAILURE_QUARANTINE_THRESHOLD
+            ):
+                outcome = store.record_outcome(
+                    lease,
+                    "content_quarantined",
+                    error=(
+                        "repeated bounded content failures for the unchanged "
+                        "catalogue source revision"
+                    ),
+                    details={
+                        "automation": {
+                            "content_failure_streak":
+                                content_failure_streak,
+                            "threshold":
+                                CONTENT_FAILURE_QUARANTINE_THRESHOLD,
+                            "wake_policy":
+                                "source_change_or_annual_refresh",
+                        }
+                    },
+                )
+                return {
+                    "ok": True,
+                    "processed": True,
+                    "published": False,
+                    "product_id": lease.product_id,
+                    "outcome": outcome.outcome,
+                    "next_attempt_at": outcome.next_attempt_at,
+                    "reason": "content_failure_quarantine",
+                }
+
+            try:
+                search_identity = _search_identity(lease.payload)
+            except CLIError:
                 return _apply_decision(
                     store,
                     lease,
@@ -2254,6 +2623,10 @@ def run_one(
                         "The catalogue record has no public product name.",
                     ),
                 )
+            product_name = " ".join(
+                str(lease.payload.get("product_name") or "").split()
+            )
+            product_model = str(search_identity["model"])
             research_identity = " ".join(
                 dict.fromkeys(
                     item
@@ -2276,105 +2649,195 @@ def run_one(
                     },
                 )
 
-            try:
-                ai_settings = AISettings.from_env()
-                ai_provider_fingerprint = _ai_provider_fingerprint(
-                    ai_settings
-                )
-                circuit_status = store.recent_ai_provider_rejection(
-                    ai_provider_fingerprint,
-                    http_statuses=AI_PROVIDER_CIRCUIT_HTTP_STATUSES,
-                    within=AI_PROVIDER_CIRCUIT_WINDOW,
-                )
-                if circuit_status is None:
-                    circuit_status = store.recent_ai_provider_rejection(
-                        ai_provider_fingerprint,
-                        http_statuses=AI_RATE_LIMIT_CIRCUIT_HTTP_STATUSES,
-                        within=AI_RATE_LIMIT_CIRCUIT_WINDOW,
-                    )
-                if circuit_status is not None:
-                    message = (
-                        "AI provider circuit is open after a recent HTTP "
-                        f"{circuit_status} "
-                        + (
-                            "rate limit"
-                            if circuit_status == 429
-                            else "definitive rejection"
-                        )
-                        + " for the same endpoint, account, and model"
-                    )
-                    outcome = store.record_outcome(
-                        lease,
-                        "ai_error",
-                        error=message,
-                        details={
-                            "automation": {
-                                "circuit": "ai_provider",
-                                "http_status": circuit_status,
-                            }
-                        },
-                    )
-                    if circuit_status == 429:
-                        return {
-                            "ok": True,
-                            "processed": False,
-                            "published": False,
-                            "product_id": lease.product_id,
-                            "outcome": outcome.outcome,
-                            "reason": "ai_provider_circuit_open",
-                            "next_attempt_at": outcome.next_attempt_at,
-                        }
-                    raise AIError(message)
-                invalid_output_products = (
-                    store.recent_ai_provider_error_products(
-                        _ai_output_fingerprint(ai_settings),
-                        error_types=AI_INVALID_OUTPUT_CIRCUIT_ERROR_TYPES,
-                        within=AI_INVALID_OUTPUT_CIRCUIT_WINDOW,
-                    )
-                )
-                if (
-                    invalid_output_products
-                    >= AI_INVALID_OUTPUT_CIRCUIT_THRESHOLD
-                ):
-                    message = (
-                        "AI output circuit is open after invalid output for "
-                        f"{invalid_output_products} distinct products with "
-                        "the same endpoint, account, and model"
-                    )
-                    store.record_outcome(
-                        lease,
-                        "ai_error",
-                        error=message,
-                        details={
-                            "automation": {
-                                "circuit": "ai_invalid_output",
-                                "distinct_products":
-                                    invalid_output_products,
-                            }
-                        },
-                    )
-                    raise AIError(message)
-                ai_client = OpenAICompatibleClient(ai_settings)
-            except AIError as exc:
-                _record_active_failure(store, lease, "ai_error", exc)
-                raise
-            try:
-                search_client = _make_search_client(timeout=search_timeout)
-            except ExaError as exc:
-                _record_active_failure(
+            # Everything below this point can initiate paid research. Systemic
+            # gates therefore release this lease back to its exact prior queue
+            # state instead of assigning a failure to the selected product.
+            invalid_streak = store.recent_distinct_outcome_streak(
+                "invalid_decision",
+                limit=INVALID_DECISION_CIRCUIT_THRESHOLD,
+                within=INVALID_DECISION_CIRCUIT_WINDOW,
+            )
+            if invalid_streak >= INVALID_DECISION_CIRCUIT_THRESHOLD:
+                return _defer_research_pause(
                     store,
                     lease,
-                    _provider_outcome(exc, locals().get("search_client")),
-                    exc,
+                    {
+                        "ok": True,
+                        "processed": False,
+                        "published": False,
+                        "reason": "ai_decision_circuit_open",
+                        "distinct_products": invalid_streak,
+                    },
+                )
+
+            try:
+                budget_pause = _global_research_budget_pause(
+                    store,
+                    reservation_credits=research_settings.max_credits,
+                )
+            except ConfigError as exc:
+                store.defer_lease(
+                    lease,
+                    (
+                        "research_configuration_"
+                        f"{exc.__class__.__name__}"
+                    )[:200],
                 )
                 raise
-            research_scope_fingerprints = _research_scope_fingerprints(
-                lease.payload,
-                ai_settings,
-                search_client,
-                max_results=max_results,
-                research_settings=research_settings,
+            if budget_pause is not None:
+                return _defer_research_pause(store, lease, budget_pause)
+
+            try:
+                ai_settings = AISettings.from_env()
+            except (AIError, ConfigError) as exc:
+                store.defer_lease(
+                    lease,
+                    f"research_configuration_{exc.__class__.__name__}"[:200],
+                )
+                raise
+
+            ai_provider_fingerprint = _ai_provider_fingerprint(ai_settings)
+            ai_provider_event = store.recent_ai_provider_rejection_event(
+                ai_provider_fingerprint,
+                http_statuses=AI_PROVIDER_CIRCUIT_HTTP_STATUSES,
+                within=AI_PROVIDER_CIRCUIT_WINDOW,
             )
+            ai_provider_reason = "definitive_rejection"
+            if ai_provider_event is None:
+                ai_provider_event = store.recent_ai_provider_rejection_event(
+                    ai_provider_fingerprint,
+                    http_statuses=AI_RATE_LIMIT_CIRCUIT_HTTP_STATUSES,
+                    within=AI_RATE_LIMIT_CIRCUIT_WINDOW,
+                )
+                ai_provider_reason = "rate_limit"
+            if ai_provider_event is not None:
+                return _defer_research_pause(
+                    store,
+                    lease,
+                    {
+                        "ok": True,
+                        "processed": False,
+                        "published": False,
+                        "reason": "ai_provider_circuit_open",
+                        "circuit_reason": ai_provider_reason,
+                        "http_status": ai_provider_event.http_status,
+                        "resume_at": (
+                            ai_provider_event.expires_at.isoformat()
+                        ),
+                    },
+                )
+
+            invalid_output_products = (
+                store.recent_ai_provider_error_products(
+                    _ai_output_fingerprint(ai_settings),
+                    error_types=AI_INVALID_OUTPUT_CIRCUIT_ERROR_TYPES,
+                    categories=AI_INVALID_OUTPUT_CIRCUIT_CATEGORIES,
+                    within=AI_INVALID_OUTPUT_CIRCUIT_WINDOW,
+                )
+            )
+            if (
+                invalid_output_products
+                >= AI_INVALID_OUTPUT_CIRCUIT_THRESHOLD
+            ):
+                return _defer_research_pause(
+                    store,
+                    lease,
+                    {
+                        "ok": True,
+                        "processed": False,
+                        "published": False,
+                        "reason": "ai_invalid_output_circuit_open",
+                        "distinct_products": invalid_output_products,
+                    },
+                )
+
+            try:
+                search_client = _make_search_client(timeout=search_timeout)
+            except (ConfigError, ExaError) as exc:
+                store.defer_lease(
+                    lease,
+                    f"research_configuration_{exc.__class__.__name__}"[:200],
+                )
+                raise
+
+            exa_provider_fingerprint = _exa_provider_fingerprint(
+                search_client
+            )
+            exa_provider_event = store.recent_exa_provider_rejection(
+                exa_provider_fingerprint,
+                http_statuses=EXA_PROVIDER_CIRCUIT_HTTP_STATUSES,
+                within=EXA_PROVIDER_CIRCUIT_WINDOW,
+            )
+            exa_provider_reason = "definitive_rejection"
+            if exa_provider_event is None:
+                exa_provider_event = store.recent_exa_provider_rejection(
+                    exa_provider_fingerprint,
+                    http_statuses=EXA_RATE_LIMIT_CIRCUIT_HTTP_STATUSES,
+                    within=EXA_RATE_LIMIT_CIRCUIT_WINDOW,
+                )
+                exa_provider_reason = "rate_limit"
+            if exa_provider_event is not None:
+                return _defer_research_pause(
+                    store,
+                    lease,
+                    {
+                        "ok": True,
+                        "processed": False,
+                        "published": False,
+                        "reason": "exa_provider_circuit_open",
+                        "circuit_reason": exa_provider_reason,
+                        "http_status": exa_provider_event.http_status,
+                        "resume_at": (
+                            exa_provider_event.expires_at.isoformat()
+                        ),
+                    },
+                )
+
+            now = datetime.now(timezone.utc)
+            month_start = datetime(
+                now.year,
+                now.month,
+                1,
+                tzinfo=timezone.utc,
+            )
+            quota_event = store.recent_exa_provider_error(
+                exa_provider_fingerprint,
+                error_types={"ExaQuotaExhaustedError"},
+                within=max(now - month_start, timedelta(microseconds=1)),
+                now=now,
+            )
+            if (
+                quota_event is not None
+                and quota_event.finished_at >= month_start
+            ):
+                return _defer_research_pause(
+                    store,
+                    lease,
+                    {
+                        "ok": True,
+                        "processed": False,
+                        "published": False,
+                        "reason": "search_quota_exhausted",
+                        "provider": "exa",
+                        "resume_at": next_month_start(now).isoformat(),
+                    },
+                )
+
+            try:
+                ai_client = OpenAICompatibleClient(ai_settings)
+                research_scope_fingerprints = _research_scope_fingerprints(
+                    lease.payload,
+                    ai_settings,
+                    search_client,
+                    max_results=max_results,
+                    research_settings=research_settings,
+                )
+            except (AIError, ConfigError, ExaError) as exc:
+                store.defer_lease(
+                    lease,
+                    f"research_configuration_{exc.__class__.__name__}"[:200],
+                )
+                raise
 
             started = time.monotonic()
             search: dict[str, Any] = {
@@ -2916,6 +3379,7 @@ def run_one(
                 "published": False,
                 "reason": "search_quota_exhausted",
                 "provider": "exa",
+                "pause_scope": "product_and_provider",
                 "resume_at": next_month_start().isoformat(),
             }
 
@@ -3000,6 +3464,51 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 limit=100,
             )
     _emit(result)
+    return 0
+
+
+def _operator_datetime(value: str | None, *, name: str) -> datetime | None:
+    if value is None:
+        return None
+    candidate = value.strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise CLIError(f"{name} must be an ISO-8601 datetime") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise CLIError(f"{name} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _cmd_requeue(args: argparse.Namespace) -> int:
+    attempted_after = _operator_datetime(
+        args.attempted_after,
+        name="--attempted-after",
+    )
+    attempted_before = _operator_datetime(
+        args.attempted_before,
+        name="--attempted-before",
+    )
+    with _store() as store:
+        count = store.requeue_products(
+            args.outcome,
+            reason=args.reason,
+            attempted_after=attempted_after,
+            attempted_before=attempted_before,
+            limit=args.limit,
+        )
+    _emit(
+        {
+            "ok": True,
+            "requeued": count,
+            "outcomes": list(dict.fromkeys(args.outcome)),
+            "reason": " ".join(args.reason.split()),
+            "attempted_after": attempted_after,
+            "attempted_before": attempted_before,
+        }
+    )
     return 0
 
 
@@ -3134,6 +3643,22 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="show queue counts and recent product attempts")
     status.add_argument("--product-id")
     status.set_defaults(func=_cmd_status)
+
+    requeue = subparsers.add_parser(
+        "requeue",
+        help="selectively wake finished outcomes after an operator policy change",
+    )
+    requeue.add_argument(
+        "--outcome",
+        action="append",
+        required=True,
+        help="last outcome to wake; repeat for multiple outcomes",
+    )
+    requeue.add_argument("--reason", required=True)
+    requeue.add_argument("--attempted-after")
+    requeue.add_argument("--attempted-before")
+    requeue.add_argument("--limit", type=int, default=1000)
+    requeue.set_defaults(func=_cmd_requeue)
 
     publish_home = subparsers.add_parser(
         "publish-home",
