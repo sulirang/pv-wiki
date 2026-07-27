@@ -116,6 +116,7 @@ AI_MODEL=...
 AI_TIMEOUT_SECONDS=60
 AI_MAX_TOKENS=4096
 AI_THINKING_MODE=  # optional: enabled or disabled
+AI_REASONING_EFFORT=  # optional: high or max
 AI_MAX_EVIDENCE_CHARS=80000
 ```
 
@@ -127,7 +128,9 @@ responses that are not a single JSON object. A trusted private HTTP endpoint req
 not included in errors. `AI_THINKING_MODE` is omitted by default for protocol
 compatibility. When set to `enabled` or `disabled`, the request includes
 `"thinking":{"type":"<mode>"}`; use it only with a provider that documents
-that extension. Explicitly selecting `disabled` prevents a supported
+that extension. `AI_REASONING_EFFORT` is also omitted by default; when set,
+the request includes `reasoning_effort`, with `high` being DeepSeek's shortest
+supported effort. Explicitly selecting `disabled` prevents a supported
 reasoning-by-default model from spending the bounded output allowance on
 reasoning before it returns the required JSON.
 

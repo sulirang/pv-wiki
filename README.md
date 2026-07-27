@@ -34,7 +34,9 @@ release supports OpenAI-compatible Chat Completions and fixes the endpoint to
 `{AI_BASE_URL}/chat/completions`. The optional
 `AI_THINKING_MODE=enabled|disabled` provider extension sends
 `"thinking":{"type":"..."}` when explicitly configured; it is omitted by
-default so other compatible providers retain their native behavior.
+default so other compatible providers retain their native behavior. The
+optional `AI_REASONING_EFFORT=high|max` extension is also omitted by default;
+for DeepSeek, `high` is the shortest supported effort.
 
 ## Database boundaries
 

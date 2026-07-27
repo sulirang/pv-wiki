@@ -784,6 +784,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             "thinking_mode": (
                 ai_settings.thinking_mode or "provider_default"
             ),
+            "reasoning_effort": (
+                ai_settings.reasoning_effort or "provider_default"
+            ),
             "note": "configuration validated; doctor does not spend AI tokens",
         }
     except AIError as exc:
@@ -1216,6 +1219,7 @@ def _research_scope_fingerprints(
             "model": ai_settings.model,
             "json_response_format": ai_settings.json_response_format,
             "thinking_mode": ai_settings.thinking_mode,
+            "reasoning_effort": ai_settings.reasoning_effort,
             "credential_fingerprint": hashlib.sha256(
                 ai_settings.api_key.encode("utf-8")
             ).hexdigest(),
@@ -1265,6 +1269,7 @@ def _ai_output_fingerprint(settings: AISettings) -> str:
                 "prompt_version": AI_RESEARCH_PROMPT_VERSION,
                 "json_response_format": settings.json_response_format,
                 "thinking_mode": settings.thinking_mode,
+                "reasoning_effort": settings.reasoning_effort,
                 "max_tokens": settings.max_tokens,
                 "max_response_bytes": settings.max_response_bytes,
                 "max_evidence_chars": settings.max_evidence_chars,

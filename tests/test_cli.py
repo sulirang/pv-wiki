@@ -1291,6 +1291,28 @@ class CLITests(unittest.TestCase):
             baseline_scopes["extract"],
             thinking_scopes["extract"],
         )
+        effort_settings = replace(settings, reasoning_effort="high")
+        self.assertEqual(
+            provider,
+            cli._ai_provider_fingerprint(effort_settings),
+        )
+        self.assertNotEqual(
+            output,
+            cli._ai_output_fingerprint(effort_settings),
+        )
+        effort_scopes = cli._research_scope_fingerprints(
+            product(),
+            effort_settings,
+            search_client,
+            max_results=5,
+            research_settings=cli.ResearchSettings.from_env(),
+        )
+        self.assertNotEqual(baseline_scopes["ai"], effort_scopes["ai"])
+        self.assertEqual(baseline_scopes["search"], effort_scopes["search"])
+        self.assertEqual(
+            baseline_scopes["extract"],
+            effort_scopes["extract"],
+        )
 
     def test_failure_status_distinguishes_definitive_from_partial_calls(self) -> None:
         search_client = mock.Mock()

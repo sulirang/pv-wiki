@@ -34,7 +34,9 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    provider extension `"thinking":{"type":"..."}`. Leave it empty for
    providers that do not implement the extension; explicitly select `disabled`
    when a supported provider's default reasoning would consume the bounded
-   output budget before returning JSON. Set
+   output budget before returning JSON. When thinking is enabled on DeepSeek,
+   optional `AI_REASONING_EFFORT=high` selects its shortest supported effort;
+   leave it empty for providers that do not document this extension.
    Review the bundled versioned `suppliers.json` registry. Use
    `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` and
    `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for deployment-specific

@@ -185,7 +185,9 @@ operator to explicitly set `AI_ALLOW_INSECURE_HTTP=true`. The optional
 `"thinking":{"type":"..."}` only when configured; leave it empty for
 compatibility, or select `disabled` when a supported reasoning-by-default
 model would otherwise exhaust the bounded output allowance before returning
-JSON. The model receives
+JSON. Optional `AI_REASONING_EFFORT=high|max` is also sent only when
+configured; DeepSeek documents `high` as its shortest supported effort. The
+model receives
 bounded public identity, search discovery hints without result URLs, and
 extracted evidence; it
 does not receive product database IDs, family codes, lease tokens, or

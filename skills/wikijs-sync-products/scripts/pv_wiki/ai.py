@@ -355,6 +355,7 @@ class AISettings:
     max_evidence_chars: int = DEFAULT_MAX_EVIDENCE_CHARS
     json_response_format: bool = False
     thinking_mode: Literal["enabled", "disabled"] | None = None
+    reasoning_effort: Literal["high", "max"] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_insecure_http, bool):
@@ -375,6 +376,23 @@ class AISettings:
                 self,
                 "thinking_mode",
                 normalized_thinking_mode,
+            )
+        if self.reasoning_effort is not None:
+            if not isinstance(self.reasoning_effort, str):
+                raise AIConfigError(
+                    "AI_REASONING_EFFORT must be high or max"
+                )
+            normalized_reasoning_effort = (
+                self.reasoning_effort.strip().casefold()
+            )
+            if normalized_reasoning_effort not in {"high", "max"}:
+                raise AIConfigError(
+                    "AI_REASONING_EFFORT must be high or max"
+                )
+            object.__setattr__(
+                self,
+                "reasoning_effort",
+                normalized_reasoning_effort,
             )
         object.__setattr__(
             self,
@@ -497,6 +515,10 @@ class AISettings:
             env,
             ("AI_THINKING_MODE", "LLM_THINKING_MODE"),
         )
+        reasoning_effort = _first_nonempty(
+            env,
+            ("AI_REASONING_EFFORT", "LLM_REASONING_EFFORT"),
+        )
         return cls(
             base_url=base_url,
             api_key=api_key,
@@ -504,6 +526,7 @@ class AISettings:
             allow_insecure_http=allow_insecure_http,
             json_response_format=json_response_format,
             thinking_mode=thinking_mode or None,
+            reasoning_effort=reasoning_effort or None,
             timeout=timeout,
             max_tokens=max_tokens,
             max_response_bytes=max_response_bytes,
@@ -1948,6 +1971,8 @@ class OpenAICompatibleClient:
             payload["response_format"] = {"type": "json_object"}
         if self.settings.thinking_mode is not None:
             payload["thinking"] = {"type": self.settings.thinking_mode}
+        if self.settings.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.settings.reasoning_effort
         data = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
