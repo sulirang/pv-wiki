@@ -324,7 +324,7 @@ class ExaClientTests(unittest.TestCase):
         self.assertEqual(3, len(payloads))
         self.assertNotIn("includeDomains", payloads[-1])
         self.assertEqual(
-            '"JinkoSolar" "JKM620N-66HL4M-BDV" official datasheet PDF',
+            '"JKM620N-66HL4M-BDV" filetype:pdf',
             payloads[-1]["query"],
         )
         self.assertFalse(bundle["official_results_found"])

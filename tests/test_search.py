@@ -53,7 +53,7 @@ class BuildQueriesTests(unittest.TestCase):
         )
 
         self.assertIn('"JA Solar" "JA460W"', queries[0])
-        self.assertIn('"JA Solar" "JAM72S20"', queries[1])
+        self.assertEqual('"JAM72S20" filetype:pdf', queries[1])
         self.assertTrue(
             all("2112X1052X35MM" not in query for query in queries)
         )

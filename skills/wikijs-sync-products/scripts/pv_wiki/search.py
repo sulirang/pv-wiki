@@ -162,9 +162,10 @@ def build_queries(product: Mapping[str, Any]) -> list[str]:
         f"{primary_identity} official datasheet PDF",
     ]
     if len(models) > 1:
-        candidates.append(
-            f"{exact_identity(models[1])} official datasheet PDF"
-        )
+        # The manufacturer is already enforced by the official-domain filter
+        # during the first pass. A narrow exact-model PDF query performs much
+        # better on vendor download/CDN indexes than another prose-heavy query.
+        candidates.append(f"{_quote(models[1])} filetype:pdf")
     else:
         candidates.append(
             f"{primary_identity} official specifications technical manual"
