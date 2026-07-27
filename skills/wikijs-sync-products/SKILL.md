@@ -180,7 +180,12 @@ path.
 The supported AI protocol is OpenAI-compatible Chat Completions. The worker
 adds `/chat/completions` to `AI_BASE_URL`. HTTPS is mandatory by default.
 Loopback HTTP is accepted; another trusted private HTTP endpoint requires the
-operator to explicitly set `AI_ALLOW_INSECURE_HTTP=true`. The model receives
+operator to explicitly set `AI_ALLOW_INSECURE_HTTP=true`. The optional
+`AI_THINKING_MODE=enabled|disabled` sends the provider extension
+`"thinking":{"type":"..."}` only when configured; leave it empty for
+compatibility, or select `disabled` when a supported reasoning-by-default
+model would otherwise exhaust the bounded output allowance before returning
+JSON. The model receives
 bounded public identity, search discovery hints without result URLs, and
 extracted evidence; it
 does not receive product database IDs, family codes, lease tokens, or

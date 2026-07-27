@@ -24,7 +24,12 @@ Run these steps from `deploy/n8n` on the authorized VPS:
 3. Fill the Exa key plus the user-owned AI,
    Wiki.js, and read-only catalogue settings
    in `worker.env`. `AI_BASE_URL` is an OpenAI-compatible API base path such as
-   `https://provider.example/v1`; choose `AI_MODEL` explicitly. Set
+   `https://provider.example/v1`; choose `AI_MODEL` explicitly. The optional
+   `AI_THINKING_MODE` accepts only `enabled` or `disabled` and sends the
+   provider extension `"thinking":{"type":"..."}`. Leave it empty for
+   providers that do not implement the extension; explicitly select `disabled`
+   when a supported provider's default reasoning would consume the bounded
+   output budget before returning JSON. Set
    `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` when an internal catalogue `brand_code`
    needs an operator-approved public manufacturer identity. Configure
    `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for narrow trusted hosts, keyed by

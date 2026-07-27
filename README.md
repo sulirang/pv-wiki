@@ -31,7 +31,10 @@ and must not create a Hermes cron job.
 
 The model, API base URL, and API key are all operator supplied. The first
 release supports OpenAI-compatible Chat Completions and fixes the endpoint to
-`{AI_BASE_URL}/chat/completions`.
+`{AI_BASE_URL}/chat/completions`. The optional
+`AI_THINKING_MODE=enabled|disabled` provider extension sends
+`"thinking":{"type":"..."}` when explicitly configured; it is omitted by
+default so other compatible providers retain their native behavior.
 
 ## Database boundaries
 
@@ -164,7 +167,10 @@ deliberately review-gated:
 1. Copy and fill `deploy/n8n/.env.example` and
    `deploy/n8n/worker.env.example`; keep both actual files mode `0600`.
 2. Configure `EXA_API_KEYS` (or `EXA_API_KEY`), then select `AI_BASE_URL`,
-   `AI_API_KEY`, and `AI_MODEL`. Configure
+   `AI_API_KEY`, and `AI_MODEL`. If the selected provider supports the
+   `thinking` request extension and its default consumes the output budget
+   before returning JSON, explicitly set `AI_THINKING_MODE=disabled`;
+   otherwise leave it empty. Configure
    `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` for catalogue brands that need an
    operator-approved public manufacturer identity. Optionally configure
    `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`, keyed by the exact catalogue brand or

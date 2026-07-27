@@ -1225,6 +1225,36 @@ class CLITests(unittest.TestCase):
                 replace(settings, max_tokens=2048)
             ),
         )
+        thinking_settings = replace(settings, thinking_mode="disabled")
+        self.assertEqual(
+            provider,
+            cli._ai_provider_fingerprint(thinking_settings),
+        )
+        self.assertNotEqual(
+            output,
+            cli._ai_output_fingerprint(thinking_settings),
+        )
+        search_client = mock.Mock(credential_fingerprint="a" * 64)
+        baseline_scopes = cli._research_scope_fingerprints(
+            product(),
+            settings,
+            search_client,
+            max_results=5,
+            research_settings=cli.ResearchSettings.from_env(),
+        )
+        thinking_scopes = cli._research_scope_fingerprints(
+            product(),
+            thinking_settings,
+            search_client,
+            max_results=5,
+            research_settings=cli.ResearchSettings.from_env(),
+        )
+        self.assertNotEqual(baseline_scopes["ai"], thinking_scopes["ai"])
+        self.assertEqual(baseline_scopes["search"], thinking_scopes["search"])
+        self.assertEqual(
+            baseline_scopes["extract"],
+            thinking_scopes["extract"],
+        )
 
     def test_failure_status_distinguishes_definitive_from_partial_calls(self) -> None:
         search_client = mock.Mock()

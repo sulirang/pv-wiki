@@ -91,6 +91,7 @@ class AISettingsTests(unittest.TestCase):
                 "AI_MAX_RESPONSE_BYTES": "8192",
                 "AI_MAX_EVIDENCE_CHARS": "9000",
                 "AI_JSON_RESPONSE_FORMAT": "true",
+                "AI_THINKING_MODE": "DISABLED",
             }
         )
         self.assertEqual("https://primary.example/v1", direct.base_url)
@@ -99,6 +100,7 @@ class AISettingsTests(unittest.TestCase):
         self.assertEqual(75, direct.timeout)
         self.assertEqual(3072, direct.max_tokens)
         self.assertTrue(direct.json_response_format)
+        self.assertEqual("disabled", direct.thinking_mode)
         self.assertNotIn("primary-key", repr(direct))
 
         aliases = ai.AISettings.from_env(
@@ -110,6 +112,7 @@ class AISettingsTests(unittest.TestCase):
         )
         self.assertEqual("alias-model", aliases.model)
         self.assertFalse(aliases.json_response_format)
+        self.assertIsNone(aliases.thinking_mode)
 
     def test_requires_https_except_for_loopback(self) -> None:
         for url in (
@@ -169,6 +172,17 @@ class AISettingsTests(unittest.TestCase):
                     "AI_JSON_RESPONSE_FORMAT": "sometimes",
                 }
             )
+        with self.assertRaisesRegex(ai.AIConfigError, "AI_THINKING_MODE"):
+            ai.AISettings.from_env(
+                {
+                    "AI_BASE_URL": "https://llm.example/v1",
+                    "AI_API_KEY": "key",
+                    "AI_MODEL": "model",
+                    "AI_THINKING_MODE": "automatic",
+                }
+            )
+        with self.assertRaisesRegex(ai.AIConfigError, "AI_THINKING_MODE"):
+            settings(thinking_mode=False)
 
     def test_nonfinite_json_constants_are_rejected(self) -> None:
         for value in ("NaN", "Infinity", "-Infinity"):
@@ -785,6 +799,40 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertEqual(0, payload["temperature"])
         self.assertIs(payload["stream"], False)
         self.assertNotIn("response_format", payload)
+        self.assertNotIn("thinking", payload)
+
+    def test_optional_thinking_mode_is_sent_as_provider_extension(self) -> None:
+        calls: list[dict] = []
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {"outcome": "no_datasheet"}
+                                )
+                            }
+                        }
+                    ]
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(thinking_mode="disabled"),
+            opener=fake_open,
+        )
+        self.assertEqual(
+            {"outcome": "no_datasheet"},
+            client.decide(product={"name": "PV-42"}),
+        )
+        self.assertEqual(
+            {"type": "disabled"},
+            calls[0]["thinking"],
+        )
 
     def test_json_response_format_and_bounded_provider_metadata(self) -> None:
         calls: list[dict] = []

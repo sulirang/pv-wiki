@@ -111,6 +111,7 @@ AI_API_KEY=...
 AI_MODEL=...
 AI_TIMEOUT_SECONDS=60
 AI_MAX_TOKENS=4096
+AI_THINKING_MODE=  # optional: enabled or disabled
 AI_MAX_EVIDENCE_CHARS=80000
 ```
 
@@ -119,7 +120,12 @@ The worker uses OpenAI-compatible Chat Completions at
 enabled, as well as redirects, oversized responses, ambiguous JSON, and
 responses that are not a single JSON object. A trusted private HTTP endpoint requires the explicit
 `AI_ALLOW_INSECURE_HTTP=true` opt-in. Provider response bodies and API keys are
-not included in errors.
+not included in errors. `AI_THINKING_MODE` is omitted by default for protocol
+compatibility. When set to `enabled` or `disabled`, the request includes
+`"thinking":{"type":"<mode>"}`; use it only with a provider that documents
+that extension. Explicitly selecting `disabled` prevents a supported
+reasoning-by-default model from spending the bounded output allowance on
+reasoning before it returns the required JSON.
 
 The model is an untrusted proposer. It receives only reader-facing product
 fields, bounded search-provider titles/snippets as discovery hints, and successful

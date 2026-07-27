@@ -354,12 +354,28 @@ class AISettings:
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     max_evidence_chars: int = DEFAULT_MAX_EVIDENCE_CHARS
     json_response_format: bool = False
+    thinking_mode: Literal["enabled", "disabled"] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.allow_insecure_http, bool):
             raise AIConfigError("AI_ALLOW_INSECURE_HTTP must be true or false")
         if not isinstance(self.json_response_format, bool):
             raise AIConfigError("AI_JSON_RESPONSE_FORMAT must be true or false")
+        if self.thinking_mode is not None:
+            if not isinstance(self.thinking_mode, str):
+                raise AIConfigError(
+                    "AI_THINKING_MODE must be enabled or disabled"
+                )
+            normalized_thinking_mode = self.thinking_mode.strip().casefold()
+            if normalized_thinking_mode not in {"enabled", "disabled"}:
+                raise AIConfigError(
+                    "AI_THINKING_MODE must be enabled or disabled"
+                )
+            object.__setattr__(
+                self,
+                "thinking_mode",
+                normalized_thinking_mode,
+            )
         object.__setattr__(
             self,
             "base_url",
@@ -477,12 +493,17 @@ class AISettings:
             env,
             ("AI_JSON_RESPONSE_FORMAT", "LLM_JSON_RESPONSE_FORMAT"),
         )
+        thinking_mode = _first_nonempty(
+            env,
+            ("AI_THINKING_MODE", "LLM_THINKING_MODE"),
+        )
         return cls(
             base_url=base_url,
             api_key=api_key,
             model=model,
             allow_insecure_http=allow_insecure_http,
             json_response_format=json_response_format,
+            thinking_mode=thinking_mode or None,
             timeout=timeout,
             max_tokens=max_tokens,
             max_response_bytes=max_response_bytes,
@@ -1876,6 +1897,8 @@ class OpenAICompatibleClient:
         }
         if self.settings.json_response_format:
             payload["response_format"] = {"type": "json_object"}
+        if self.settings.thinking_mode is not None:
+            payload["thinking"] = {"type": self.settings.thinking_mode}
         data = json.dumps(
             payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
