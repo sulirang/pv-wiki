@@ -90,10 +90,11 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   Raw brand codes are never substituted by AI output. The two JSON environment
   variables remain narrow deployment overrides.
 - Searches approved manufacturer domains first through Exa `includeDomains`.
-  When both bounded official queries return no result, the remaining initial
-  query performs one open-web discovery fallback with the registry's low-value
-  domains excluded. Supplemental AI queries are discovery-only and cannot
-  grant source trust.
+  An official result counts only when its URL, title, or search extract contains
+  a complete operator-derived model candidate. Otherwise one exact-model query
+  performs an open-web discovery fallback with the registry's low-value domains
+  excluded; complete-model PDF results rank first. Supplemental AI queries are
+  discovery-only and cannot grant source trust.
 - When no trusted-domain mapping matches, automatically verifies only an HTTPS
   manufacturer host whose name is consistent with the operator-approved public
   alias when one is configured, or otherwise with the AI-discovered public

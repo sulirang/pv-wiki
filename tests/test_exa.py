@@ -256,6 +256,81 @@ class ExaClientTests(unittest.TestCase):
         self.assertEqual("official_then_open_web", bundle["search_mode"])
         self.assertEqual(3, bundle["usage"]["credits"])
 
+    def test_irrelevant_official_results_trigger_model_bound_pdf_fallback(
+        self,
+    ) -> None:
+        payloads: list[dict] = []
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            payload = json.loads(request.data.decode("utf-8"))
+            payloads.append(payload)
+            if "includeDomains" in payload:
+                results = [
+                    {
+                        "title": "Different product PDF",
+                        "url": (
+                            "https://jinkosolar.com/uploads/"
+                            "JKM615-635N-78HL4-BDV.pdf"
+                        ),
+                        "highlights": ["JKM625N-78HL4-BDV"],
+                    }
+                ]
+            else:
+                results = [
+                    {
+                        "title": "Retail listing",
+                        "url": (
+                            "https://retailer.example/"
+                            "JKM620N-66HL4M-BDV"
+                        ),
+                        "highlights": ["JKM620N-66HL4M-BDV"],
+                    },
+                    {
+                        "title": "Official target family datasheet",
+                        "url": (
+                            "https://jinkosolarcdn.shwebspace.com/uploads/"
+                            "JKM600-625N-66HL4M-BDV.pdf"
+                        ),
+                        "highlights": [
+                            "Module type JKM620N-66HL4M-BDV"
+                        ],
+                    },
+                ]
+            return FakeResponse(
+                {
+                    "requestId": f"request-{len(payloads)}",
+                    "results": results,
+                    "costDollars": {"total": 0.001},
+                }
+            )
+
+        client = exa.ExaClient(api_key="exa-test", opener=fake_urlopen)
+        bundle = client.search_product(
+            {
+                "manufacturer": "JinkoSolar",
+                "model": "JK620W",
+                "model_candidates": [
+                    "JK620W",
+                    "JKM620N-66HL4M-BDV",
+                ],
+                "_search_domains": [
+                    "jinkosolar.com",
+                    "jinkosolarcdn.shwebspace.com",
+                ],
+            }
+        )
+
+        self.assertEqual(3, len(payloads))
+        self.assertNotIn("includeDomains", payloads[-1])
+        self.assertEqual(
+            '"JinkoSolar" "JKM620N-66HL4M-BDV" official datasheet PDF',
+            payloads[-1]["query"],
+        )
+        self.assertFalse(bundle["official_results_found"])
+        self.assertEqual("official_then_open_web", bundle["search_mode"])
+        self.assertTrue(bundle["results"][0]["url"].endswith(".pdf"))
+
     def test_quota_exhaustion_rotates_keys(self) -> None:
         seen_keys: list[str | None] = []
 

@@ -60,9 +60,11 @@ quote, and publication gates as the initial pass.
 For a registered manufacturer, the initial retrieval uses the role-labelled
 global, B2B/download, support, and regional hosts as an Exa `includeDomains`
 allowlist. Two bounded official queries run first. Only when neither produces a
-candidate does the third initial query fall back to open-web discovery, with
-known low-value hosts excluded. Domain filters are runtime parameters, never
-AI-authored query text.
+candidate containing a complete operator-derived model does one exact-model
+initial query fall back to open-web discovery, with known low-value hosts
+excluded. Results containing the complete model and a PDF path rank ahead of
+generic family or storefront pages. Domain filters are runtime parameters,
+never AI-authored query text.
 
 ## Source tiers
 

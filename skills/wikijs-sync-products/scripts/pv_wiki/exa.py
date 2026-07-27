@@ -15,6 +15,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -39,7 +40,7 @@ from .search import (
 
 API_BASE_URL = "https://api.exa.ai"
 DEFAULT_TIMEOUT = 20.0
-SEARCH_CONTRACT_VERSION = "2026-07-27.3"
+SEARCH_CONTRACT_VERSION = "2026-07-27.4"
 EXTRACT_CONTRACT_VERSION = "2026-07-26.2"
 MAX_HIGHLIGHT_CHARACTERS = 12_000
 
@@ -141,6 +142,77 @@ def _validated_search_domains(
             seen.add(domain)
             domains.append(domain)
     return domains
+
+
+def _identity_key(value: Any) -> str:
+    return "".join(
+        character
+        for character in str(value or "").casefold()
+        if character.isalnum()
+    )
+
+
+def _product_model_keys(product: Mapping[str, Any]) -> tuple[str, ...]:
+    raw_values: list[Any] = [product.get("model")]
+    candidates = product.get("model_candidates")
+    if (
+        isinstance(candidates, Sequence)
+        and not isinstance(candidates, (str, bytes, bytearray))
+    ):
+        raw_values.extend(candidates)
+    keys: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        key = _identity_key(raw_value)
+        if len(key) >= 3 and key not in seen:
+            seen.add(key)
+            keys.append(key)
+    return tuple(keys)
+
+
+def _result_model_relevance(
+    result: Mapping[str, Any],
+    model_keys: Sequence[str],
+) -> int:
+    searchable = _identity_key(
+        " ".join(
+            (
+                str(result.get("title") or ""),
+                urllib.parse.unquote(str(result.get("url") or "")),
+                str(result.get("content") or ""),
+            )
+        )
+    )
+    return max(
+        (len(key) for key in model_keys if key in searchable),
+        default=0,
+    )
+
+
+def _is_pdf_result(result: Mapping[str, Any]) -> bool:
+    try:
+        path = urllib.parse.urlsplit(str(result.get("url") or "")).path
+    except ValueError:
+        return False
+    return path.casefold().endswith(".pdf")
+
+
+def _rank_product_results(
+    results: Any,
+    model_keys: Sequence[str],
+) -> list[dict[str, Any]]:
+    if not isinstance(results, list):
+        return []
+    valid = [dict(item) for item in results if isinstance(item, Mapping)]
+    return sorted(
+        valid,
+        key=lambda item: (
+            -_result_model_relevance(item, model_keys),
+            -int(_is_pdf_result(item)),
+            -_finite_number(item.get("score")),
+            str(item.get("url") or ""),
+        ),
+    )
 
 
 class ExaClient:
@@ -341,6 +413,7 @@ class ExaClient:
         max_results: int = 5,
     ) -> dict[str, Any]:
         queries = build_queries(product)
+        model_keys = _product_model_keys(product)
         include_domains = _validated_search_domains(
             product.get("_search_domains"),
             name="product._search_domains",
@@ -358,11 +431,19 @@ class ExaClient:
                 max_results=max_results,
                 exclude_domains=exclude_domains,
             )
+            bundle["results"] = _rank_product_results(
+                bundle.get("results"),
+                model_keys,
+            )
             bundle["search_mode"] = "open_web"
             return bundle
 
         official_queries = queries[:2]
-        fallback_queries = queries[2:]
+        fallback_queries = (
+            queries[1:2]
+            if len(model_keys) > 1
+            else queries[2:]
+        )
         official = self.search_queries(
             official_queries,
             max_results=max_results,
@@ -373,7 +454,16 @@ class ExaClient:
         official_credits = self.last_operation_known_credits
         official["planned_queries"] = queries
         official["official_domains"] = include_domains
-        official["official_results_found"] = bool(official.get("results"))
+        official_results = [
+            item
+            for item in _rank_product_results(
+                official.get("results"),
+                model_keys,
+            )
+            if _result_model_relevance(item, model_keys) > 0
+        ]
+        official["results"] = official_results
+        official["official_results_found"] = bool(official_results)
         if official["official_results_found"] or not fallback_queries:
             official["search_mode"] = "official_only"
             return official
@@ -386,6 +476,10 @@ class ExaClient:
         self.last_operation_requests += official_requests
         self.last_operation_completed_requests += official_completed
         self.last_operation_known_credits += official_credits
+        fallback_results = _rank_product_results(
+            fallback.get("results"),
+            model_keys,
+        )
         return {
             **fallback,
             "queries": [
@@ -396,6 +490,7 @@ class ExaClient:
             "search_mode": "official_then_open_web",
             "official_domains": include_domains,
             "official_results_found": False,
+            "results": fallback_results,
             "usage": {
                 "credits": (
                     float(official.get("usage", {}).get("credits", 0))
