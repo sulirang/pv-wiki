@@ -121,8 +121,8 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
-VALIDATION_POLICY_VERSION = "2026-07-27.3"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-27.3"
+VALIDATION_POLICY_VERSION = "2026-07-27.4"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-27.4"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
@@ -1737,6 +1737,7 @@ def _run_research_ai(
     candidate_manufacturer: str | None,
     previous_queries: tuple[str, ...],
     validation_feedback: ValidationFeedback | None,
+    final_only: bool,
 ) -> tuple[FinalAction | SearchMoreAction, int]:
     request = {
         "model": settings.model,
@@ -1748,6 +1749,7 @@ def _run_research_ai(
             if validation_feedback is not None
             else ""
         ),
+        "final_only": final_only,
     }
     fingerprint = _reserve_research_action(
         store,
@@ -1765,6 +1767,7 @@ def _run_research_ai(
             candidate_manufacturer=candidate_manufacturer,
             previous_queries=previous_queries,
             validation_feedback=validation_feedback,
+            final_only=final_only,
         )
         provider_requests = _provider_request_count(
             client,
@@ -3211,6 +3214,9 @@ def run_one(
                         audit=audit,
                     )
 
+                final_only = (
+                    round_number + 1 >= research_settings.max_rounds
+                )
                 action, provider_requests = _run_research_ai(
                     store,
                     lease,
@@ -3223,6 +3229,7 @@ def run_one(
                     candidate_manufacturer=candidate_manufacturer,
                     previous_queries=tuple(query_history),
                     validation_feedback=validation_feedback,
+                    final_only=final_only,
                 )
                 ai_calls += 1
                 ai_provider_requests += provider_requests

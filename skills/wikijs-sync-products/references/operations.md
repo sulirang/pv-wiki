@@ -90,8 +90,11 @@ URL/token limits. The
 AI can propose search text but cannot provide a domain allowlist, grant source
 trust, call Wiki.js, or change a budget. No new URL/evidence, a local
 validation gap at the round limit, or any exhausted budget ends the attempt as
-a normal machine-handled outcome. Record ordinary source conflicts the same
-way and let the worker retry them on its normal schedule. They do not create
+a normal machine-handled outcome. The last admitted AI action is final-only;
+if the model still requests another search, the worker discards those queries
+and records the fixed evidence gap conservatively instead of raising a provider
+error. Record ordinary source conflicts the same way and let the worker retry
+them on its normal schedule. They do not create
 per-product issues; reserve notification for a systemic condition that
 prevents the batch from progressing.
 

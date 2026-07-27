@@ -1328,12 +1328,15 @@ def build_research_messages(
     candidate_manufacturer: str | None = None,
     previous_queries: Sequence[str] = (),
     validation_feedback: ValidationFeedback | None = None,
+    final_only: bool = False,
     max_evidence_chars: int = DEFAULT_MAX_EVIDENCE_CHARS,
 ) -> list[dict[str, str]]:
     """Build a bounded prompt for one ``final`` or ``search_more`` action."""
 
     if not isinstance(product, Mapping):
         raise TypeError("product must be a mapping")
+    if not isinstance(final_only, bool):
+        raise TypeError("final_only must be boolean")
     if validation_feedback is not None and not isinstance(
         validation_feedback, ValidationFeedback
     ):
@@ -1357,6 +1360,7 @@ def build_research_messages(
         "query_binding_terms": list(bindings),
         "required_query_binding_terms": list(required_bindings),
         "previous_queries": list(normalized_previous),
+        "final_only": final_only,
         "validation_feedback": (
             {
                 "gap": validation_feedback.gap.value,
@@ -1392,6 +1396,16 @@ def build_research_messages(
             "final is only a proposal; it cannot publish or bypass local validation.",
         ],
     }
+    if final_only:
+        request["action_contract"]["exact_top_level_shapes"].pop("search_more")
+        request["action_contract"]["rules"].extend(
+            [
+                "The bounded research budget is exhausted: return final now.",
+                "search_more is forbidden. If the extracts are insufficient, "
+                "return a conservative final no_datasheet, ambiguous, or "
+                "insufficient_identity decision.",
+            ]
+        )
     if validation_feedback is not None:
         request["action_contract"]["rules"].extend(
             [
@@ -1534,6 +1548,7 @@ def validate_research_action(
     candidate_manufacturer: str | None = None,
     previous_queries: Sequence[str] = (),
     validation_feedback: ValidationFeedback | None = None,
+    final_only: bool = False,
 ) -> ResearchAction:
     """Validate one untrusted model action into a small runtime-owned type."""
 
@@ -1544,6 +1559,8 @@ def validate_research_action(
         )
     if not isinstance(product, Mapping):
         raise TypeError("product must be a mapping")
+    if not isinstance(final_only, bool):
+        raise TypeError("final_only must be boolean")
     if validation_feedback is not None and not isinstance(
         validation_feedback, ValidationFeedback
     ):
@@ -1585,6 +1602,11 @@ def validate_research_action(
                 "search_more gap must match the fixed validation feedback gap",
                 category=AIOutputErrorCategory.ACTION_CONTRACT,
             )
+        if final_only:
+            # The query budget is already exhausted, so the untrusted query
+            # strings can have no external effect. Preserve only the bounded
+            # gap enum and let the caller finish with a conservative outcome.
+            return SearchMoreAction(gap=gap, queries=())
         queries = _validate_search_queries(
             value.get("queries"),
             product=product,
@@ -1606,6 +1628,7 @@ def parse_research_action_content(
     candidate_manufacturer: str | None = None,
     previous_queries: Sequence[str] = (),
     validation_feedback: ValidationFeedback | None = None,
+    final_only: bool = False,
 ) -> ResearchAction:
     """Parse and validate a complete model response for one research round."""
 
@@ -1615,6 +1638,7 @@ def parse_research_action_content(
         candidate_manufacturer=candidate_manufacturer,
         previous_queries=previous_queries,
         validation_feedback=validation_feedback,
+        final_only=final_only,
     )
 
 
@@ -2063,6 +2087,7 @@ class OpenAICompatibleClient:
         candidate_manufacturer: str | None = None,
         previous_queries: Sequence[str] = (),
         validation_feedback: ValidationFeedback | None = None,
+        final_only: bool = False,
     ) -> ResearchAction:
         """Return one strictly validated ``final`` or ``search_more`` action.
 
@@ -2079,6 +2104,7 @@ class OpenAICompatibleClient:
             candidate_manufacturer=candidate_manufacturer,
             previous_queries=previous_queries,
             validation_feedback=validation_feedback,
+            final_only=final_only,
             max_evidence_chars=self.settings.max_evidence_chars,
         )
         self.last_research_provider_requests = 0
@@ -2097,6 +2123,7 @@ class OpenAICompatibleClient:
                 candidate_manufacturer=candidate_manufacturer,
                 previous_queries=previous_queries,
                 validation_feedback=validation_feedback,
+                final_only=final_only,
             )
 
         try:

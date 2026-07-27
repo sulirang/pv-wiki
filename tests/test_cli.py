@@ -2545,6 +2545,9 @@ class CLITests(unittest.TestCase):
             "previous_queries"
         ]
         self.assertEqual(7, len(final_queries))
+        self.assertTrue(
+            ai_client.next_research_action.call_args.kwargs["final_only"]
+        )
         with state.StateStore(self.state_path) as store:
             attempt = store.attempt_history("P-42")[-1]
             self.assertEqual(

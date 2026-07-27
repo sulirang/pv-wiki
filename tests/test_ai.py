@@ -375,6 +375,23 @@ class PromptTests(unittest.TestCase):
         self.assertNotIn("Do not return final publish", rules)
         self.assertIn("cannot name or authorize a source or domain", rules)
 
+    def test_final_only_research_prompt_forbids_more_search(self) -> None:
+        messages = ai.build_research_messages(
+            product={"model": "PV-42"},
+            previous_queries=["PV-42 datasheet"],
+            final_only=True,
+        )
+
+        prompt = json.loads(messages[1]["content"])
+        self.assertTrue(prompt["research_context"]["final_only"])
+        self.assertEqual(
+            {"final"},
+            set(prompt["action_contract"]["exact_top_level_shapes"]),
+        )
+        rules = " ".join(prompt["action_contract"]["rules"])
+        self.assertIn("research budget is exhausted", rules)
+        self.assertIn("search_more is forbidden", rules)
+
     def test_validation_feedback_rejects_unbounded_or_unsafe_text(self) -> None:
         fixed = ai.ValidationFeedback.for_gap(
             ai.ResearchGap.INDEPENDENT_CORROBORATION
@@ -464,6 +481,24 @@ class ParsingTests(unittest.TestCase):
         self.assertIsInstance(action, ai.SearchMoreAction)
         self.assertEqual(ai.ResearchGap.PRIMARY_DATASHEET, action.gap)
         self.assertEqual(("PV-42 technical manual",), action.queries)
+
+    def test_final_only_search_more_becomes_a_conservative_stop_signal(
+        self,
+    ) -> None:
+        action = ai.validate_research_action(
+            {
+                "action": "search_more",
+                "gap": "primary_datasheet",
+                "queries": ["PV-42 datasheet"],
+            },
+            product={"model": "PV-42"},
+            previous_queries=["pv-42 DATASHEET"],
+            final_only=True,
+        )
+
+        self.assertIsInstance(action, ai.SearchMoreAction)
+        self.assertEqual(ai.ResearchGap.PRIMARY_DATASHEET, action.gap)
+        self.assertEqual((), action.queries)
 
     def test_search_query_may_bind_current_candidate_manufacturer(self) -> None:
         action = ai.validate_research_action(

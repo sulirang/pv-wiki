@@ -63,7 +63,9 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   actions, seven basic search queries, five unique extract URLs, and a
   20-unit search admission budget. Before each call it reserves one normalized
   unit per Search query or two units per Extract batch; Exa's reported dollar
-  cost is also retained in audit metadata. No new
+  cost is also retained in audit metadata. The final AI action is explicitly
+  final-only; a model request for another search at that point is converted
+  locally into a conservative machine-handled outcome. No new
   research action starts after the 600-second deadline.
 - Uses Exa as the sole bounded search and extraction provider. A retrieval
   comparison supporting that decision is recorded in
