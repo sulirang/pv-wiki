@@ -19,7 +19,7 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from .config import is_placeholder_value
+from .config import is_placeholder_value, supplier_search_excluded_domains
 from .search import (
     EXTRACT_BUDGET_UNITS_PER_BATCH,
     MAX_EXTRACT_URLS,
@@ -39,7 +39,7 @@ from .search import (
 
 API_BASE_URL = "https://api.exa.ai"
 DEFAULT_TIMEOUT = 20.0
-SEARCH_CONTRACT_VERSION = "2026-07-26.2"
+SEARCH_CONTRACT_VERSION = "2026-07-27.3"
 EXTRACT_CONTRACT_VERSION = "2026-07-26.2"
 MAX_HIGHLIGHT_CHARACTERS = 12_000
 
@@ -105,6 +105,42 @@ def _clean_query(value: Any) -> str:
     if len(query) > 400:
         raise ValueError("query must not exceed 400 characters")
     return query
+
+
+def _validated_search_domains(
+    values: Sequence[str] | None,
+    *,
+    name: str,
+) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError(f"{name} must be a sequence of hostnames")
+    if len(values) > 50:
+        raise ValueError(f"{name} cannot contain more than 50 hostnames")
+    domains: list[str] = []
+    seen: set[str] = set()
+    for raw_domain in values:
+        if not isinstance(raw_domain, str):
+            raise TypeError(f"{name} must contain only hostname strings")
+        domain = raw_domain.strip().rstrip(".").casefold()
+        if (
+            not domain
+            or len(domain) > 253
+            or "://" in domain
+            or "/" in domain
+            or "*" in domain
+            or not re.fullmatch(
+                r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+                domain,
+            )
+        ):
+            raise ValueError(f"{name} must contain only narrow hostnames")
+        if domain not in seen:
+            seen.add(domain)
+            domains.append(domain)
+    return domains
 
 
 class ExaClient:
@@ -304,12 +340,90 @@ class ExaClient:
         product: Mapping[str, Any],
         max_results: int = 5,
     ) -> dict[str, Any]:
-        return self.search_queries(build_queries(product), max_results=max_results)
+        queries = build_queries(product)
+        include_domains = _validated_search_domains(
+            product.get("_search_domains"),
+            name="product._search_domains",
+        )
+        exclude_domains = _validated_search_domains(
+            (
+                product.get("_exclude_domains")
+                or sorted(supplier_search_excluded_domains())
+            ),
+            name="product._exclude_domains",
+        )
+        if not include_domains:
+            bundle = self.search_queries(
+                queries,
+                max_results=max_results,
+                exclude_domains=exclude_domains,
+            )
+            bundle["search_mode"] = "open_web"
+            return bundle
+
+        official_queries = queries[:2]
+        fallback_queries = queries[2:]
+        official = self.search_queries(
+            official_queries,
+            max_results=max_results,
+            include_domains=include_domains,
+        )
+        official_requests = self.last_operation_requests
+        official_completed = self.last_operation_completed_requests
+        official_credits = self.last_operation_known_credits
+        official["planned_queries"] = queries
+        official["official_domains"] = include_domains
+        official["official_results_found"] = bool(official.get("results"))
+        if official["official_results_found"] or not fallback_queries:
+            official["search_mode"] = "official_only"
+            return official
+
+        fallback = self.search_queries(
+            fallback_queries,
+            max_results=max_results,
+            exclude_domains=exclude_domains,
+        )
+        self.last_operation_requests += official_requests
+        self.last_operation_completed_requests += official_completed
+        self.last_operation_known_credits += official_credits
+        return {
+            **fallback,
+            "queries": [
+                *official.get("queries", []),
+                *fallback.get("queries", []),
+            ],
+            "planned_queries": queries,
+            "search_mode": "official_then_open_web",
+            "official_domains": include_domains,
+            "official_results_found": False,
+            "usage": {
+                "credits": (
+                    float(official.get("usage", {}).get("credits", 0))
+                    + float(fallback.get("usage", {}).get("credits", 0))
+                ),
+                "cost_dollars": round(
+                    float(
+                        official.get("usage", {}).get("cost_dollars", 0)
+                    )
+                    + float(
+                        fallback.get("usage", {}).get("cost_dollars", 0)
+                    ),
+                    9,
+                ),
+            },
+            "request_ids": [
+                *official.get("request_ids", []),
+                *fallback.get("request_ids", []),
+            ],
+        }
 
     def search_queries(
         self,
         queries: Sequence[str],
         max_results: int = 5,
+        *,
+        include_domains: Sequence[str] | None = None,
+        exclude_domains: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         self.last_operation_requests = 0
         self.last_operation_completed_requests = 0
@@ -320,6 +434,14 @@ class ExaClient:
             raise ValueError("max_results must be between 1 and 20")
 
         clean_queries = _validated_queries(queries)
+        clean_include_domains = _validated_search_domains(
+            include_domains,
+            name="include_domains",
+        )
+        clean_exclude_domains = _validated_search_domains(
+            exclude_domains,
+            name="exclude_domains",
+        )
         merged: dict[str, dict[str, Any]] = {}
         request_ids: list[str] = []
         cost_dollars = 0.0
@@ -327,22 +449,27 @@ class ExaClient:
 
         for query in clean_queries:
             self.last_operation_requests += 1
+            payload: dict[str, Any] = {
+                "query": query,
+                "type": "auto",
+                "numResults": max_results,
+                "contents": {
+                    "highlights": {
+                        "query": (
+                            "official manufacturer datasheet and complete "
+                            "model identity"
+                        ),
+                        "maxCharacters": 1_200,
+                    }
+                },
+            }
+            if clean_include_domains:
+                payload["includeDomains"] = clean_include_domains
+            if clean_exclude_domains:
+                payload["excludeDomains"] = clean_exclude_domains
             response = self._post(
                 "/search",
-                {
-                    "query": query,
-                    "type": "auto",
-                    "numResults": max_results,
-                    "contents": {
-                        "highlights": {
-                            "query": (
-                                "official manufacturer datasheet and complete "
-                                "model identity"
-                            ),
-                            "maxCharacters": 1_200,
-                        }
-                    },
-                },
+                payload,
             )
             results = response.get("results")
             if not isinstance(results, list):
@@ -403,6 +530,8 @@ class ExaClient:
             "queries": clean_queries,
             "search_depth": "auto",
             "max_results": max_results,
+            "include_domains": clean_include_domains,
+            "exclude_domains": clean_exclude_domains,
             "results": ranked,
             "usage": {
                 "credits": credits,

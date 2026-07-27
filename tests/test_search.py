@@ -38,6 +38,26 @@ class BuildQueriesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             search.build_queries({"id": 123})
 
+    def test_build_queries_uses_exact_alternate_model_without_long_description(
+        self,
+    ) -> None:
+        queries = search.build_queries(
+            {
+                "manufacturer": "JA Solar",
+                "model": "JA460W",
+                "model_candidates": ["JA460W", "JAM72S20"],
+                "product_name": (
+                    "JAM72S20 460W HALFCELL MODULE 166MM 2112X1052X35MM"
+                ),
+            }
+        )
+
+        self.assertIn('"JA Solar" "JA460W"', queries[0])
+        self.assertIn('"JA Solar" "JAM72S20"', queries[1])
+        self.assertTrue(
+            all("2112X1052X35MM" not in query for query in queries)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

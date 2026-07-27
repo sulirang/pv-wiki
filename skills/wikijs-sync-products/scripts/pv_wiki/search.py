@@ -95,6 +95,27 @@ def _pick(product: Mapping[str, Any], keys: Sequence[str]) -> str:
     return ""
 
 
+def _pick_terms(value: Any, *, limit: int) -> list[str]:
+    """Return bounded unique query terms from a scalar or sequence."""
+
+    values = (
+        value
+        if isinstance(value, (list, tuple, set, frozenset))
+        else (value,)
+    )
+    terms: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        cleaned = _clean_term(item)
+        key = cleaned.casefold()
+        if cleaned and key not in seen:
+            seen.add(key)
+            terms.append(cleaned)
+        if len(terms) == limit:
+            break
+    return terms
+
+
 def _quote(term: str) -> str:
     return f'"{term}"'
 
@@ -121,28 +142,47 @@ def build_queries(product: Mapping[str, Any]) -> list[str]:
     name = _pick(product, ("name", "product_name", "title", "model_name"))
     category = _pick(product, ("category", "product_type", "type"))
 
-    identity: list[str] = []
-    for term in (manufacturer, model or name):
-        if term and term.casefold() not in {item.casefold() for item in identity}:
-            identity.append(term)
-    if not identity:
+    models = _pick_terms(model or name, limit=1)
+    for candidate in _pick_terms(product.get("model_candidates"), limit=3):
+        if candidate.casefold() not in {item.casefold() for item in models}:
+            models.append(candidate)
+    if not models:
         raise ValueError("product needs a manufacturer, model/part number, or name")
 
-    exact_identity = " ".join(_quote(term) for term in identity)
+    def exact_identity(candidate: str) -> str:
+        terms = [
+            term
+            for term in (manufacturer, candidate)
+            if term
+        ]
+        return " ".join(_quote(term) for term in terms)
+
+    primary_identity = exact_identity(models[0])
     candidates = [
-        f"{exact_identity} official datasheet PDF",
-        f"{exact_identity} official specifications technical manual",
+        f"{primary_identity} official datasheet PDF",
     ]
+    if len(models) > 1:
+        candidates.append(
+            f"{exact_identity(models[1])} official datasheet PDF"
+        )
+    else:
+        candidates.append(
+            f"{primary_identity} official specifications technical manual"
+        )
 
     category_context = ""
     if category and category.casefold() not in {
-        item.casefold() for item in identity
+        item.casefold() for item in (manufacturer, *models) if item
     }:
         category_context = _quote(category)
     candidates.append(
         (
-            f"{exact_identity} {category_context} "
-            "manufacturer product family official"
+            f"{primary_identity} {category_context} "
+            + (
+                "official specifications technical manual"
+                if len(models) > 1
+                else "manufacturer product family official"
+            )
         ).strip()
     )
 

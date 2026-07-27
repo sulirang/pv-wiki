@@ -40,22 +40,25 @@ also forces the probe transaction read-only and fails if that transaction or
 the fixed product query cannot run; review the PostgreSQL role grants
 separately.
 
-External search sends only `product_name` by default. Bounded search
-titles/snippets and successful extracts let AI discover the public manufacturer
+External search sends only reader-facing identity fields. Bounded search
+titles/snippets and successful extracts let AI verify the public manufacturer
 and product type. `family_code` always remains local and never becomes a range
 route, public category, search term, or AI input. Raw `brand_code` is never
-sent; when internal hints are enabled, only its operator-configured public
-manufacturer value from `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` may be sent.
+sent; with internal hints enabled, the bundled `suppliers.json` registry (or a
+deployment override) may provide its approved public manufacturer/category.
 `product_id` is eligible only under
-`PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS=true`, and then only when it is a short
-ASCII model-shaped value without whitespace or a company suffix. Purely
-numeric/company-like names and identifiers remain local.
+`PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS=true`. A clean model-shaped identifier
+is preferred; a space-separated kit/stock identifier may contribute only its
+exact model-shaped tokens. Company-suffixed and URL-like identifiers remain
+local. The description contributes exact model tokens and public category
+context while ratings, dimensions, and refrigerants are rejected as models.
 
 Source authority is configured separately:
-`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` maps an exact catalogue brand or its
-explicit public alias to narrow trusted hosts. A trusted-domain override
-requires the corresponding public alias, and AI-discovered manufacturer text
-cannot select, union, or replace either operator mapping.
+the bundled registry maps an exact catalogue brand to role-labelled narrow
+official hosts. `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` may override that brand
+or its explicit public alias. A domain entry requires the corresponding public
+alias, and AI-discovered manufacturer text cannot select, union, or replace
+either source of operator authority.
 
 ## Durable worker state
 

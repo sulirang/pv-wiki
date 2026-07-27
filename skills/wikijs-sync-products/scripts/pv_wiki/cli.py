@@ -48,6 +48,8 @@ from .config import (
     public_brand_alias_map,
     redact_environment_secrets,
     state_target,
+    supplier_public_category,
+    supplier_search_excluded_domains,
     trusted_source_domain_map,
     trusted_source_domains_for_product,
 )
@@ -65,6 +67,7 @@ from .db import DatabaseConfigurationError, ProductReader, validate_postgres_ssl
 from .decision import (
     DecisionError,
     SourceVerificationError,
+    catalogue_model_candidates,
     canonical_product_category,
     preferred_catalogue_model,
     text_contains_catalogue_identity,
@@ -118,8 +121,8 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
-VALIDATION_POLICY_VERSION = "2026-07-27.2"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-27.2"
+VALIDATION_POLICY_VERSION = "2026-07-27.3"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-27.3"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
@@ -167,10 +170,6 @@ _AI_TOKEN_USAGE_FIELDS = frozenset(
 # source check, Wiki mutation, and durable outcome must form one in-process
 # publication fence. The deployed worker is a single process.
 _SOURCE_PUBLISH_FENCE = threading.Lock()
-_PUBLIC_PRODUCT_ID_HINT_RE = re.compile(
-    r"(?=.{3,64}\Z)(?=.*[A-Za-z])(?=.*[0-9])"
-    r"[A-Za-z0-9][A-Za-z0-9._/+:-]*"
-)
 _COMPANY_IDENTIFIER_SUFFIX_RE = re.compile(
     r"(?:srl|ltd|llc|gmbh|bv|inc|corp|company)\Z",
     flags=re.IGNORECASE,
@@ -294,19 +293,31 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
     stable_id = " ".join(str(product.get("product_id") or "").split())
     public_id_approved = bool(
         include_internal_hints
-        and _PUBLIC_PRODUCT_ID_HINT_RE.fullmatch(stable_id)
+        and 3 <= len(stable_id) <= 200
+        and not any(ord(character) < 32 for character in stable_id)
+        and "://" not in stable_id
         and not _COMPANY_IDENTIFIER_SUFFIX_RE.search(stable_id)
     )
-    public_model = preferred_catalogue_model(
+    catalogue_candidates = catalogue_model_candidates(
         stable_id,
         public_name,
         allow_product_id=public_id_approved,
     )
+    non_description_candidates = tuple(
+        candidate
+        for candidate in catalogue_candidates
+        if not public_name
+        or candidate.casefold() != public_name.casefold()
+    )
+    model_candidates = non_description_candidates or catalogue_candidates
+    public_model = model_candidates[0] if model_candidates else ""
     if not public_model:
         raise CLIError(
             "catalogue identity is empty; record insufficient_identity without search"
         )
     identity: dict[str, Any] = {"model": public_model}
+    if len(model_candidates) > 1:
+        identity["model_candidates"] = list(model_candidates)
     if public_name and public_name != public_model:
         identity["product_name"] = public_name
     if include_internal_hints:
@@ -314,6 +325,15 @@ def _search_identity(product: dict[str, Any]) -> dict[str, Any]:
         manufacturer_alias = public_brand_alias(brand)
         if manufacturer_alias:
             identity["manufacturer"] = manufacturer_alias
+        public_category = supplier_public_category(brand)
+        if public_category:
+            identity["category"] = public_category
+        search_domains = trusted_source_domains_for_product(
+            brand,
+            manufacturer_alias or None,
+        )
+        if search_domains:
+            identity["_search_domains"] = sorted(search_domains)
     return identity
 
 
@@ -1165,6 +1185,7 @@ def _research_scope_fingerprints(
         "provider": "exa",
         "endpoint": provider_endpoint,
         "search_identity": search_identity,
+        "excluded_domains": sorted(supplier_search_excluded_domains()),
         "credential_fingerprint": provider_credential,
     }
     search_scope = digest(
@@ -1469,15 +1490,30 @@ def _run_research_search(
         scope_fingerprints=scope_fingerprints,
     )
     try:
-        raw_bundle = (
-            client.search_queries(planned_queries, max_results=max_results)
-            if queries is not None
-            else client.search_product(identity, max_results=max_results)
-        )
+        if queries is not None:
+            search_kwargs: dict[str, Any] = {"max_results": max_results}
+            excluded_domains = supplier_search_excluded_domains()
+            if excluded_domains:
+                search_kwargs["exclude_domains"] = sorted(excluded_domains)
+            raw_bundle = client.search_queries(
+                planned_queries,
+                **search_kwargs,
+            )
+        else:
+            raw_bundle = client.search_product(
+                identity,
+                max_results=max_results,
+            )
         if not isinstance(raw_bundle, dict):
             raise ExaResponseError("Exa search result must be an object")
         bundle = dict(raw_bundle)
-        bundle["queries"] = planned_queries
+        executed_queries = bundle.get("queries")
+        if (
+            not isinstance(executed_queries, list)
+            or not all(isinstance(item, str) for item in executed_queries)
+        ):
+            bundle["queries"] = planned_queries
+        bundle.setdefault("planned_queries", planned_queries)
         candidate_urls = [
             item["url"]
             for item in bundle.get("results", [])
@@ -1491,7 +1527,7 @@ def _run_research_search(
             request_fingerprint=fingerprint,
             status="completed",
             result_summary={
-                "queries": planned_queries,
+                "queries": bundle["queries"],
                 "candidate_urls": candidate_urls,
                 "request_ids": (
                     request_ids

@@ -24,6 +24,9 @@ from pv_wiki.config import (  # noqa: E402
     public_brand_alias_map,
     state_path,
     state_target,
+    supplier_public_category,
+    supplier_registry_entry,
+    supplier_search_excluded_domains,
     trusted_source_domain_map,
     trusted_source_domains,
     trusted_source_domains_for_product,
@@ -31,6 +34,40 @@ from pv_wiki.config import (  # noqa: E402
 
 
 class ConfigTests(unittest.TestCase):
+    def test_bundled_supplier_registry_uses_operator_brand_table(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual("Fox ESS", public_brand_alias("FOX"))
+            self.assertEqual("JA Solar", public_brand_alias("ja"))
+            self.assertEqual("", public_brand_alias("HPA"))
+            self.assertEqual(
+                "heat pump accessories",
+                supplier_public_category("HPA"),
+            )
+            self.assertEqual(
+                frozenset(
+                    {
+                        "outes.com",
+                        "outesgroup.com",
+                        "outes-tech.com",
+                        "outes.eu",
+                        "outes.it",
+                    }
+                ),
+                trusted_source_domains_for_product("OTS", "OUTES"),
+            )
+            self.assertEqual(
+                "manufacturer",
+                supplier_registry_entry("TRN")["kind"],
+            )
+            self.assertEqual(
+                frozenset({"jasolar.com"}),
+                trusted_source_domains_for_product("JA", "JA Solar"),
+            )
+            self.assertIn(
+                "scribd.com",
+                supplier_search_excluded_domains(),
+            )
+
     def test_defaults_do_not_require_secrets(self) -> None:
         with mock.patch.dict(
             os.environ,

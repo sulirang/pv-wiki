@@ -141,12 +141,15 @@ table may instead provide an exact `model_quote` header row and exact parameter
 `quote` row; the runtime verifies one unique target-model column and the
 selected value in that same column.
 
-`PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` explicitly maps a catalogue `brand_code` to
-the public manufacturer identity allowed in search and decision validation.
-`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` maps that exact brand or alias to narrow
-trusted hosts. A domain override is usable only with the corresponding public
-alias, and AI output cannot select or replace either operator mapping. If no
-trusted-domain entry matches, the local gate can automatically verify only
+The bundled `pv_wiki/suppliers.json` file is the normal operator-owned mapping
+from catalogue `brand_code` to public manufacturer/category identity and
+role-labelled official hosts. `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` and
+`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` are deployment overrides. A domain entry
+is usable only with the corresponding public alias, and AI output cannot
+select or replace either source of operator authority. Registered manufacturers
+are searched on their official hosts first; open-web discovery is a bounded
+fallback and does not grant trust. If no trusted-domain entry matches, the
+local gate can automatically verify only
 an HTTPS manufacturer host whose name is consistent with the public
 manufacturer and whose extract contains both that manufacturer and the
 complete catalogue model. A second independent HTTPS extract must corroborate

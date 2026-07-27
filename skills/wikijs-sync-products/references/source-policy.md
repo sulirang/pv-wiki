@@ -2,22 +2,25 @@
 
 ## Entity match
 
-The catalogue name may be either a public model or a longer description. The
-runtime selects the strongest public hint: a distinctive model-bearing name,
-or, only when the operator explicitly enables internal search hints, an
-eligible alphanumeric catalogue code when the name contains only generic
-specifications. A publish proposal must bind its complete manufacturer model
-to one of those catalogue identities, including suffix,
+The catalogue name may be either a public model or a longer description. When
+the operator enables internal search hints, the runtime builds an ordered set
+from a clean catalogue number and complete model-shaped fragments in the
+description. It rejects dimensions, ratings, refrigerants, and other obvious
+specification tokens as models. A clean catalogue number has priority, while a
+public model embedded in the description remains an exact alternate. A
+publish proposal must bind its complete manufacturer model to one of those
+catalogue identities, including suffix,
 electrical/mechanical variant, region, and revision. Internal family codes are
 not public product categories and must not be used to infer product type. A
 shared family name or partial model is not enough. If two variants remain
 plausible, return `ambiguous`.
 
-`brand_code` is not itself a public identity. The operator may map it to a
-public manufacturer with `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON`; only that
-explicit alias may be used as a manufacturer search hint when internal hints
-are enabled, or as the hard manufacturer boundary for publication. AI output
-cannot replace the alias.
+`brand_code` is not itself a public identity. The versioned `suppliers.json`
+registry maps operator-approved codes to a public manufacturer, a category-only
+hint, or an unassigned state. Only manufacturer entries may become
+manufacturer search hints or hard publication boundaries. Environment JSON
+may override a deployment mapping, but AI output cannot replace either source
+of operator authority.
 
 Bounded search titles/snippets are untrusted discovery hints; their URLs are
 withheld from the model. Successful extracts are used to discover the public
@@ -54,6 +57,13 @@ forms, trust grants, and publication instructions fail closed.
 Supplemental results remain subject to the same local URL, identity, source,
 quote, and publication gates as the initial pass.
 
+For a registered manufacturer, the initial retrieval uses the role-labelled
+global, B2B/download, support, and regional hosts as an Exa `includeDomains`
+allowlist. Two bounded official queries run first. Only when neither produces a
+candidate does the third initial query fall back to open-web discovery, with
+known low-value hosts excluded. Domain filters are runtime parameters, never
+AI-authored query text.
+
 ## Source tiers
 
 1. `manufacturer`: manufacturer product page or document host.
@@ -73,12 +83,14 @@ official document. A mirror may substitute only when explicitly enabled and
 corroborated by a second independent source.
 
 `source_type` is an AI proposal, not an authorization decision.
-`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` is an optional narrow-host override and
-verification fast path keyed by an exact catalogue brand or by that brand's
-configured public alias. If both keys are configured with different domain
-sets, configuration fails closed. AI output never selects or replaces this
-mapping, and a domain override is usable only when the catalogue brand also
-has an explicit public alias. When no configured entry matches, the runtime
+The bundled supplier registry is the normal narrow-host verification fast
+path. `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` is an optional deployment override
+keyed by an exact catalogue brand or by that brand's configured public alias.
+If both override keys are configured with different domain sets,
+configuration fails closed. AI output never selects or replaces this mapping,
+and a domain entry is usable only when the catalogue brand also has an
+operator-approved public alias. When no bundled or configured entry matches,
+the runtime
 may accept a manufacturer source only when all of these conditions hold:
 
 - the URL uses HTTPS;

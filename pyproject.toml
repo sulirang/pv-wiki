@@ -24,6 +24,9 @@ package-dir = {"" = "skills/wikijs-sync-products/scripts"}
 [tool.setuptools.packages.find]
 where = ["skills/wikijs-sync-products/scripts"]
 
+[tool.setuptools.package-data]
+pv_wiki = ["suppliers.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "skills/wikijs-sync-products/tests"]
 addopts = "-q"

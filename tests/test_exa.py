@@ -167,6 +167,95 @@ class ExaClientTests(unittest.TestCase):
         self.assertEqual(2, bundle["usage"]["credits"])
         self.assertEqual(0.002, bundle["usage"]["cost_dollars"])
 
+    def test_product_search_prefers_official_domains_without_open_fallback(
+        self,
+    ) -> None:
+        payloads: list[dict] = []
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            payload = json.loads(request.data.decode("utf-8"))
+            payloads.append(payload)
+            return FakeResponse(
+                {
+                    "requestId": f"official-{len(payloads)}",
+                    "results": [
+                        {
+                            "title": "Official",
+                            "url": "https://jasolar.com/model.pdf",
+                            "highlights": ["JAM72S20"],
+                        }
+                    ],
+                    "costDollars": {"total": 0.001},
+                }
+            )
+
+        client = exa.ExaClient(api_key="exa-test", opener=fake_urlopen)
+        bundle = client.search_product(
+            {
+                "manufacturer": "JA Solar",
+                "model": "JA460W",
+                "model_candidates": ["JA460W", "JAM72S20"],
+                "_search_domains": ["jasolar.com"],
+            }
+        )
+
+        self.assertEqual(2, len(payloads))
+        self.assertTrue(
+            all(
+                payload["includeDomains"] == ["jasolar.com"]
+                for payload in payloads
+            )
+        )
+        self.assertTrue(bundle["official_results_found"])
+        self.assertEqual("official_only", bundle["search_mode"])
+
+    def test_product_search_falls_back_once_when_official_search_is_empty(
+        self,
+    ) -> None:
+        payloads: list[dict] = []
+
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            payload = json.loads(request.data.decode("utf-8"))
+            payloads.append(payload)
+            is_fallback = len(payloads) == 3
+            return FakeResponse(
+                {
+                    "requestId": f"request-{len(payloads)}",
+                    "results": (
+                        [
+                            {
+                                "title": "Fallback candidate",
+                                "url": "https://distributor.example/model",
+                                "highlights": ["JA460W"],
+                            }
+                        ]
+                        if is_fallback
+                        else []
+                    ),
+                    "costDollars": {"total": 0.001},
+                }
+            )
+
+        client = exa.ExaClient(api_key="exa-test", opener=fake_urlopen)
+        bundle = client.search_product(
+            {
+                "manufacturer": "JA Solar",
+                "model": "JA460W",
+                "model_candidates": ["JA460W", "JAM72S20"],
+                "_search_domains": ["jasolar.com"],
+            }
+        )
+
+        self.assertEqual(3, len(payloads))
+        self.assertIn("includeDomains", payloads[0])
+        self.assertIn("includeDomains", payloads[1])
+        self.assertNotIn("includeDomains", payloads[2])
+        self.assertIn("scribd.com", payloads[2]["excludeDomains"])
+        self.assertEqual("official_then_open_web", bundle["search_mode"])
+        self.assertEqual(3, bundle["usage"]["credits"])
+
     def test_quota_exhaustion_rotates_keys(self) -> None:
         seen_keys: list[str | None] = []
 

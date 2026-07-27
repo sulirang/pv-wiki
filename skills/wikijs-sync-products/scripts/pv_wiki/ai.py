@@ -566,6 +566,7 @@ _PUBLIC_PRODUCT_FIELDS = frozenset(
         "vendor",
         "maker",
         "model",
+        "model_candidates",
         "model_name",
         "model_number",
         "part_number",
@@ -648,6 +649,7 @@ _SENSITIVE_FEEDBACK_RE = re.compile(
 )
 _MODEL_BINDING_FIELDS = (
     "model",
+    "model_candidates",
     "model_name",
     "model_number",
     "part_number",
@@ -780,9 +782,19 @@ def _research_binding_terms(
 ) -> tuple[str, ...]:
     terms: list[str] = []
     for field_name in (*_MODEL_BINDING_FIELDS, *_MANUFACTURER_BINDING_FIELDS):
-        term = _normalized_binding_term(product.get(field_name))
-        if term and term.casefold() not in {item.casefold() for item in terms}:
-            terms.append(term)
+        raw_value = product.get(field_name)
+        raw_terms = (
+            raw_value
+            if isinstance(raw_value, Sequence)
+            and not isinstance(raw_value, (str, bytes, bytearray))
+            else (raw_value,)
+        )
+        for raw_term in raw_terms:
+            term = _normalized_binding_term(raw_term)
+            if term and term.casefold() not in {
+                item.casefold() for item in terms
+            }:
+                terms.append(term)
     if candidate_manufacturer is not None:
         candidate = _normalize_local_context_text(
             candidate_manufacturer,
@@ -797,9 +809,19 @@ def _research_binding_terms(
 def _model_binding_terms(product: Mapping[str, Any]) -> tuple[str, ...]:
     terms: list[str] = []
     for field_name in _MODEL_BINDING_FIELDS:
-        term = _normalized_binding_term(product.get(field_name))
-        if term and term.casefold() not in {item.casefold() for item in terms}:
-            terms.append(term)
+        raw_value = product.get(field_name)
+        raw_terms = (
+            raw_value
+            if isinstance(raw_value, Sequence)
+            and not isinstance(raw_value, (str, bytes, bytearray))
+            else (raw_value,)
+        )
+        for raw_term in raw_terms:
+            term = _normalized_binding_term(raw_term)
+            if term and term.casefold() not in {
+                item.casefold() for item in terms
+            }:
+                terms.append(term)
     return tuple(terms)
 
 
@@ -1240,6 +1262,9 @@ def build_decision_messages(
             "Infer the public manufacturer, model, and product category from "
             "the extracted public content; catalogue brand metadata may be absent.",
             "product.model is the runtime's strongest public model hint. "
+            "product.model_candidates contains operator-derived exact alternate "
+            "model tokens from the catalogue number and description; use an "
+            "alternate only when the extracts contain that complete token. "
             "product.product_name, when present, may be a longer descriptive "
             "catalogue label. A publish or out_of_scope model must match the "
             "complete hint or a complete distinctive model appearing in that label.",

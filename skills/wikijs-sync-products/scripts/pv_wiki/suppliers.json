@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "excluded_search_domains": [
+    "alldatasheet.com",
+    "alldatasheet.net",
+    "scribd.com",
+    "tekmatic-store.it"
+  ],
+  "brands": {
+    "AIKO": {
+      "kind": "manufacturer",
+      "manufacturer": "AIKO",
+      "domains": [
+        {"host": "aikosolar.com", "role": "global_product"}
+      ]
+    },
+    "ASTRO": {
+      "kind": "manufacturer",
+      "manufacturer": "Astronergy",
+      "domains": [
+        {"host": "astronergy.com", "role": "global_product"}
+      ]
+    },
+    "BRAND": {
+      "kind": "unassigned",
+      "description": "Da assegnare",
+      "domains": []
+    },
+    "BTR": {
+      "kind": "manufacturer",
+      "manufacturer": "Betteri",
+      "domains": [
+        {"host": "betteri.cn", "role": "corporate_downloads"},
+        {"host": "thesolarconnector.com", "role": "global_product"}
+      ]
+    },
+    "CNDS": {
+      "kind": "manufacturer",
+      "manufacturer": "Canadian Solar",
+      "domains": [
+        {"host": "canadiansolar.com", "role": "global_product"}
+      ]
+    },
+    "CSE": {
+      "kind": "manufacturer",
+      "manufacturer": "China Smart Energy & Technology",
+      "domains": []
+    },
+    "DEYE": {
+      "kind": "manufacturer",
+      "manufacturer": "Deye",
+      "domains": [
+        {"host": "deyeinverter.com", "role": "global_product"}
+      ]
+    },
+    "DZJ": {
+      "kind": "category",
+      "description": "solar pile driver",
+      "public_category": "solar pile driver",
+      "domains": []
+    },
+    "EMC": {
+      "kind": "manufacturer",
+      "manufacturer": "Eurasia Motor Company",
+      "domains": []
+    },
+    "EVR": {
+      "kind": "manufacturer",
+      "manufacturer": "Everstar",
+      "domains": []
+    },
+    "FOX": {
+      "kind": "manufacturer",
+      "manufacturer": "Fox ESS",
+      "domains": [
+        {"host": "fox-ess.com", "role": "global_product"}
+      ]
+    },
+    "HPA": {
+      "kind": "category",
+      "description": "heat pump accessories",
+      "public_category": "heat pump accessories",
+      "domains": []
+    },
+    "HUAWEI": {
+      "kind": "manufacturer",
+      "manufacturer": "Huawei",
+      "domains": [
+        {"host": "solar.huawei.com", "role": "global_product"},
+        {"host": "support.huawei.com", "role": "support_downloads"}
+      ]
+    },
+    "INVT": {
+      "kind": "category",
+      "description": "EV charger",
+      "public_category": "EV charger",
+      "domains": []
+    },
+    "JA": {
+      "kind": "manufacturer",
+      "manufacturer": "JA Solar",
+      "domains": [
+        {"host": "jasolar.com", "role": "global_product_downloads"}
+      ]
+    },
+    "JK": {
+      "kind": "manufacturer",
+      "manufacturer": "JinkoSolar",
+      "domains": [
+        {"host": "jinkosolar.com", "role": "global_product"}
+      ]
+    },
+    "JUSHI": {
+      "kind": "manufacturer",
+      "manufacturer": "Jushi Group",
+      "domains": [
+        {"host": "jushi.com", "role": "corporate_product"}
+      ]
+    },
+    "KSENG": {
+      "kind": "manufacturer",
+      "manufacturer": "Kseng",
+      "domains": [
+        {"host": "ksengenergy.com", "role": "global_product"}
+      ]
+    },
+    "LCRS": {
+      "kind": "manufacturer",
+      "manufacturer": "Luciano Russo",
+      "domains": []
+    },
+    "LONGI": {
+      "kind": "manufacturer",
+      "manufacturer": "LONGi",
+      "domains": [
+        {"host": "longi.com", "role": "global_product_downloads"}
+      ]
+    },
+    "NWT": {
+      "kind": "manufacturer",
+      "manufacturer": "Newntide",
+      "domains": [
+        {"host": "newntide.com", "role": "global_product"}
+      ]
+    },
+    "OTS": {
+      "kind": "manufacturer",
+      "manufacturer": "OUTES",
+      "aliases": [
+        "Zhongguang",
+        "Zhejiang Zhongguang Electrical"
+      ],
+      "domains": [
+        {"host": "outes.com", "role": "china_consumer_product"},
+        {"host": "outesgroup.com", "role": "global_b2b"},
+        {"host": "outes-tech.com", "role": "global_hvac_b2b"},
+        {"host": "outes.eu", "role": "europe_product_downloads"},
+        {"host": "outes.it", "role": "italy_product_downloads"}
+      ]
+    },
+    "PMR": {
+      "kind": "manufacturer",
+      "manufacturer": "Peimar",
+      "domains": [
+        {"host": "peimar.com", "role": "global_product_downloads"}
+      ]
+    },
+    "PW": {
+      "kind": "manufacturer",
+      "manufacturer": "Powerway",
+      "domains": [
+        {"host": "pvpowerway.com", "role": "global_product"}
+      ]
+    },
+    "PYL": {
+      "kind": "manufacturer",
+      "manufacturer": "Pylontech",
+      "domains": [
+        {"host": "pylontech.com.cn", "role": "global_product"},
+        {"host": "pylontech.it", "role": "italy_product_support"}
+      ]
+    },
+    "RM": {
+      "kind": "manufacturer",
+      "manufacturer": "Ronma Solar",
+      "domains": [
+        {"host": "ronmasolar.com", "role": "global_product_downloads"}
+      ]
+    },
+    "RS": {
+      "kind": "manufacturer",
+      "manufacturer": "Risen Energy",
+      "domains": [
+        {"host": "risen.com", "role": "global_product"},
+        {"host": "risenenergy.com", "role": "global_product_downloads"}
+      ]
+    },
+    "SAJ": {
+      "kind": "manufacturer",
+      "manufacturer": "SAJ Electric",
+      "aliases": ["Sanjing"],
+      "domains": [
+        {"host": "saj-electric.com", "role": "global_product_downloads"}
+      ]
+    },
+    "SKT": {
+      "kind": "manufacturer",
+      "manufacturer": "Sunket",
+      "domains": [
+        {"host": "sunket.com", "role": "global_product_downloads"},
+        {"host": "sunketpower.com", "role": "global_product"},
+        {"host": "sunketess.com", "role": "energy_storage_product"}
+      ]
+    },
+    "SLGG": {
+      "kind": "manufacturer",
+      "manufacturer": "Solargiga",
+      "domains": [
+        {"host": "solargiga.com", "role": "global_product_downloads"}
+      ]
+    },
+    "SP": {
+      "kind": "manufacturer",
+      "manufacturer": "Sunpro Power",
+      "domains": [
+        {"host": "sunpropower.com", "role": "global_product_downloads"},
+        {"host": "sunpropower.us", "role": "us_product"}
+      ]
+    },
+    "SUNGRO": {
+      "kind": "manufacturer",
+      "manufacturer": "Sungrow",
+      "domains": [
+        {"host": "sungrowpower.com", "role": "global_product_downloads"}
+      ]
+    },
+    "TEST": {
+      "kind": "unassigned",
+      "description": "Da assegnare",
+      "domains": []
+    },
+    "TIGO": {
+      "kind": "manufacturer",
+      "manufacturer": "Tigo Energy",
+      "domains": [
+        {"host": "tigoenergy.com", "role": "global_product_downloads"}
+      ]
+    },
+    "TRN": {
+      "kind": "manufacturer",
+      "manufacturer": "Trina Solar",
+      "domains": [
+        {"host": "trinasolar.com", "role": "global_product_downloads"}
+      ]
+    },
+    "TW": {
+      "kind": "manufacturer",
+      "manufacturer": "Tongwei",
+      "aliases": ["TW Solar"],
+      "domains": [
+        {"host": "tongwei.cn", "role": "global_product"},
+        {"host": "tongwei.com.cn", "role": "global_product_downloads"}
+      ]
+    },
+    "UL": {
+      "kind": "manufacturer",
+      "manufacturer": "Ulica Solar",
+      "domains": [
+        {"host": "ulicasolar.com", "role": "global_product_downloads"}
+      ]
+    },
+    "XIN": {
+      "kind": "manufacturer",
+      "manufacturer": "Xinxiang Bailu",
+      "domains": []
+    }
+  }
+}

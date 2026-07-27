@@ -8,6 +8,7 @@ import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -391,6 +392,210 @@ def _validated_source_domain(value: object) -> str:
     return domain
 
 
+def _validated_excluded_search_domain(value: object) -> str:
+    """Validate an Exa exclusion hostname, including known shared hosts."""
+
+    if not isinstance(value, str):
+        raise ConfigError(
+            "bundled excluded search domains must be hostname strings"
+        )
+    domain = value.strip().rstrip(".").casefold()
+    if (
+        not domain
+        or len(domain) > 253
+        or "://" in domain
+        or "/" in domain
+        or "*" in domain
+        or not re.fullmatch(
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            domain,
+        )
+    ):
+        raise ConfigError(
+            "bundled excluded search domains must be narrow hostnames"
+        )
+    return domain
+
+
+@lru_cache(maxsize=1)
+def _bundled_supplier_registry() -> dict[str, object]:
+    """Load and validate the versioned operator-owned supplier registry."""
+
+    path = Path(__file__).with_name("suppliers.json")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConfigError("bundled suppliers.json is missing or invalid") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or not isinstance(value.get("brands"), dict)
+        or len(value["brands"]) > 500
+    ):
+        raise ConfigError("bundled suppliers.json has an invalid root schema")
+
+    raw_excluded = value.get("excluded_search_domains", [])
+    if (
+        not isinstance(raw_excluded, list)
+        or len(raw_excluded) > 50
+    ):
+        raise ConfigError(
+            "bundled suppliers.json excluded_search_domains is invalid"
+        )
+    excluded = tuple(
+        _validated_excluded_search_domain(domain) for domain in raw_excluded
+    )
+
+    brands: dict[str, dict[str, object]] = {}
+    for raw_code, raw_entry in value["brands"].items():
+        if (
+            not isinstance(raw_code, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,50}", raw_code)
+            or not isinstance(raw_entry, dict)
+        ):
+            raise ConfigError("bundled suppliers.json contains an invalid brand")
+        code = raw_code.casefold()
+        if code in brands:
+            raise ConfigError(
+                "bundled suppliers.json contains duplicate brand codes"
+            )
+        kind = raw_entry.get("kind")
+        if kind not in {"manufacturer", "category", "unassigned"}:
+            raise ConfigError(
+                f"bundled supplier {raw_code} has an invalid kind"
+            )
+        manufacturer = raw_entry.get("manufacturer", "")
+        if not isinstance(manufacturer, str) or len(manufacturer) > 200:
+            raise ConfigError(
+                f"bundled supplier {raw_code} has an invalid manufacturer"
+            )
+        manufacturer = " ".join(manufacturer.split())
+        if kind == "manufacturer" and (
+            not manufacturer
+            or not any(character.isalpha() for character in manufacturer)
+        ):
+            raise ConfigError(
+                f"bundled supplier {raw_code} needs a public manufacturer"
+            )
+        if kind != "manufacturer" and manufacturer:
+            raise ConfigError(
+                f"bundled supplier {raw_code} cannot declare a manufacturer"
+            )
+
+        raw_aliases = raw_entry.get("aliases", [])
+        if (
+            not isinstance(raw_aliases, list)
+            or len(raw_aliases) > 20
+            or any(
+                not isinstance(alias, str)
+                or not alias.strip()
+                or len(alias.strip()) > 200
+                for alias in raw_aliases
+            )
+        ):
+            raise ConfigError(
+                f"bundled supplier {raw_code} has invalid aliases"
+            )
+        aliases = tuple(" ".join(alias.split()) for alias in raw_aliases)
+
+        raw_domains = raw_entry.get("domains", [])
+        if not isinstance(raw_domains, list) or len(raw_domains) > 20:
+            raise ConfigError(
+                f"bundled supplier {raw_code} has invalid domains"
+            )
+        domains: list[dict[str, str]] = []
+        seen_domains: set[str] = set()
+        for raw_domain in raw_domains:
+            if (
+                not isinstance(raw_domain, dict)
+                or set(raw_domain) != {"host", "role"}
+                or not isinstance(raw_domain.get("role"), str)
+                or not re.fullmatch(
+                    r"[a-z][a-z0-9_]{1,49}",
+                    raw_domain["role"],
+                )
+            ):
+                raise ConfigError(
+                    f"bundled supplier {raw_code} has an invalid domain entry"
+                )
+            host = _validated_source_domain(raw_domain.get("host"))
+            if host in seen_domains:
+                raise ConfigError(
+                    f"bundled supplier {raw_code} has duplicate domains"
+                )
+            seen_domains.add(host)
+            domains.append({"host": host, "role": raw_domain["role"]})
+
+        description = raw_entry.get("description", "")
+        public_category = raw_entry.get("public_category", "")
+        if (
+            not isinstance(description, str)
+            or len(description) > 200
+            or not isinstance(public_category, str)
+            or len(public_category) > 100
+        ):
+            raise ConfigError(
+                f"bundled supplier {raw_code} has invalid descriptive fields"
+            )
+        brands[code] = {
+            "code": raw_code,
+            "kind": kind,
+            "manufacturer": manufacturer,
+            "aliases": aliases,
+            "domains": tuple(domains),
+            "description": " ".join(description.split()),
+            "public_category": " ".join(public_category.split()),
+        }
+    return {
+        "schema_version": 1,
+        "excluded_search_domains": excluded,
+        "brands": brands,
+    }
+
+
+def supplier_registry_entry(brand_code: str | None) -> dict[str, object]:
+    """Return one approved supplier/category record by catalogue code."""
+
+    brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
+    if not brand:
+        return {}
+    brands = _bundled_supplier_registry()["brands"]
+    assert isinstance(brands, dict)
+    entry = brands.get(brand)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def supplier_search_excluded_domains() -> frozenset[str]:
+    """Return operator-maintained low-value domains for open-web fallback."""
+
+    domains = _bundled_supplier_registry()["excluded_search_domains"]
+    assert isinstance(domains, tuple)
+    return frozenset(domains)
+
+
+def supplier_public_category(brand_code: str | None) -> str:
+    """Return a public category only for codes explicitly marked as categories."""
+
+    entry = supplier_registry_entry(brand_code)
+    if entry.get("kind") != "category":
+        return ""
+    value = entry.get("public_category")
+    return value if isinstance(value, str) else ""
+
+
+def _bundled_supplier_domains(brand_code: str | None) -> frozenset[str]:
+    entry = supplier_registry_entry(brand_code)
+    domains = entry.get("domains")
+    if not isinstance(domains, tuple):
+        return frozenset()
+    return frozenset(
+        item["host"]
+        for item in domains
+        if isinstance(item, dict) and isinstance(item.get("host"), str)
+    )
+
+
 def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -487,7 +692,19 @@ def public_brand_alias(brand_code: str | None) -> str:
     """Resolve an explicitly approved public name for one catalogue brand."""
 
     brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
-    return public_brand_alias_map().get(brand, "") if brand else ""
+    if not brand:
+        return ""
+    configured = public_brand_alias_map().get(brand)
+    if configured is not None:
+        return configured
+    entry = supplier_registry_entry(brand)
+    manufacturer = entry.get("manufacturer")
+    return (
+        manufacturer
+        if entry.get("kind") == "manufacturer"
+        and isinstance(manufacturer, str)
+        else ""
+    )
 
 
 def trusted_source_domain_map() -> dict[str, frozenset[str]]:
@@ -550,7 +767,7 @@ def trusted_source_domains(brand_code: str) -> frozenset[str]:
         raise TrustedSourceNotConfigured(
             "a non-empty catalogue brand_code is required for trusted publishing"
         )
-    domains = trusted_source_domain_map().get(brand_code.strip().casefold())
+    domains = trusted_source_domains_for_product(brand_code, None)
     if not domains:
         raise TrustedSourceNotConfigured(
             "no trusted source domains are configured for this catalogue brand_code"
@@ -574,7 +791,7 @@ def trusted_source_domains_for_product(
     brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
     if not brand:
         return frozenset()
-    alias = public_brand_alias_map().get(brand, "").casefold()
+    alias = public_brand_alias(brand).casefold()
     brand_domains = mapping.get(brand, frozenset())
     alias_domains = mapping.get(alias, frozenset()) if alias else frozenset()
     if brand_domains and alias_domains and brand_domains != alias_domains:
@@ -582,7 +799,8 @@ def trusted_source_domains_for_product(
             "trusted source domains conflict between the catalogue brand "
             "and its explicit public alias"
         )
-    return brand_domains or alias_domains
+    configured = brand_domains or alias_domains
+    return configured or _bundled_supplier_domains(brand)
 
 
 def missing_environment(names: list[str] | tuple[str, ...]) -> list[str]:
@@ -613,6 +831,9 @@ __all__ = [
     "redact_environment_secrets",
     "state_path",
     "state_target",
+    "supplier_public_category",
+    "supplier_registry_entry",
+    "supplier_search_excluded_domains",
     "trusted_source_domain_map",
     "trusted_source_domains",
     "trusted_source_domains_for_product",

@@ -35,12 +35,13 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    providers that do not implement the extension; explicitly select `disabled`
    when a supported provider's default reasoning would consume the bounded
    output budget before returning JSON. Set
-   `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` when an internal catalogue `brand_code`
-   needs an operator-approved public manufacturer identity. Configure
-   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for narrow trusted hosts, keyed by
-   the exact catalogue brand or its configured public alias. AI output cannot
-   select or replace either mapping. A trusted-domain entry also requires the
-   matching public alias. Without a matching trusted-domain entry,
+   Review the bundled versioned `suppliers.json` registry. Use
+   `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` and
+   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for deployment-specific
+   manufacturer or narrow-host overrides. Registered suppliers are searched on
+   their global/B2B/regional official hosts first. AI output cannot select or
+   replace the bundled registry or an override. A domain entry also requires
+   the matching public alias. Without a matching trusted-domain entry,
    the worker may automatically verify an HTTPS manufacturer host when its name
    is consistent with the public manufacturer identity and its extract contains
    both that manufacturer and the complete model. A second independent HTTPS

@@ -81,10 +81,17 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   mentions an accessory bolt, the classification is rejected. A second local
   gate also rejects any `publish` proposal whose model or public category
   itself identifies generic hardware.
-- Uses `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` to map an operator-owned catalogue
-  `brand_code` to its public manufacturer name. Raw brand codes are never
-  substituted by AI output. `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` separately
-  maps that catalogue brand or its exact public alias to narrow trusted hosts.
+- Uses the versioned operator-owned
+  [`suppliers.json`](skills/wikijs-sync-products/scripts/pv_wiki/suppliers.json)
+  registry to map catalogue `brand_code` values to public manufacturers,
+  category-only codes, and role-labelled global/B2B/regional official hosts.
+  Raw brand codes are never substituted by AI output. The two JSON environment
+  variables remain narrow deployment overrides.
+- Searches approved manufacturer domains first through Exa `includeDomains`.
+  When both bounded official queries return no result, the remaining initial
+  query performs one open-web discovery fallback with the registry's low-value
+  domains excluded. Supplemental AI queries are discovery-only and cannot
+  grant source trust.
 - When no trusted-domain mapping matches, automatically verifies only an HTTPS
   manufacturer host whose name is consistent with the operator-approved public
   alias when one is configured, or otherwise with the AI-discovered public
@@ -94,11 +101,14 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   quoted from the verified primary manufacturer datasheet; they do not each
   need a duplicate quote from the independent identity source. A failed check
   becomes `source_unverified` and cannot publish.
-- Separates a descriptive catalogue name from its public model identity. A
-  proposed model must be a complete distinctive model embedded in the name or
-  an eligible alphanumeric catalogue code when internal search hints are
-  explicitly enabled, and only cited extracts—not unrelated successful
-  candidates—must contain that bound model.
+- Separates a descriptive catalogue name from its public model identities.
+  With internal hints enabled, the resolver keeps an ordered set containing a
+  clean catalogue number plus exact model-shaped tokens from the description.
+  Electrical ratings, dimensions, refrigerants, and other specification tokens
+  are excluded. Queries therefore use `R125-G2` instead of a 125000 W
+  description while a stock alias such as `JA460W` can retain `JAM72S20` as an
+  exact alternate. Only cited extracts—not unrelated successful candidates—
+  may establish the final model.
 - Allows multi-model series datasheets into analysis. A normal prose/target-only
   row still needs one exact model/label/value quote. A Markdown-pipe or TSV
   table may instead provide `model_quote` for the exact model-header row and
@@ -173,14 +183,13 @@ deliberately review-gated:
    `AI_API_KEY`, and `AI_MODEL`. If the selected provider supports the
    `thinking` request extension and its default consumes the output budget
    before returning JSON, explicitly set `AI_THINKING_MODE=disabled`;
-   otherwise leave it empty. Configure
-   `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` for catalogue brands that need an
-   operator-approved public manufacturer identity. Optionally configure
-   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`, keyed by the exact catalogue brand or
-   public alias, with narrow trusted hosts. AI output cannot select or replace
-   either mapping. A trusted-domain override also requires the corresponding
-   public brand alias so the runtime has an operator-approved manufacturer
-   identity. Set the optional global daily/monthly credit limits before
+   otherwise leave it empty. Review the bundled `suppliers.json` registry and
+   use `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` or
+   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for deployment-specific
+   overrides. AI output cannot select or replace either the bundled registry
+   or an override. A trusted-domain override also requires an
+   operator-approved public brand identity. Set the optional global
+   daily/monthly credit limits before
    unattended operation; their default `0` values disable those stop-losses.
 3. Start the Compose project or attach only the worker to an existing n8n
    network.

@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 from pv_wiki.decision import (  # noqa: E402
     DecisionError,
     SourceVerificationError,
+    catalogue_model_candidates,
     model_matches_catalogue_identity,
     preferred_catalogue_model,
     text_contains_catalogue_identity,
@@ -86,6 +87,28 @@ def valid_decision() -> dict:
 
 
 class DecisionTests(unittest.TestCase):
+    def test_catalogue_candidates_combine_stock_code_and_public_model(self) -> None:
+        self.assertEqual(
+            (
+                "JA460W",
+                "JAM72S20",
+                "JAM72S20 460W HALFCELL MODULE 166MM 2112X1052X35MM",
+            ),
+            catalogue_model_candidates(
+                "JA460W",
+                "JAM72S20 460W HALFCELL MODULE 166MM 2112X1052X35MM",
+                allow_product_id=True,
+            ),
+        )
+        self.assertEqual(
+            "R125-G2",
+            preferred_catalogue_model(
+                "R125-G2",
+                "125000W Three Phase 380V/60HZ,10 MPPT inverter",
+                allow_product_id=True,
+            ),
+        )
+
     def test_exact_identity_match_rejects_prefixes_suffixes_and_substrings(self) -> None:
         self.assertTrue(
             text_contains_exact_identity(
@@ -279,7 +302,7 @@ class DecisionTests(unittest.TestCase):
             )
         )
         self.assertEqual(
-            "SUN2000-50KTL-M3 INVERTER",
+            "SUN2000-50KTL-M3",
             preferred_catalogue_model(
                 "01073873",
                 "SUN2000-50KTL-M3 INVERTER",
@@ -301,7 +324,7 @@ class DecisionTests(unittest.TestCase):
                     preferred_catalogue_model("INTERNAL-42", name),
                 )
         self.assertEqual(
-            "PV-42 solar inverter",
+            "PV-42",
             preferred_catalogue_model("INTERNAL-42", "PV-42 solar inverter"),
         )
         self.assertEqual(

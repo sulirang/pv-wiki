@@ -477,6 +477,41 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual("Acme Solar", identity["manufacturer"])
 
+    def test_bundled_brand_registry_drives_identity_and_official_domains(
+        self,
+    ) -> None:
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
+
+        identity = cli._search_identity(
+            {
+                **product(),
+                "brand_code": "FOX",
+                "product_id": "R125-G2",
+                "product_name": (
+                    "125000W Three Phase 380V/60HZ,10 MPPT inverter"
+                ),
+            }
+        )
+
+        self.assertEqual("R125-G2", identity["model"])
+        self.assertEqual("Fox ESS", identity["manufacturer"])
+        self.assertEqual(["fox-ess.com"], identity["_search_domains"])
+        self.assertNotIn("125000W", identity.get("model_candidates", []))
+
+    def test_identity_extracts_model_from_space_separated_kit_code(self) -> None:
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
+
+        identity = cli._search_identity(
+            {
+                **product(),
+                "brand_code": "",
+                "product_id": "KIT HS2-5K-S2",
+                "product_name": "Hybrid inverter and battery kit",
+            }
+        )
+
+        self.assertEqual("HS2-5K-S2", identity["model"])
+
     def test_internal_company_identifier_is_not_promoted_as_model(self) -> None:
         os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
 
@@ -1169,7 +1204,8 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(
             {
-                "model": "SUN2000-50KTL-M3 INVERTER",
+                "model": "SUN2000-50KTL-M3",
+                "product_name": "SUN2000-50KTL-M3 INVERTER",
             },
             cli._search_identity(
                 {
@@ -2257,6 +2293,12 @@ class CLITests(unittest.TestCase):
         search_client.search_queries.assert_called_once_with(
             ['"PV-42" independent specifications'],
             max_results=5,
+            exclude_domains=[
+                "alldatasheet.com",
+                "alldatasheet.net",
+                "scribd.com",
+                "tekmatic-store.it",
+            ],
         )
         self.assertEqual(2, search_client.extract_urls.call_count)
         self.assertEqual(2, ai_client.next_research_action.call_count)

@@ -126,8 +126,10 @@ _OUT_OF_SCOPE_CJK_TYPE_TERMS = (
 _IN_SCOPE_ENGLISH_TYPE_RE = re.compile(
     r"(?<!\w)(?:"
     r"solar|photovoltaic|pv\s+module|solar\s+module|solar\s+panel|"
+    r"n[\s-]?type|mono(?:crystalline)?|half[\s-]?cell|"
     r"inverters?|batter(?:y|ies)|energy\s+storage|heat\s+pumps?|"
-    r"compressors?|chargers?|converters?|power\s+suppl(?:y|ies)"
+    r"compressors?|chargers?|converters?|power\s+suppl(?:y|ies)|"
+    r"pompa\s+di\s+calore|modul[oi]|pannell[oi]|batteri[ae]"
     r")(?!\w)",
     flags=re.IGNORECASE,
 )
@@ -197,6 +199,17 @@ _MEASUREMENT_FRAGMENT_RE = re.compile(
     r"\d+(?:[.,]\d+)?(?:"
     r"w|kw|mw|v|kv|a|ma|ah|wh|kwh|va|kva|"
     r"mm|cm|m|g|kg|hz|khz|mhz"
+    r")",
+    flags=re.IGNORECASE,
+)
+_SPECIFICATION_FRAGMENT_RE = re.compile(
+    r"(?:"
+    r"\d+(?:[x×]\d+)+(?:mm|cm|m)?"
+    r"|\d+(?:[.,]\d+)?(?:w|kw|mw|v|kv|a|ma|ah|wh|kwh|va|kva|hz)"
+    r"(?:[/_-]\d+(?:[.,]\d+)?"
+    r"(?:w|kw|mw|v|kv|a|ma|ah|wh|kwh|va|kva|hz))+"
+    r"|\d+(?:mppt|ph|phase|cells?)"
+    r"|r(?:32|290|410a|134a)"
     r")",
     flags=re.IGNORECASE,
 )
@@ -330,6 +343,8 @@ def _distinctive_model_fragments(value: str) -> tuple[str, ...]:
         if (
             key not in seen
             and _is_distinctive_model_identity(fragment)
+            and len(fragment) <= 80
+            and _SPECIFICATION_FRAGMENT_RE.fullmatch(fragment) is None
         ):
             seen.add(key)
             fragments.append(fragment)
@@ -354,6 +369,54 @@ def _looks_like_product_description(value: str) -> bool:
     )
 
 
+def catalogue_model_candidates(
+    product_id: Any,
+    product_name: Any,
+    *,
+    allow_product_id: bool = False,
+) -> tuple[str, ...]:
+    """Return ordered public model candidates from number and description.
+
+    A clean catalogue number is the strongest hint. Descriptive names still
+    contribute exact model-shaped fragments, so stock aliases such as
+    ``JA460W`` can be searched alongside a public family model such as
+    ``JAM72S20`` without treating dimensions or electrical ratings as models.
+    """
+
+    name = " ".join(str(product_name or "").split())
+    stable_id = " ".join(str(product_id or "").split())
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        normalized = " ".join(value.split())
+        key = identity_key(normalized)
+        if normalized and key and key not in seen:
+            seen.add(key)
+            candidates.append(normalized)
+
+    if allow_product_id and stable_id:
+        if (
+            not re.search(r"\s", stable_id)
+            and _is_distinctive_model_identity(stable_id)
+        ):
+            add(stable_id)
+        for fragment in _distinctive_model_fragments(stable_id):
+            add(fragment)
+
+    if (
+        name
+        and identity_key(name)
+        and not identity_key(name).isdecimal()
+        and not _looks_like_organization_name(name)
+    ):
+        for fragment in _distinctive_model_fragments(name):
+            add(fragment)
+        if _looks_like_product_description(name):
+            add(name)
+    return tuple(candidates)
+
+
 def preferred_catalogue_model(
     product_id: Any,
     product_name: Any,
@@ -362,24 +425,12 @@ def preferred_catalogue_model(
 ) -> str:
     """Choose a public model hint, promoting the stable key only by opt-in."""
 
-    name = " ".join(str(product_name or "").split())
-    stable_id = " ".join(str(product_id or "").split())
-    if not name:
-        return ""
-    name_key = identity_key(name)
-    if (
-        not name_key
-        or name_key.isdecimal()
-        or _looks_like_organization_name(name)
-    ):
-        return ""
-    if _distinctive_model_fragments(name):
-        return name
-    if not _looks_like_product_description(name):
-        return ""
-    if allow_product_id and _is_distinctive_model_identity(stable_id):
-        return stable_id
-    return name
+    candidates = catalogue_model_candidates(
+        product_id,
+        product_name,
+        allow_product_id=allow_product_id,
+    )
+    return candidates[0] if candidates else ""
 
 
 def model_matches_catalogue_identity(
@@ -391,25 +442,15 @@ def model_matches_catalogue_identity(
     """Require a proposed public model to be anchored in catalogue identity."""
 
     model_key = identity_key(model)
-    name_key = identity_key(product_name)
-    product_id_key = identity_key(product_id)
     if not model_key:
         return False
-    if name_key and model_key == name_key:
-        return True
-    if not _is_distinctive_model_identity(model):
-        return False
-    if (
-        product_id_key
-        and model_key == product_id_key
-        and _is_distinctive_model_identity(product_id)
-    ):
-        return True
-    fragments = _distinctive_model_fragments(product_name)
-    return (
-        bool(fragments)
-        and model_key in name_key
-        and all(identity_key(fragment) in model_key for fragment in fragments)
+    return any(
+        model_key == identity_key(candidate)
+        for candidate in catalogue_model_candidates(
+            product_id,
+            product_name,
+            allow_product_id=True,
+        )
     )
 
 
@@ -422,18 +463,13 @@ def text_contains_catalogue_identity(
 
     if not isinstance(body, str) or not body.strip():
         return False
-    name = " ".join(str(product_name or "").split())
-    stable_id = " ".join(str(product_id or "").split())
-    fragments = _distinctive_model_fragments(name)
-    return (
-        bool(name)
-        and text_contains_exact_identity(name, body)
-    ) or (
-        bool(fragments)
-        and all(text_contains_exact_identity(fragment, body) for fragment in fragments)
-    ) or (
-        _is_distinctive_model_identity(stable_id)
-        and text_contains_exact_identity(stable_id, body)
+    return any(
+        text_contains_exact_identity(candidate, body)
+        for candidate in catalogue_model_candidates(
+            product_id,
+            product_name,
+            allow_product_id=True,
+        )
     )
 
 
@@ -1869,6 +1905,7 @@ def validate_decision(
 __all__ = [
     "DecisionError",
     "SourceVerificationError",
+    "catalogue_model_candidates",
     "canonical_product_category",
     "identity_key",
     "model_matches_catalogue_identity",
