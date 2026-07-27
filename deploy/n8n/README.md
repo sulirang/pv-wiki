@@ -45,8 +45,10 @@ Run these steps from `deploy/n8n` on the authorized VPS:
    `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for deployment-specific
    manufacturer or narrow-host overrides. Registered suppliers are searched on
    their global/B2B/regional official hosts first. AI output cannot select or
-   replace the bundled registry or an override. A domain entry also requires
-   the matching public alias. Without a matching trusted-domain entry,
+   replace the bundled registry or an override. Bundle rows whose source
+   `brand_code` is empty may inherit one only from an exact branded model
+   sibling in the same catalogue; fuzzy matches are refused. A domain entry
+   also requires the matching public alias. Without a matching trusted-domain entry,
    the worker may automatically verify an HTTPS manufacturer host when its name
    is consistent with the public manufacturer identity and its extract contains
    both that manufacturer and the complete model. A second independent HTTPS

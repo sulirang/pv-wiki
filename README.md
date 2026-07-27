@@ -100,6 +100,11 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   category-only codes, and role-labelled global/B2B/regional official hosts.
   Raw brand codes are never substituted by AI output. The two JSON environment
   variables remain narrow deployment overrides.
+- During a full catalogue sync, a bundle row with an empty `brand_code` may
+  inherit a registered supplier only from one exact model-candidate sibling in
+  the same source catalogue (for example `KIT H1-4K-S2` from branded
+  `H1-4K-S2`). Fuzzy names, conflicts, and unregistered brands remain empty;
+  the sync result reports the bounded count as `brands_inferred`.
 - Searches approved manufacturer domains first through Exa `includeDomains`.
   An official result counts only when its URL, title, or search extract contains
   a complete operator-derived model candidate. Otherwise one exact-model query

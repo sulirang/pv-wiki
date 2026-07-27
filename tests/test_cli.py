@@ -354,6 +354,54 @@ class CLITests(unittest.TestCase):
             self.assertEqual("due", current.status)
             self.assertEqual(0, current.consecutive_failures)
 
+    def test_sync_catalogue_inherits_brand_from_exact_model_sibling(self) -> None:
+        reader = mock.Mock()
+        reader.fetch_products.return_value = [
+            {
+                **product(),
+                "product_id": "H1-4K-S2",
+                "brand_code": "SAJ",
+                "product_name": "4kW inverter ibrido, 2MPPT",
+            },
+            {
+                **product(),
+                "product_id": "KIT H1-4K-S2",
+                "brand_code": None,
+                "family_code": None,
+                "product_name": "inv 4 kw + 10 kwh",
+            },
+        ]
+        with mock.patch.object(cli, "ProductReader", return_value=reader):
+            payload = cli.sync_catalogue()
+
+        self.assertEqual(1, payload["brands_inferred"])
+        with state.StateStore(self.state_path) as store:
+            bundle = store.get_product("KIT H1-4K-S2")
+            self.assertEqual("SAJ", bundle.payload["brand_code"])
+
+    def test_sync_catalogue_does_not_fuzzy_infer_missing_brand(self) -> None:
+        reader = mock.Mock()
+        reader.fetch_products.return_value = [
+            {
+                **product(),
+                "product_id": "H1-4K-S20",
+                "brand_code": "SAJ",
+            },
+            {
+                **product(),
+                "product_id": "KIT H1-4K-S2",
+                "brand_code": None,
+                "product_name": "inv 4 kw + 10 kwh",
+            },
+        ]
+        with mock.patch.object(cli, "ProductReader", return_value=reader):
+            payload = cli.sync_catalogue()
+
+        self.assertEqual(0, payload["brands_inferred"])
+        with state.StateStore(self.state_path) as store:
+            bundle = store.get_product("KIT H1-4K-S2")
+            self.assertIsNone(bundle.payload["brand_code"])
+
     def test_daily_catalogue_refresh_preserves_quota_wait(self) -> None:
         paused_at = datetime.now(timezone.utc)
         with state.StateStore(self.state_path) as store:

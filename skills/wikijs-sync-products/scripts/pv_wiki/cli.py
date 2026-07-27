@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -891,6 +891,83 @@ def _cmd_sync_db(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _product_source_value(product: Any, field: str) -> Any:
+    if isinstance(product, Mapping):
+        return product.get(field)
+    return getattr(product, field, None)
+
+
+def _inherit_registered_sibling_brands(
+    products: list[Any],
+) -> tuple[list[Any], int]:
+    """Fill a missing brand from one exact, branded catalogue model sibling.
+
+    Bundle rows such as ``KIT H1-4K-S2`` may omit ``brand_code`` even though
+    the same read-only catalogue contains the exact base product
+    ``H1-4K-S2`` with ``brand_code=SAJ``. Only an exact model-candidate match
+    to one registered supplier is accepted; fuzzy names and conflicting
+    brands remain empty for AI/local verification.
+    """
+
+    brands_by_product_id: dict[str, set[str]] = {}
+    for product in products:
+        product_id = str(
+            _product_source_value(product, "product_id") or ""
+        ).strip()
+        brand = str(
+            _product_source_value(product, "brand_code") or ""
+        ).strip()
+        if not product_id or not brand or not public_brand_alias(brand):
+            continue
+        brands_by_product_id.setdefault(
+            product_id.casefold(),
+            set(),
+        ).add(brand)
+
+    enriched: list[Any] = []
+    inferred = 0
+    for product in products:
+        existing_brand = str(
+            _product_source_value(product, "brand_code") or ""
+        ).strip()
+        if existing_brand:
+            enriched.append(product)
+            continue
+        product_id = str(
+            _product_source_value(product, "product_id") or ""
+        ).strip()
+        product_name = str(
+            _product_source_value(product, "product_name") or ""
+        ).strip()
+        matched_brands = {
+            brand
+            for candidate in catalogue_model_candidates(
+                product_id,
+                product_name,
+                allow_product_id=True,
+            )
+            for brand in brands_by_product_id.get(
+                candidate.casefold(),
+                set(),
+            )
+        }
+        if len(matched_brands) != 1:
+            enriched.append(product)
+            continue
+        inferred_brand = next(iter(matched_brands))
+        if isinstance(product, Mapping):
+            updated = dict(product)
+            updated["brand_code"] = inferred_brand
+        elif is_dataclass(product) and not isinstance(product, type):
+            updated = replace(product, brand_code=inferred_brand)
+        else:
+            enriched.append(product)
+            continue
+        enriched.append(updated)
+        inferred += 1
+    return enriched, inferred
+
+
 def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
     """Refresh the queue, optionally waking explicit monthly quota waits."""
 
@@ -898,6 +975,7 @@ def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
         raise TypeError("resume_quota must be a boolean")
 
     products = ProductReader().fetch_products(batch_size=500)
+    products, brands_inferred = _inherit_registered_sibling_brands(products)
     with _SOURCE_PUBLISH_FENCE:
         with _store() as store:
             # Keep SQLite write-lock holds short enough that a concurrently
@@ -917,6 +995,7 @@ def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
     return {
         "ok": True,
         "source_records": len(products),
+        "brands_inferred": brands_inferred,
         "created": sum(item.created for item in results),
         "changed": sum(item.changed and not item.created for item in results),
         "rescheduled": sum(item.rescheduled for item in results),
