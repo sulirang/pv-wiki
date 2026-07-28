@@ -28,13 +28,21 @@ from typing import Any
 from .render import validate_public_http_url
 
 
-PDF_EXTRACTION_CONTRACT_VERSION = "2026-07-28.1"
+PDF_EXTRACTION_CONTRACT_VERSION = "2026-07-28.3"
 PDF_MAGIC = b"%PDF-"
 PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/x-pdf"})
 PDF_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 MAX_REDIRECTS = 3
 READ_CHUNK_BYTES = 64 * 1024
 MIN_USABLE_PDF_TEXT_CHARS = 200
+MAX_LAYOUT_SCAN_LINES = 2_000
+MAX_LAYOUT_LINE_CHARS = 20_000
+MAX_DERIVED_LAYOUT_TABLES = 4
+MAX_DERIVED_LAYOUT_COLUMNS = 12
+MAX_DERIVED_LAYOUT_ROWS = 50
+MAX_DERIVED_LAYOUT_CELL_CHARS = 200
+MAX_DERIVED_LAYOUT_ROW_CHARS = 500
+MAX_DERIVED_LAYOUT_CHARS = 12_000
 
 
 class PDFDocumentError(RuntimeError):
@@ -339,6 +347,454 @@ def _normalized_page_text(value: Any) -> str:
     return text.strip()
 
 
+@dataclass(frozen=True, slots=True)
+class _CompositeLayoutHeader:
+    """One visually tabular model header split across two PDF text rows."""
+
+    suffix_line_index: int
+    column_count: int
+    normalized_row: str
+
+
+def _collapsed_layout_cell(value: str) -> str:
+    return " ".join(value.replace("\u00a0", " ").split())
+
+
+def _model_shaped_layout_token(value: str) -> bool:
+    compact = "".join(character for character in value if character.isalnum())
+    return (
+        3 <= len(compact) <= 80
+        and any(character.isalpha() for character in compact)
+        and any(character.isdecimal() for character in compact)
+    )
+
+
+def _composite_layout_header(
+    lines: Sequence[str],
+    line_index: int,
+) -> _CompositeLayoutHeader | None:
+    """Join a repeated model prefix row with its following suffix row.
+
+    Some manufacturer PDFs draw ``SUN2000L`` and ``-4.6KTL`` as separate text
+    objects on adjacent visual rows. ``pypdf`` faithfully preserves that shape,
+    but the complete catalogue model then never occurs in the extracted text.
+    This recognizer is deliberately narrow: the first row must end in 2-12
+    identical mixed letter/digit tokens and the next non-empty row must contain
+    exactly the same number of short model-shaped suffixes.
+    """
+
+    if not 0 <= line_index < len(lines):
+        return None
+    line = lines[line_index]
+    if not line.strip() or len(line) > MAX_LAYOUT_LINE_CHARS:
+        return None
+    tokens = list(re.finditer(r"\S+", line))
+    if len(tokens) < 3:
+        return None
+    base = tokens[-1].group(0)
+    if not _model_shaped_layout_token(base):
+        return None
+
+    repeated: list[re.Match[str]] = []
+    base_key = base.casefold()
+    for token in reversed(tokens):
+        if token.group(0).casefold() != base_key:
+            break
+        repeated.append(token)
+    repeated.reverse()
+    if not 2 <= len(repeated) <= MAX_DERIVED_LAYOUT_COLUMNS:
+        return None
+    label = _collapsed_layout_cell(line[: repeated[0].start()])
+    if not label or len(label) > MAX_DERIVED_LAYOUT_CELL_CHARS:
+        return None
+
+    suffix_line_index = line_index + 1
+    while (
+        suffix_line_index < len(lines)
+        and suffix_line_index <= line_index + 4
+        and not lines[suffix_line_index].strip()
+    ):
+        suffix_line_index += 1
+    if suffix_line_index >= len(lines) or suffix_line_index > line_index + 4:
+        return None
+    suffix_line = lines[suffix_line_index]
+    if len(suffix_line) > MAX_LAYOUT_LINE_CHARS:
+        return None
+    suffixes = re.findall(r"\S+", suffix_line)
+    if len(suffixes) != len(repeated):
+        return None
+    if any(
+        len(suffix) > 80
+        or re.fullmatch(r"[A-Za-z0-9_.+/\-]+", suffix) is None
+        or not any(character.isdecimal() for character in suffix)
+        for suffix in suffixes
+    ):
+        return None
+
+    models = [
+        _collapsed_layout_cell(f"{base}{suffix}")
+        for suffix in suffixes
+    ]
+    if (
+        len({model.casefold() for model in models}) != len(models)
+        or any(not _model_shaped_layout_token(model) for model in models)
+    ):
+        return None
+    normalized_row = "\t".join((label, *models))
+    if len(normalized_row) > MAX_DERIVED_LAYOUT_ROW_CHARS:
+        return None
+    return _CompositeLayoutHeader(
+        suffix_line_index=suffix_line_index,
+        column_count=len(models),
+        normalized_row=normalized_row,
+    )
+
+
+def _normalized_layout_data_row(
+    line: str,
+    *,
+    column_count: int,
+) -> str | None:
+    """Conservatively turn one fixed-width row into label + model-value cells.
+
+    The PDF layout renderer may insert a few spaces between words that belong to
+    one cell. Select only the ``column_count`` largest gaps, and reject the row
+    unless those gaps are clearly wider than every unselected internal gap.
+    This keeps ambiguous merged or irregular rows out of the derived evidence.
+    """
+
+    stripped = line.strip()
+    if (
+        not stripped
+        or len(stripped) > MAX_LAYOUT_LINE_CHARS
+        or not 2 <= column_count <= MAX_DERIVED_LAYOUT_COLUMNS
+    ):
+        return None
+    gaps = list(re.finditer(r"[ \u00a0]{2,}", stripped))
+    if len(gaps) < column_count:
+        return None
+    ranked = sorted(
+        enumerate(gaps),
+        key=lambda item: (-len(item[1].group(0)), item[1].start()),
+    )
+    selected_indexes = {index for index, _match in ranked[:column_count]}
+    selected = sorted(
+        (match for index, match in enumerate(gaps) if index in selected_indexes),
+        key=lambda match: match.start(),
+    )
+    selected_minimum = min(len(match.group(0)) for match in selected)
+    unselected_maximum = max(
+        (
+            len(match.group(0))
+            for index, match in enumerate(gaps)
+            if index not in selected_indexes
+        ),
+        default=0,
+    )
+    if (
+        unselected_maximum
+        and selected_minimum < unselected_maximum * 2
+    ):
+        return None
+
+    cells: list[str] = []
+    start = 0
+    for gap in selected:
+        cells.append(_collapsed_layout_cell(stripped[start: gap.start()]))
+        start = gap.end()
+    cells.append(_collapsed_layout_cell(stripped[start:]))
+    if (
+        len(cells) != column_count + 1
+        or any(not cell or len(cell) > MAX_DERIVED_LAYOUT_CELL_CHARS for cell in cells)
+        or not any(character.isalpha() for character in cells[0])
+    ):
+        return None
+    normalized_row = "\t".join(cells)
+    return (
+        normalized_row
+        if len(normalized_row) <= MAX_DERIVED_LAYOUT_ROW_CHARS
+        else None
+    )
+
+
+def _derived_layout_table_text(page_text: str) -> str:
+    """Return bounded, marked TSV views while leaving source layout untouched."""
+
+    if not isinstance(page_text, str) or not page_text.strip():
+        return ""
+    lines = page_text.splitlines()[:MAX_LAYOUT_SCAN_LINES]
+    blocks: list[str] = []
+    used = 0
+    line_index = 0
+    while (
+        line_index < len(lines)
+        and len(blocks) < MAX_DERIVED_LAYOUT_TABLES
+        and used < MAX_DERIVED_LAYOUT_CHARS
+    ):
+        header = _composite_layout_header(lines, line_index)
+        if header is None:
+            line_index += 1
+            continue
+
+        table_number = len(blocks) + 1
+        rows = [header.normalized_row]
+        scan_index = header.suffix_line_index + 1
+        while scan_index < len(lines) and len(rows) < MAX_DERIVED_LAYOUT_ROWS:
+            if _composite_layout_header(lines, scan_index) is not None:
+                break
+            stripped = lines[scan_index].strip()
+            if stripped.startswith("*"):
+                break
+            normalized_row = _normalized_layout_data_row(
+                lines[scan_index],
+                column_count=header.column_count,
+            )
+            if normalized_row is not None:
+                rows.append(normalized_row)
+            scan_index += 1
+
+        block = "\n".join(
+            (
+                f"[Derived PDF layout table {table_number}]",
+                *rows,
+                f"[End derived PDF layout table {table_number}]",
+            )
+        )
+        separator_chars = 2 if blocks else 0
+        remaining = MAX_DERIVED_LAYOUT_CHARS - used - separator_chars
+        if len(block) > remaining:
+            break
+        blocks.append(block)
+        used += separator_chars + len(block)
+        line_index = max(scan_index, header.suffix_line_index + 1)
+    return "\n\n".join(blocks)
+
+
+def _page_text_with_derived_layout_tables(value: Any) -> str:
+    """Prepend auditable table projections and retain the normalized source."""
+
+    page_text = _normalized_page_text(value)
+    derived = _derived_layout_table_text(page_text)
+    return (
+        f"{derived}\n\n[Raw PDF layout text]\n{page_text}"
+        if derived
+        else page_text
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PDFPageLayoutText:
+    """Bounded source text and candidate table projections for one PDF page."""
+
+    page_number: int
+    raw_text: str
+    derived_tables: tuple[str, ...]
+    raw_truncated: bool = False
+
+
+def _derived_layout_blocks(value: str) -> tuple[str, ...]:
+    """Split only complete, explicitly marked derived tables."""
+
+    return tuple(
+        match.group(0)
+        for match in re.finditer(
+            r"(?ms)^\[Derived PDF layout table \d+\]\n"
+            r".*?^\[End derived PDF layout table \d+\]$",
+            value,
+        )
+    )
+
+
+def _derived_layout_block_key(value: str) -> str:
+    """Ignore local table numbering when deduplicating deterministic TSV."""
+
+    lines = value.splitlines()
+    body = lines[1:-1] if len(lines) >= 3 else lines
+    return "\n".join(body).casefold()
+
+
+def _unique_derived_layout_tables(
+    pages: Sequence[_PDFPageLayoutText],
+    *,
+    max_chars: int,
+) -> dict[int, tuple[str, ...]]:
+    """Keep the earliest unique tables within one PDF-wide enrichment budget."""
+
+    budget = min(MAX_DERIVED_LAYOUT_CHARS, max_chars // 3)
+    selected: dict[int, list[str]] = {}
+    seen: set[str] = set()
+    used = 0
+    selected_count = 0
+    for page in pages:
+        for table in page.derived_tables:
+            key = _derived_layout_block_key(table)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            separator_chars = 2 if selected_count else 0
+            cost = separator_chars + len(table)
+            if cost > budget - used:
+                continue
+            selected.setdefault(page.page_number, []).append(table)
+            used += cost
+            selected_count += 1
+            if selected_count >= MAX_DERIVED_LAYOUT_TABLES:
+                return {
+                    page_number: tuple(tables)
+                    for page_number, tables in selected.items()
+                }
+    return {
+        page_number: tuple(tables)
+        for page_number, tables in selected.items()
+    }
+
+
+def _page_text_scaffold(
+    page: _PDFPageLayoutText,
+    *,
+    page_count: int,
+) -> tuple[str, str]:
+    prefix = f"[PDF page {page.page_number}/{page_count}]\n"
+    suffix = f"\n[End PDF page {page.page_number}]"
+    return prefix, suffix
+
+
+def _pdf_derived_layout_section(
+    derived_by_page: Mapping[int, Sequence[str]],
+    *,
+    page_count: int,
+) -> str:
+    """Render selected projections before source text with page provenance."""
+
+    page_sections = [
+        (
+            f"[Derived from PDF page {page_number}/{page_count}]\n"
+            + "\n\n".join(tables)
+            + f"\n[End derived from PDF page {page_number}]"
+        )
+        for page_number, tables in derived_by_page.items()
+        if tables
+    ]
+    if not page_sections:
+        return ""
+    return (
+        "[PDF derived layout projections]\n"
+        + "\n\n".join(page_sections)
+        + "\n[End PDF derived layout projections]"
+    )
+
+
+def _fair_text_allocations(
+    lengths: Sequence[int],
+    *,
+    total: int,
+) -> list[int]:
+    """Water-fill a character budget so one long page cannot starve the rest."""
+
+    allocations = [0] * len(lengths)
+    remaining_indexes = list(range(len(lengths)))
+    remaining = total
+    while remaining_indexes:
+        share = remaining // len(remaining_indexes)
+        completed = [
+            index
+            for index in remaining_indexes
+            if lengths[index] <= share
+        ]
+        if completed:
+            for index in completed:
+                allocations[index] = lengths[index]
+                remaining -= lengths[index]
+            completed_set = set(completed)
+            remaining_indexes = [
+                index
+                for index in remaining_indexes
+                if index not in completed_set
+            ]
+            continue
+        for index in remaining_indexes:
+            allocations[index] = share
+        remaining -= share * len(remaining_indexes)
+        for index in remaining_indexes[:remaining]:
+            allocations[index] += 1
+        break
+    return allocations
+
+
+def _assemble_pdf_page_texts(
+    pages: Sequence[_PDFPageLayoutText],
+    *,
+    page_count: int,
+    max_chars: int,
+) -> tuple[str, int, bool]:
+    """Assemble a fair, PDF-wide budget with deduplicated TSV projections."""
+
+    if not pages:
+        return "", 0, False
+    derived_by_page = _unique_derived_layout_tables(
+        pages,
+        max_chars=max_chars,
+    )
+    derived_section = _pdf_derived_layout_section(
+        derived_by_page,
+        page_count=page_count,
+    )
+    included = list(pages)
+
+    def scaffold_size(candidate_pages: Sequence[_PDFPageLayoutText]) -> int:
+        size = max(0, len(candidate_pages) - 1) * 2
+        if derived_section and candidate_pages:
+            size += len(derived_section) + 2
+        for page in candidate_pages:
+            prefix, suffix = _page_text_scaffold(
+                page,
+                page_count=page_count,
+            )
+            size += len(prefix) + len(suffix)
+        return size
+
+    # Keep at least one raw character per included page. If even scaffolding is
+    # too large, discard a page without selected evidence before an evidence
+    # page, while preserving the source page order of everything retained.
+    while (
+        included
+        and scaffold_size(included) + len(included) > max_chars
+    ):
+        removable_index = next(
+            (
+                index
+                for index in range(len(included) - 1, -1, -1)
+                if included[index].page_number not in derived_by_page
+            ),
+            len(included) - 1,
+        )
+        included.pop(removable_index)
+    if not included:
+        return "", 0, True
+
+    source_budget = max_chars - scaffold_size(included)
+    allocations = _fair_text_allocations(
+        [len(page.raw_text) for page in included],
+        total=source_budget,
+    )
+    pieces: list[str] = [derived_section] if derived_section else []
+    truncated = len(included) < len(pages)
+    for page, allocation in zip(included, allocations, strict=True):
+        prefix, suffix = _page_text_scaffold(
+            page,
+            page_count=page_count,
+        )
+        block = f"{prefix}{page.raw_text[:allocation]}{suffix}"
+        pieces.append(block)
+        truncated = (
+            truncated
+            or page.raw_truncated
+            or allocation < len(page.raw_text)
+        )
+    text = "\n\n".join(pieces)
+    return text, len(included), truncated
+
+
 def _parse_pdf_in_child(
     sender: Any,
     content: bytes,
@@ -373,10 +829,7 @@ def _parse_pdf_in_child(
         if page_count > max_pages:
             raise PDFParseError("PDF exceeds the configured page limit")
 
-        pieces: list[str] = []
-        used = 0
-        extracted_pages = 0
-        truncated = False
+        page_layouts: list[_PDFPageLayoutText] = []
         for index, page in enumerate(reader.pages, start=1):
             try:
                 raw_text = page.extract_text(extraction_mode="layout")
@@ -385,22 +838,20 @@ def _parse_pdf_in_child(
             page_text = _normalized_page_text(raw_text)
             if not page_text:
                 continue
-            marker = f"[PDF page {index}/{page_count}]"
-            block = f"{marker}\n{page_text}\n[End PDF page {index}]"
-            separator = "\n\n" if pieces else ""
-            remaining = max_chars - used - len(separator)
-            if remaining <= 0:
-                truncated = True
-                break
-            if len(block) > remaining:
-                block = block[:remaining]
-                truncated = True
-            pieces.append(f"{separator}{block}")
-            used += len(separator) + len(block)
-            extracted_pages += 1
-            if truncated:
-                break
-        text = "".join(pieces)
+            derived_text = _derived_layout_table_text(page_text)
+            page_layouts.append(
+                _PDFPageLayoutText(
+                    page_number=index,
+                    raw_text=page_text[:max_chars],
+                    derived_tables=_derived_layout_blocks(derived_text),
+                    raw_truncated=len(page_text) > max_chars,
+                )
+            )
+        text, extracted_pages, truncated = _assemble_pdf_page_texts(
+            page_layouts,
+            page_count=page_count,
+            max_chars=max_chars,
+        )
         if len(text.strip()) < MIN_USABLE_PDF_TEXT_CHARS:
             raise PDFParseError("PDF has no usable embedded text")
         sender.send(

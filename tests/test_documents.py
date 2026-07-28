@@ -16,7 +16,7 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
-from pv_wiki import documents  # noqa: E402
+from pv_wiki import decision, documents  # noqa: E402
 
 
 def minimal_text_pdf(text: str) -> bytes:
@@ -57,6 +57,71 @@ def minimal_text_pdf(text: str) -> bytes:
         ).encode("ascii")
     )
     return bytes(payload)
+
+
+def sun2000l_fixed_width_layout(*, repeated_rows: int = 1) -> str:
+    """Representative pypdf layout text from Huawei's shared series PDF."""
+
+    gap = " " * 24
+    header = gap.join(
+        (
+            "Technical Specification",
+            "SUN2000L",
+            "SUN2000L",
+            "SUN2000L",
+            "SUN2000L",
+            "SUN2000L",
+        )
+    )
+    suffixes = (" " * 48) + gap.join(
+        ("-2KTL", "-3KTL", "-4KTL", "-4.6KTL", "-5KTL")
+    )
+    rows = [
+        gap.join(
+            (
+                "Max. efficiency",
+                "98.4 %",
+                "98.5 %",
+                "98.6 %",
+                "98.6 %",
+                "98.6 %",
+            )
+        ),
+        gap.join(
+            (
+                "European weighted   efficiency",
+                "97.0 %",
+                "97.6 %",
+                "97.9 %",
+                "98.0 %",
+                "98.0 %",
+            )
+        ),
+        gap.join(("Max. input voltage", "600 V")),
+        gap.join(
+            (
+                "Recommended max. PV power",
+                "3,000 Wp",
+                "4,500 Wp",
+                "6,000 Wp",
+                "6,900 Wp",
+                "7,500 Wp",
+            )
+        ),
+        gap.join(
+            (
+                "Rated output power",
+                "2,000 W",
+                "3,000 W",
+                "4,000 W",
+                "4,600 W",
+                "4,990 W",
+            )
+        ),
+    ]
+    if repeated_rows > 1:
+        rows.extend([rows[-1]] * (repeated_rows - 1))
+    return "\n".join((header, suffixes, *rows))
 
 
 class FakeResponse:
@@ -126,6 +191,128 @@ class PDFDocumentTests(unittest.TestCase):
         self.assertIn("[PDF page 1/1]", parsed.text)
         self.assertIn("MODEL-42", parsed.text)
         self.assertIn("[End PDF page 1]", parsed.text)
+
+    def test_shared_series_layout_appends_auditable_composite_tsv(self) -> None:
+        source = sun2000l_fixed_width_layout()
+
+        enriched = documents._page_text_with_derived_layout_tables(source)
+
+        self.assertIn(
+            "[Derived PDF layout table 1]\n"
+            "Technical Specification\tSUN2000L-2KTL\tSUN2000L-3KTL\t"
+            "SUN2000L-4KTL\tSUN2000L-4.6KTL\tSUN2000L-5KTL\n",
+            enriched,
+        )
+        self.assertTrue(
+            enriched.endswith(documents._normalized_page_text(source))
+        )
+        self.assertIn("\n\n[Raw PDF layout text]\n", enriched)
+        self.assertIn(
+            "European weighted efficiency\t97.0 %\t97.6 %\t97.9 %\t"
+            "98.0 %\t98.0 %",
+            enriched,
+        )
+        self.assertNotIn("Max. input voltage\t600 V", enriched)
+        self.assertTrue(
+            decision.text_contains_catalogue_identity(
+                "SUN2000L-4.6KTL",
+                "SUN2000L-4.6KTL",
+                enriched,
+            )
+        )
+
+    def test_derived_tsv_binds_fact_to_target_model_column(self) -> None:
+        enriched = documents._page_text_with_derived_layout_tables(
+            sun2000l_fixed_width_layout()
+        )
+        derived_lines = enriched.split("[Derived PDF layout table 1]\n", 1)[
+            1
+        ].splitlines()
+        model_quote = derived_lines[0]
+        fact_quote = next(
+            line
+            for line in derived_lines
+            if line.startswith("Rated output power\t")
+        )
+
+        self.assertTrue(
+            decision._structured_table_quote_supports_fact(
+                model_quote=model_quote,
+                fact_quote=fact_quote,
+                name="Rated output power",
+                value=4600,
+                unit="W",
+                expected_product_name="SUN2000L-4.6KTL",
+            )
+        )
+        self.assertFalse(
+            decision._structured_table_quote_supports_fact(
+                model_quote=model_quote,
+                fact_quote=fact_quote,
+                name="Rated output power",
+                value=4000,
+                unit="W",
+                expected_product_name="SUN2000L-4.6KTL",
+            )
+        )
+
+    def test_derived_layout_projection_is_row_bounded(self) -> None:
+        enriched = documents._page_text_with_derived_layout_tables(
+            sun2000l_fixed_width_layout(repeated_rows=100)
+        )
+        derived = enriched.split("[Derived PDF layout table 1]\n", 1)[1]
+        derived = derived.split("[End derived PDF layout table 1]", 1)[0]
+
+        # The cap includes the one composite header plus retained data rows.
+        self.assertEqual(
+            documents.MAX_DERIVED_LAYOUT_ROWS,
+            len(derived.splitlines()),
+        )
+
+    def test_multipage_budget_deduplicates_tsv_and_preserves_each_page(self) -> None:
+        layout = sun2000l_fixed_width_layout()
+        derived_tables = documents._derived_layout_blocks(
+            documents._derived_layout_table_text(layout)
+        )
+        pages = [
+            documents._PDFPageLayoutText(
+                page_number=page_number,
+                raw_text=(
+                    f"RAW-PAGE-{page_number}\n"
+                    f"{layout}\n"
+                    + f"page-{page_number}-detail " * 600
+                ),
+                derived_tables=derived_tables,
+            )
+            for page_number in range(1, 7)
+        ]
+
+        text, extracted_pages, truncated = documents._assemble_pdf_page_texts(
+            pages,
+            page_count=6,
+            max_chars=30_000,
+        )
+
+        self.assertEqual(30_000, len(text))
+        self.assertEqual(6, extracted_pages)
+        self.assertTrue(truncated)
+        self.assertEqual(1, text.count("[Derived PDF layout table 1]"))
+        self.assertEqual(
+            1,
+            text.count(
+                "Technical Specification\tSUN2000L-2KTL\t"
+                "SUN2000L-3KTL\tSUN2000L-4KTL\t"
+                "SUN2000L-4.6KTL\tSUN2000L-5KTL"
+            ),
+        )
+        self.assertLess(
+            text.index("[Derived PDF layout table 1]"),
+            text.index("RAW-PAGE-1"),
+        )
+        for page_number in range(1, 7):
+            self.assertIn(f"[PDF page {page_number}/6]", text)
+            self.assertIn(f"RAW-PAGE-{page_number}", text)
+            self.assertIn(f"[End PDF page {page_number}]", text)
 
     def test_download_pins_public_dns_and_validates_pdf_wire_format(self) -> None:
         body = minimal_text_pdf("MODEL-42 " + ("specification " * 20))

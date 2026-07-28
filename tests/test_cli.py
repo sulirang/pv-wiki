@@ -560,6 +560,28 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual("HS2-5K-S2", identity["model"])
 
+    def test_identity_keeps_named_series_without_digits(self) -> None:
+        os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
+
+        identity = cli._search_identity(
+            {
+                **product(),
+                "product_id": "MIRA BMS",
+                "product_name": (
+                    "High voltage lithium battery BMS for Mira 2500"
+                ),
+            }
+        )
+
+        self.assertEqual("MIRA BMS", identity["model"])
+        self.assertTrue(
+            cli.text_contains_catalogue_identity(
+                "MIRA BMS",
+                "High voltage lithium battery BMS for Mira 2500",
+                "FoxESS MIRA BMS datasheet",
+            )
+        )
+
     def test_internal_company_identifier_is_not_promoted_as_model(self) -> None:
         os.environ["PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS"] = "true"
 
@@ -746,7 +768,7 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             self.assertEqual([url], store.allowed_evidence_urls(token))
 
-    def test_extract_prefers_page_labelled_direct_pdf_text_when_enabled(
+    def test_extract_merges_complementary_direct_pdf_and_exa_text(
         self,
     ) -> None:
         os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
@@ -772,7 +794,7 @@ class CLITests(unittest.TestCase):
         direct = documents.PDFEvidence(
             text=(
                 "[PDF page 1/2]\n"
-                "PV-42 Rated power 42 W Input voltage 48 V "
+                "Rated power 42 W Input voltage 48 V "
                 "Efficiency 98.5 percent\n"
                 "[End PDF page 1]"
             ),
@@ -801,13 +823,25 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         result = payload["extract"]["results"][0]
-        self.assertEqual("direct_pdf_text", result["content_source"])
-        self.assertEqual("used", result["pdf_direct_status"])
+        self.assertEqual(
+            "direct_pdf_text+exa_text",
+            result["content_source"],
+        )
+        self.assertEqual(
+            "identity_mismatch",
+            result["pdf_direct_status"],
+        )
         self.assertEqual(2, result["pdf_page_count"])
+        self.assertEqual(1, result["pdf_extracted_pages"])
         self.assertEqual("a" * 64, result["pdf_sha256"])
         self.assertTrue(result["pdf_final_url_changed"])
+        self.assertEqual(
+            "cdn.acme.example",
+            result["pdf_final_hostname"],
+        )
         self.assertTrue(result["identity_verified"])
         self.assertIn("[PDF page 1/2]", result["raw_content"])
+        self.assertIn("PV-42 Exa full text fallback", result["raw_content"])
         extract_pdf.assert_called_once_with(
             url,
             max_bytes=12_000_000,
@@ -816,6 +850,64 @@ class CLITests(unittest.TestCase):
             download_timeout=20.0,
             parse_timeout=15.0,
         )
+
+    def test_extract_recovers_direct_pdf_when_exa_returns_only_failure(
+        self,
+    ) -> None:
+        os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
+        token = self.claim()
+        url = "https://acme.example/pv-42.pdf"
+        self.prepare_search(token, url)
+        request = self.write_json(
+            "extract-direct-only.json",
+            {"urls": [url], "query": "PV-42 specifications"},
+        )
+        client = mock.Mock()
+        client.extract_urls.return_value = {
+            "results": [],
+            "failed_results": [
+                {"url": url, "error": "provider could not parse PDF"}
+            ],
+            "usage": {"credits": 2},
+        }
+        direct = documents.PDFEvidence(
+            text=(
+                "[PDF page 1/1]\n"
+                "PV-42 Rated power 42 W\n"
+                "[End PDF page 1]"
+            ),
+            requested_url=url,
+            final_url=url,
+            sha256="b" * 64,
+            page_count=1,
+            extracted_pages=1,
+            truncated=False,
+        )
+        with (
+            mock.patch.object(cli, "ExaClient", return_value=client),
+            mock.patch.object(
+                cli,
+                "extract_pdf_evidence",
+                return_value=direct,
+            ),
+        ):
+            code, payload, error = self.run_cli(
+                "extract",
+                "--lease-token",
+                token,
+                "--request-file",
+                str(request),
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(1, len(payload["extract"]["results"]))
+        result = payload["extract"]["results"][0]
+        self.assertEqual(url, result["url"])
+        self.assertEqual("direct_pdf_text", result["content_source"])
+        self.assertEqual("used", result["pdf_direct_status"])
+        self.assertTrue(result["identity_verified"])
+        with state.StateStore(self.state_path) as store:
+            self.assertEqual([url], store.allowed_evidence_urls(token))
 
     def test_extract_keeps_exa_text_when_direct_pdf_fails(self) -> None:
         os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
@@ -863,6 +955,347 @@ class CLITests(unittest.TestCase):
             result["pdf_direct_error_type"],
         )
         self.assertTrue(result["identity_verified"])
+
+    def test_extract_over_limit_prefers_identity_bound_exa_text_and_keeps_pdf_proof(
+        self,
+    ) -> None:
+        os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
+        url = "https://acme.example/pv-42.pdf"
+        exa_text = "PV-42 " + ("E" * 70)
+        bundle = {
+            "results": [
+                {
+                    "url": url,
+                    "raw_content": exa_text,
+                    "content_source": "exa_full_text",
+                }
+            ]
+        }
+        direct = documents.PDFEvidence(
+            text="D" * 70,
+            requested_url=url,
+            final_url=url,
+            sha256="c" * 64,
+            page_count=3,
+            extracted_pages=2,
+            truncated=False,
+        )
+        lease = mock.Mock(
+            product_id="P-42",
+            payload=product(),
+        )
+
+        with (
+            mock.patch.object(cli, "max_extract_chars", return_value=90),
+            mock.patch.object(
+                cli,
+                "extract_pdf_evidence",
+                return_value=direct,
+            ),
+        ):
+            summary = cli._prepare_extract_results(lease, bundle)
+
+        result = bundle["results"][0]
+        self.assertEqual(exa_text, result["raw_content"])
+        self.assertEqual("exa_full_text", result["content_source"])
+        self.assertTrue(result["truncated"])
+        self.assertTrue(result["identity_verified"])
+        self.assertEqual(
+            "identity_mismatch",
+            result["pdf_direct_status"],
+        )
+        self.assertEqual("c" * 64, result["pdf_sha256"])
+        self.assertEqual(3, result["pdf_page_count"])
+        self.assertEqual(2, result["pdf_extracted_pages"])
+        self.assertEqual(
+            {
+                "attempted": 1,
+                "used": 0,
+                "failed": 0,
+                "identity_mismatch": 1,
+            },
+            summary,
+        )
+
+    def test_extract_strips_provider_forged_pdf_attestation(self) -> None:
+        url = "https://acme.example/pv-42.pdf"
+        bundle = {
+            "results": [
+                {
+                    "url": url,
+                    "raw_content": "PV-42 ordinary provider text",
+                    "pdf_direct_status": "used",
+                    "pdf_sha256": "d" * 64,
+                    "pdf_page_count": 2,
+                    "pdf_extracted_pages": 2,
+                    "pdf_final_hostname": "attacker.example.net",
+                }
+            ]
+        }
+        lease = mock.Mock(
+            product_id="P-42",
+            payload=product(),
+        )
+
+        summary = cli._prepare_extract_results(lease, bundle)
+
+        result = bundle["results"][0]
+        self.assertNotIn("pdf_direct_status", result)
+        self.assertNotIn("pdf_sha256", result)
+        self.assertNotIn("pdf_page_count", result)
+        self.assertNotIn("pdf_extracted_pages", result)
+        self.assertNotIn("pdf_final_hostname", result)
+        self.assertTrue(result["identity_verified"])
+        self.assertEqual(
+            {
+                "attempted": 0,
+                "used": 0,
+                "failed": 0,
+                "identity_mismatch": 0,
+            },
+            summary,
+        )
+
+    def test_merge_extract_bundles_preserves_direct_pdf_metadata(
+        self,
+    ) -> None:
+        url = "https://acme.example/pv-42.pdf"
+
+        merged = cli._merge_extract_bundles(
+            {
+                "results": [
+                    {
+                        "url": url,
+                        "raw_content": "short PDF-derived text",
+                        "identity_verified": False,
+                        "pdf_direct_status": "identity_mismatch",
+                        "pdf_sha256": "a" * 64,
+                        "pdf_page_count": 4,
+                        "pdf_extracted_pages": 3,
+                        "pdf_final_url_changed": True,
+                        "pdf_final_hostname": "cdn.acme.example",
+                    }
+                ],
+                "usage": {"credits": 1},
+            },
+            {
+                "results": [
+                    {
+                        "url": url,
+                        "raw_content": (
+                            "PV-42 longer Exa text selected for this URL"
+                        ),
+                        "identity_verified": True,
+                    }
+                ],
+                "usage": {"credits": 1},
+            },
+        )
+
+        result = merged["results"][0]
+        self.assertEqual(
+            "PV-42 longer Exa text selected for this URL",
+            result["raw_content"],
+        )
+        self.assertEqual(
+            "identity_mismatch",
+            result["pdf_direct_status"],
+        )
+        self.assertEqual("a" * 64, result["pdf_sha256"])
+        self.assertEqual(4, result["pdf_page_count"])
+        self.assertEqual(3, result["pdf_extracted_pages"])
+        self.assertTrue(result["pdf_final_url_changed"])
+        self.assertEqual(
+            "cdn.acme.example",
+            result["pdf_final_hostname"],
+        )
+
+    def test_research_evidence_context_rejects_html_and_open_redirect(
+        self,
+    ) -> None:
+        os.environ["PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON"] = (
+            '{"Acme":["acme.example"]}'
+        )
+        pdf_url = "https://docs.acme.example/pv-42.pdf"
+        mismatch_pdf_url = "https://acme.example/other-series.pdf"
+        open_redirect_url = "https://acme.example/open-redirect.pdf"
+        html_url = "https://acme.example/pv-42"
+        incomplete_pdf_url = "https://acme.example/incomplete.pdf"
+        store = mock.Mock()
+        store.allowed_evidence_urls.return_value = [
+            pdf_url,
+            mismatch_pdf_url,
+            open_redirect_url,
+            html_url,
+            incomplete_pdf_url,
+        ]
+        lease = mock.Mock(token="lease-token", payload=product())
+        metadata = {
+            "pdf_direct_status": "used",
+            "pdf_sha256": "b" * 64,
+            "pdf_page_count": 2,
+            "pdf_extracted_pages": 1,
+            "pdf_final_hostname": "cdn.acme.example",
+        }
+
+        (
+            evidence_text,
+            classification_urls,
+            classification_text,
+            verified_pdf_urls,
+        ) = cli._research_evidence_context(
+            store,
+            lease,
+            {
+                "results": [
+                    {
+                        "url": pdf_url,
+                        "raw_content": "PV-42 verified PDF content",
+                        **metadata,
+                    },
+                    {
+                        "url": mismatch_pdf_url,
+                        "raw_content": "PV-42 provider text only",
+                        **{
+                            **metadata,
+                            "pdf_direct_status": "identity_mismatch",
+                        },
+                    },
+                    {
+                        "url": open_redirect_url,
+                        "raw_content": "PV-42 attacker-hosted PDF content",
+                        **{
+                            **metadata,
+                            "pdf_final_hostname": "attacker.example.net",
+                        },
+                    },
+                    {
+                        "url": html_url,
+                        "raw_content": "PV-42 ordinary HTML content",
+                        **metadata,
+                    },
+                    {
+                        "url": incomplete_pdf_url,
+                        "raw_content": "PV-42 incomplete metadata",
+                        "pdf_direct_status": "used",
+                        "pdf_page_count": 1,
+                        "pdf_extracted_pages": 1,
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(
+            {
+                pdf_url,
+                mismatch_pdf_url,
+                open_redirect_url,
+                html_url,
+                incomplete_pdf_url,
+            },
+            set(evidence_text),
+        )
+        self.assertEqual(set(evidence_text), classification_urls)
+        self.assertEqual(evidence_text, classification_text)
+        self.assertEqual({pdf_url}, verified_pdf_urls)
+
+    def test_pdf_redirect_policy_handles_common_country_suffixes(
+        self,
+    ) -> None:
+        self.assertTrue(
+            cli._pdf_redirect_allows_publication(
+                "https://docs.acme.co.uk/pv-42.pdf",
+                "cdn.acme.co.uk",
+                trusted_domains=frozenset(),
+            )
+        )
+        self.assertFalse(
+            cli._pdf_redirect_allows_publication(
+                "https://docs.acme.co.uk/pv-42.pdf",
+                "files.attacker.co.uk",
+                trusted_domains=frozenset(),
+            )
+        )
+        self.assertTrue(
+            cli._pdf_redirect_allows_publication(
+                "https://legacy.example/pv-42.pdf",
+                "downloads.acme-cdn.co.uk",
+                trusted_domains=frozenset({"acme-cdn.co.uk"}),
+            )
+        )
+
+    def test_publish_fact_degradation_drops_duplicate_name_groups(
+        self,
+    ) -> None:
+        pdf_url = "https://acme.example/pv-42.pdf"
+        store = mock.Mock()
+        store.allowed_evidence_urls.return_value = [pdf_url]
+        lease = mock.Mock(
+            product_id="P-42",
+            token="lease-token",
+            payload=product(),
+        )
+        raw = {
+            "outcome": "publish",
+            "facts": [
+                {"name": "Rated Power", "value": 42},
+                {"name": "rated-power", "value": 42},
+                {"name": "Efficiency", "value": 98.5},
+                {"name": "Weight", "value": 12},
+            ],
+        }
+        observed_facts: list[list[str]] = []
+        observed_verified_urls: list[set[str] | None] = []
+
+        def strict_validator(
+            candidate: dict,
+            **kwargs: object,
+        ) -> dict:
+            names = [
+                str(item["name"])
+                for item in candidate["facts"]
+            ]
+            observed_facts.append(names)
+            verified_urls = kwargs["verified_primary_document_urls"]
+            observed_verified_urls.append(
+                set(verified_urls)
+                if isinstance(verified_urls, set)
+                else None
+            )
+            if "Weight" in names:
+                raise cli.DecisionError("Weight quote is invalid")
+            return {
+                **candidate,
+                "facts": [dict(item) for item in candidate["facts"]],
+            }
+
+        with mock.patch.object(
+            cli,
+            "validate_decision",
+            side_effect=strict_validator,
+        ):
+            validated = cli._validate_decision_for_lease(
+                store,
+                lease,
+                raw,
+                evidence_text_by_url={
+                    pdf_url: "PV-42 datasheet",
+                },
+                verified_primary_document_urls={pdf_url},
+            )
+
+        self.assertEqual(
+            [["Efficiency"], ["Efficiency", "Weight"]],
+            observed_facts[1:],
+        )
+        self.assertEqual([], observed_facts[0])
+        self.assertEqual(
+            [{"name": "Efficiency", "value": 98.5}],
+            validated["facts"],
+        )
+        self.assertTrue(
+            all(urls == {pdf_url} for urls in observed_verified_urls)
+        )
 
     def test_research_extract_summary_accepts_bounded_direct_pdf_counts(
         self,
@@ -1130,6 +1563,126 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
             self.assertEqual("synced", current.status)
+
+    def test_trusted_primary_datasheet_publishes_without_facts(self) -> None:
+        token = self.claim()
+        url = "https://acme.example/pv-42.pdf"
+        self.prepare_evidence(token, url)
+        proposal = decision(token)
+        proposal["facts"] = []
+        decision_path = self.write_json("publish-no-facts.json", proposal)
+        evidence_path = self.write_json(
+            "publish-no-facts-evidence.json",
+            {
+                "results": [
+                    {
+                        "url": url,
+                        "raw_content": (
+                            "Acme original datasheet for model PV-42"
+                        ),
+                    }
+                ]
+            },
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "secret-token",
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON": (
+                    '{"Acme":["acme.example"]}'
+                ),
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON": (
+                    '{"Acme":"Acme"}'
+                ),
+            }
+        )
+        client = mock.Mock()
+        client.upsert_page.return_value = {
+            "action": "created",
+            "page": {"id": 42},
+        }
+
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            code, payload, error = self.run_cli(
+                "publish",
+                "--decision-file",
+                str(decision_path),
+                "--evidence-file",
+                str(evidence_path),
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["published"])
+        rendered = client.upsert_page.call_args.args[4]
+        self.assertNotIn("## 规格参数", rendered)
+        self.assertIn(f"]({url})（官方数据表）", rendered)
+
+    def test_invalid_fact_is_omitted_without_blocking_trusted_datasheet(
+        self,
+    ) -> None:
+        token = self.claim()
+        url = "https://acme.example/pv-42.pdf"
+        self.prepare_evidence(token, url)
+        proposal = decision(token)
+        proposal["facts"][0]["value"] = 999
+        proposal["facts"][0]["evidence_quotes"][0]["quote"] = (
+            "PV-42 Rated power 999 W"
+        )
+        decision_path = self.write_json(
+            "publish-skip-invalid-fact.json",
+            proposal,
+        )
+        evidence_path = self.write_json(
+            "publish-skip-invalid-fact-evidence.json",
+            {
+                "results": [
+                    {
+                        "url": url,
+                        "raw_content": (
+                            "Acme original datasheet\n"
+                            "PV-42 Rated power 42 W\n"
+                            "PV-42 Input voltage 48 V\n"
+                            "PV-42 Efficiency 98.5%\n"
+                            "PV-42 Ingress protection IP65\n"
+                            "PV-42 Weight 12 kg"
+                        ),
+                    }
+                ]
+            },
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "secret-token",
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON": (
+                    '{"Acme":["acme.example"]}'
+                ),
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON": (
+                    '{"Acme":"Acme"}'
+                ),
+            }
+        )
+        client = mock.Mock()
+        client.upsert_page.return_value = {
+            "action": "created",
+            "page": {"id": 42},
+        }
+
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            code, payload, error = self.run_cli(
+                "publish",
+                "--decision-file",
+                str(decision_path),
+                "--evidence-file",
+                str(evidence_path),
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["published"])
+        rendered = client.upsert_page.call_args.args[4]
+        self.assertNotIn("999 W", rendered)
+        self.assertNotIn("Rated power", rendered)
+        self.assertIn("Input voltage", rendered)
 
     def test_wikijs_edit_conflict_is_nonblocking_and_retried_later(self) -> None:
         token = self.claim()
@@ -2221,7 +2774,10 @@ class CLITests(unittest.TestCase):
                 store.record_outcome(
                     lease,
                     "invalid_decision",
-                    error="publish requires at least 5 cited specification facts",
+                    error=(
+                        "facts[0].evidence_quotes[0] is not an exact "
+                        "supporting extract span"
+                    ),
                 )
 
         with (
@@ -2356,8 +2912,26 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             store.upsert_product({**product(), "brand_code": ""})
         self.configure_worker_environment()
+        os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
         url = "https://acme.example/pv-42.pdf"
         corroboration_url = "https://lab.example/pv-42-listing"
+        official_body = (
+            "Acme official product documentation\n"
+            "PV-42 Rated power 42 W\n"
+            "PV-42 Input voltage 48 V\n"
+            "PV-42 Efficiency 98.5%\n"
+            "PV-42 Ingress protection IP65\n"
+            "PV-42 Weight 12 kg"
+        )
+        direct = documents.PDFEvidence(
+            text=official_body,
+            requested_url=url,
+            final_url=url,
+            sha256="1" * 64,
+            page_count=2,
+            extracted_pages=2,
+            truncated=False,
+        )
         search_client = mock.Mock()
         search_client.search_product.return_value = {
             "queries": ["PV-42 datasheet"],
@@ -2383,14 +2957,7 @@ class CLITests(unittest.TestCase):
             "results": [
                 {
                     "url": url,
-                    "raw_content": (
-                        "Acme official product documentation\n"
-                        "PV-42 Rated power 42 W\n"
-                        "PV-42 Input voltage 48 V\n"
-                        "PV-42 Efficiency 98.5%\n"
-                        "PV-42 Ingress protection IP65\n"
-                        "PV-42 Weight 12 kg"
-                    ),
+                    "raw_content": official_body,
                 },
                 {
                     "url": corroboration_url,
@@ -2440,6 +3007,11 @@ class CLITests(unittest.TestCase):
                 "WikiJSClient",
                 return_value=wiki_client,
             ),
+            mock.patch.object(
+                cli,
+                "extract_pdf_evidence",
+                return_value=direct,
+            ) as extract_pdf,
         ):
             code, payload, error = self.run_cli(
                 "run-one",
@@ -2451,6 +3023,7 @@ class CLITests(unittest.TestCase):
         self.assertTrue(payload["processed"])
         self.assertTrue(payload["published"])
         self.assertEqual("synced", payload["outcome"])
+        extract_pdf.assert_called_once()
         ai_factory.assert_called_once()
         self.assertEqual("test-model", ai_factory.call_args.args[0].model)
         self.assertEqual(
@@ -2470,6 +3043,7 @@ class CLITests(unittest.TestCase):
 
     def test_run_one_executes_ai_requested_supplemental_search_and_persists_it(self) -> None:
         self.configure_worker_environment()
+        os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
         official_url = "https://acme.example/pv-42.pdf"
         supplemental_url = "https://independent.example.net/pv-42"
         official_body = (
@@ -2478,6 +3052,15 @@ class CLITests(unittest.TestCase):
             "PV-42 Efficiency 98.5%\n"
             "PV-42 Ingress protection IP65\n"
             "PV-42 Weight 12 kg"
+        )
+        direct = documents.PDFEvidence(
+            text=official_body,
+            requested_url=official_url,
+            final_url=official_url,
+            sha256="2" * 64,
+            page_count=2,
+            extracted_pages=2,
+            truncated=False,
         )
         search_client = mock.Mock()
         search_client.search_product.return_value = {
@@ -2539,11 +3122,17 @@ class CLITests(unittest.TestCase):
                 "WikiJSClient",
                 return_value=wiki_client,
             ),
+            mock.patch.object(
+                cli,
+                "extract_pdf_evidence",
+                return_value=direct,
+            ) as extract_pdf,
         ):
             code, payload, error = self.run_cli("run-one")
 
         self.assertEqual(0, code, error)
         self.assertTrue(payload["published"])
+        extract_pdf.assert_called_once()
         search_client.search_queries.assert_called_once_with(
             ['"PV-42" independent specifications'],
             max_results=5,
@@ -2580,6 +3169,7 @@ class CLITests(unittest.TestCase):
 
     def test_local_source_validation_can_request_one_feedback_search(self) -> None:
         self.configure_worker_environment()
+        os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
         os.environ.pop("PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON")
         official_url = "https://acme.example/pv-42.pdf"
         independent_url = "https://lab.example.net/pv-42"
@@ -2593,6 +3183,15 @@ class CLITests(unittest.TestCase):
         official_body = "\n".join(
             f"Acme PV-42 {name} {value} {unit}".strip()
             for name, value, unit in lines
+        )
+        direct = documents.PDFEvidence(
+            text=official_body,
+            requested_url=official_url,
+            final_url=official_url,
+            sha256="3" * 64,
+            page_count=2,
+            extracted_pages=2,
+            truncated=False,
         )
         independent_body = "\n".join(
             f"Acme PV-42 {name} {value} {unit}".strip()
@@ -2669,11 +3268,17 @@ class CLITests(unittest.TestCase):
                 "WikiJSClient",
                 return_value=wiki_client,
             ),
+            mock.patch.object(
+                cli,
+                "extract_pdf_evidence",
+                return_value=direct,
+            ) as extract_pdf,
         ):
             code, payload, error = self.run_cli("run-one")
 
         self.assertEqual(0, code, error)
         self.assertTrue(payload["published"])
+        extract_pdf.assert_called_once()
         self.assertEqual(3, ai_client.next_research_action.call_count)
         calls = ai_client.next_research_action.call_args_list
         feedback = calls[1].kwargs["validation_feedback"]

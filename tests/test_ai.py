@@ -336,9 +336,12 @@ class PromptTests(unittest.TestCase):
         policy = " ".join(prompt["source_policy"])
         self.assertIn("{url, model_quote, quote}", policy)
         self.assertIn("Markdown-pipe or TSV", policy)
-        self.assertIn("same number of explicit pipe/tab cells", policy)
+        self.assertIn("fixed-width", policy)
+        self.assertIn("two-or-more-space-delimited cells", policy)
         self.assertIn("same target column", policy)
         self.assertIn("unambiguous same-column", policy)
+        self.assertIn("no minimum fact count", policy)
+        self.assertIn("omit that fact and still publish", policy)
 
     def test_research_prompt_has_bounded_actions_and_safe_validation_feedback(
         self,

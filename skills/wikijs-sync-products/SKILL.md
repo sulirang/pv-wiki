@@ -210,21 +210,26 @@ registry that an operator must maintain. Without a match, the local gate may
 automatically verify only an HTTPS manufacturer host whose name is consistent
 with the AI-discovered manufacturer and whose bounded extract contains both the
 manufacturer and complete catalogue model. A second independent HTTPS extract
-must corroborate that identity, and every published fact needs exact quotes
-from both domains. Failure becomes
+must corroborate that identity. Every retained fact needs an exact quote from
+the verified primary datasheet, but not from the corroborating identity source.
+Failure becomes
 `source_unverified`: it is audited and retried automatically, without creating
 a product issue or manual-review task. The model cannot grant trust by itself.
 For certificate-verifying PostgreSQL
 modes, mount the catalogue public/private CA from `CATALOGUE_CA_PATH`
 read-only as documented in the deployment guide.
-Only cited bounded extracts containing the catalogue-bound full model are
-eligible evidence; unrelated extracted discovery candidates are ignored by
-the publication identity check. The document may also cover sibling models in
-the same series. Each
-specification must include a short exact target-model-only extract span
-containing the model, source field label, and value, with no sibling model or
-revision inside that span. Record ambiguous multi-model table rows as a normal
-non-publish outcome and retry them automatically; do not open a review issue.
+The verified primary must be an original manufacturer PDF that the runtime
+successfully downloaded and parsed, and its bounded extract must contain the
+catalogue-bound full model. A manufacturer HTML page, regulatory/authorized
+copy, or mirror may help discovery or identity corroboration but cannot grant
+automatic publication. Unrelated extracted discovery candidates are ignored by
+the publication identity check. The document may cover sibling models in the
+same series and does not need to contain only the target. Each retained
+specification must
+include either a short exact target-model-only span or an exact
+Markdown/TSV/normalized-PDF table header and parameter row that bind the value
+to the same target column. Omit an unsafe parameter row. There is no minimum
+fact count once the trusted primary datasheet and target membership pass.
 
 Run `pv-wiki doctor` before any live probes, then `pv-wiki doctor --live`. The
 doctor validates AI and search-provider configuration but intentionally spends
@@ -324,9 +329,10 @@ Run these checks in order:
    start the looping n8n workflow until this check passes. If a different
    staging prefix is mandatory, use separate worker state and plan an explicit
    migration.
-5. Confirm exact full model/suffix matching, official datasheet references,
-   at least five cited specification facts, no internal family code on the
-   page, and no invented review claims.
+5. Confirm the full target model is present in the trusted official datasheet
+   as either a standalone or series member, the complete original PDF is linked
+   in references, every displayed specification is bound to the target, no
+   internal family code appears on the page, and no review claim is invented.
 6. Edit text outside `PV-WIKI-AUTO`, rerun when due during acceptance, and
    confirm the human text remains byte-for-byte intact.
 7. Run the homepage workflow and confirm brand/category indexes, total count,

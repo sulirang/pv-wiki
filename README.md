@@ -82,11 +82,16 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   comparison supporting that decision is recorded in
   [`docs/search-provider-benchmark-2026-07-26.md`](docs/search-provider-benchmark-2026-07-26.md).
 - Requests bounded Exa full text for selected pages and PDFs, retaining
-  highlights as a fallback. An opt-in direct-PDF path can additionally fetch
-  explicit HTTPS `.pdf` URLs through DNS-pinned public connections and extract
-  page-labelled embedded text in a resource-bounded child process. Raw PDF
-  bytes remain in memory and are never persisted; scanned or image-only
-  documents fall back to Exa rather than weakening the evidence gate.
+  highlights as a fallback. The direct-PDF path fetches explicit HTTPS `.pdf`
+  URLs through DNS-pinned public connections and extracts page-labelled
+  embedded text in a resource-bounded child process, including when Exa could
+  not parse the submitted PDF. It is required evidence for automatic
+  publication, although discovery still works when it is disabled. A
+  deterministic normalized TSV
+  view preserves fixed-width tables and joins split model prefix/suffix header
+  rows before the original layout text. Raw PDF bytes remain in memory and are
+  never persisted; scanned or image-only documents fall back to Exa rather
+  than weakening the evidence gate.
 - Calls a user-selected OpenAI-compatible model with bounded public discovery
   hints and extracts so it can identify the manufacturer and product type.
   Search-result URLs are withheld from the model; only successful Extract URLs
@@ -134,20 +139,29 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   description while a stock alias such as `JA460W` can retain `JAM72S20` as an
   exact alternate. Only cited extracts—not unrelated successful candidates—
   may establish the final model.
-- Allows multi-model series datasheets into analysis. A normal prose/target-only
-  row still needs one exact model/label/value quote. A Markdown-pipe or TSV
+- Allows multi-model series datasheets into analysis. The complete target model
+  must be present as a member of the document, but it does not need to be the
+  document's only model. A normal prose/target-only row still needs one exact
+  model/label/value quote. A Markdown-pipe, TSV, or normalized fixed-width PDF
   table may instead provide `model_quote` for the exact model-header row and
-  `quote` for the exact parameter row; the runtime accepts it only when the
-  target model occurs in one unique header cell and the selected value is
-  unambiguous in the same column.
+  `quote` for the exact parameter row; the runtime accepts a fact only when the
+  target has one identifiable header column and the selected value is
+  unambiguous in that same column.
 - Keeps family codes, lease tokens, secrets, and unapproved database IDs out of
   the model prompt. Only an explicitly enabled, short ASCII model-shaped
   `product_id` may be promoted to the public model hint.
-- Validates exact source URLs, source trust, confidence, conflicts, public
-  category, five unique facts, and source-grounded model/label/value evidence
-  spans before a page can publish. Ordinary URL/domain constraints accidentally
-  included in an AI supplemental query are discarded; obfuscated forms fail
-  closed.
+- Treats one successfully downloaded and locally parsed, trusted original
+  manufacturer PDF containing the complete target model as the publication
+  evidence threshold. An ordinary HTML product page, distributor document, or
+  mirror cannot satisfy this gate. There is no minimum specification count.
+  Safely grounded facts are retained and an invalid individual fact is omitted
+  rather than blocking the trusted datasheet; every retained fact still needs a
+  source-grounded
+  model/label/value span. The original PDF URL is rendered as the complete Wiki
+  reference rather than an excerpt. Exact source trust, catalogue-bound model,
+  confidence, public page metadata, and conflict checks still fail closed.
+  Ordinary URL/domain constraints accidentally included in an AI supplemental
+  query are discarded; obfuscated forms fail closed.
 - Upserts only the `PV-WIKI-AUTO` section and preserves human-authored text.
 - Builds a normal catalogue homepage with brand/category entry points, totals,
   per-brand counts, and recently updated products.

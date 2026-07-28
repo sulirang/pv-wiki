@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -12,11 +13,12 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import __version__
 from .ai import (
@@ -78,6 +80,7 @@ from .decision import (
     SourceVerificationError,
     catalogue_model_candidates,
     canonical_product_category,
+    identity_key,
     preferred_catalogue_model,
     text_contains_catalogue_identity,
     validate_decision,
@@ -130,8 +133,8 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
-VALIDATION_POLICY_VERSION = "2026-07-27.5"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-28.1"
+VALIDATION_POLICY_VERSION = "2026-07-28.4"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-28.4"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
@@ -183,6 +186,20 @@ _COMPANY_IDENTIFIER_SUFFIX_RE = re.compile(
     r"(?:srl|ltd|llc|gmbh|bv|inc|corp|company)\Z",
     flags=re.IGNORECASE,
 )
+_DIRECT_PDF_SUCCESS_STATUSES = frozenset({"used"})
+_DIRECT_PDF_PARSED_STATUSES = frozenset({"used", "identity_mismatch"})
+_COMMON_COUNTRY_SECOND_LEVELS = frozenset(
+    {"ac", "co", "com", "edu", "gov", "net", "org"}
+)
+_DIRECT_PDF_METADATA_FIELDS = (
+    "pdf_direct_status",
+    "pdf_direct_error_type",
+    "pdf_sha256",
+    "pdf_page_count",
+    "pdf_extracted_pages",
+    "pdf_final_url_changed",
+    "pdf_final_hostname",
+)
 
 _RESEARCH_GAP_NOTES = {
     "manufacturer_identity": (
@@ -213,6 +230,96 @@ class CLIError(RuntimeError):
 
 class ResearchReplaySuppressedError(CLIError):
     """Raised when durable audit state refuses an unsafe paid replay."""
+
+
+def _normalized_hostname(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    hostname = value.strip().strip(".").casefold()
+    if not hostname:
+        return ""
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return ""
+    labels = hostname.split(".")
+    if (
+        len(hostname) > 253
+        or any(
+            re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            is None
+            for label in labels
+        )
+    ):
+        return ""
+    return hostname
+
+
+def _url_hostname(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    try:
+        return _normalized_hostname(urlsplit(value).hostname)
+    except ValueError:
+        return ""
+
+
+def _registrable_domain(hostname: Any) -> str:
+    normalized = _normalized_hostname(hostname)
+    if not normalized:
+        return ""
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        return ""
+    labels = normalized.split(".")
+    if len(labels) < 2:
+        return ""
+    label_count = 2
+    if (
+        len(labels) >= 3
+        and len(labels[-1]) == 2
+        and labels[-2] in _COMMON_COUNTRY_SECOND_LEVELS
+    ):
+        label_count = 3
+    return ".".join(labels[-label_count:])
+
+
+def _hostname_matches_domain(hostname: Any, domain: Any) -> bool:
+    normalized_hostname = _normalized_hostname(hostname)
+    normalized_domain = _normalized_hostname(domain)
+    return bool(
+        normalized_hostname
+        and normalized_domain
+        and (
+            normalized_hostname == normalized_domain
+            or normalized_hostname.endswith(f".{normalized_domain}")
+        )
+    )
+
+
+def _pdf_redirect_allows_publication(
+    requested_url: str,
+    final_hostname: Any,
+    *,
+    trusted_domains: frozenset[str],
+) -> bool:
+    requested_hostname = _url_hostname(requested_url)
+    normalized_final_hostname = _normalized_hostname(final_hostname)
+    requested_domain = _registrable_domain(requested_hostname)
+    final_domain = _registrable_domain(normalized_final_hostname)
+    if (
+        requested_domain
+        and final_domain
+        and requested_domain == final_domain
+    ):
+        return True
+    return any(
+        _hostname_matches_domain(normalized_final_hostname, domain)
+        for domain in trusted_domains
+    )
 
 
 def _json_default(value: Any) -> Any:
@@ -556,10 +663,45 @@ def _merge_extract_bundles(
                 continue
             old_body = existing.get("raw_content")
             new_body = candidate.get("raw_content")
-            if isinstance(new_body, str) and (
-                not isinstance(old_body, str) or len(new_body) > len(old_body)
+            old_identity = existing.get("identity_verified") is True
+            new_identity = candidate.get("identity_verified") is True
+            prefer_candidate = isinstance(new_body, str) and (
+                not isinstance(old_body, str)
+                or (new_identity and not old_identity)
+                or (
+                    new_identity == old_identity
+                    and len(new_body) > len(old_body)
+                )
+            )
+            selected = candidate if prefer_candidate else existing
+            other = existing if prefer_candidate else candidate
+            combined = dict(other)
+            combined.update(selected)
+
+            def metadata_rank(value: Mapping[str, Any]) -> int:
+                status = value.get("pdf_direct_status")
+                if status == "used":
+                    return 4
+                if status == "identity_mismatch":
+                    return 3
+                if status == "failed":
+                    return 2
+                if status == "attempted":
+                    return 1
+                return 0
+
+            for field in _DIRECT_PDF_METADATA_FIELDS:
+                combined.pop(field, None)
+            for source in sorted(
+                (existing, candidate),
+                key=metadata_rank,
             ):
-                merged[url] = candidate
+                for field in _DIRECT_PDF_METADATA_FIELDS:
+                    if field in source:
+                        combined[field] = source[field]
+            if combined.get("pdf_direct_status") in _DIRECT_PDF_PARSED_STATUSES:
+                combined.pop("pdf_direct_error_type", None)
+            merged[url] = combined
 
     failed: list[dict[str, Any]] = []
     seen_failed: set[tuple[str, str]] = set()
@@ -606,8 +748,6 @@ def _validation_research_gap(error: DecisionError) -> str | None:
         return "manufacturer_identity"
     if "requires a primary datasheet" in message:
         return "primary_datasheet"
-    if "at least 5 cited specification facts" in message:
-        return "missing_exact_fact"
     if "facts[" in message and (
         "evidence_quotes" in message
         or "exact supporting extract span" in message
@@ -1137,8 +1277,15 @@ def _cmd_search(args: argparse.Namespace) -> int:
 def _prepare_extract_results(
     lease: Lease,
     bundle: dict[str, Any],
+    *,
+    submitted_urls: Sequence[str] | None = None,
 ) -> dict[str, int]:
-    """Prefer page-labelled direct PDF text and finalize bounded evidence."""
+    """Add direct-PDF evidence independently and finalize bounded extracts.
+
+    Exa discovery/extraction and direct PDF retrieval are deliberately separate
+    evidence paths.  A submitted PDF can therefore become a successful result
+    even when Exa's ``/contents`` response reports no text for that URL.
+    """
 
     settings = PDFSettings.from_env()
     limit = max_extract_chars()
@@ -1148,20 +1295,42 @@ def _prepare_extract_results(
         "failed": 0,
         "identity_mismatch": 0,
     }
-    results = bundle.get("results")
-    if not isinstance(results, list):
-        return direct_summary
+    raw_results = bundle.get("results")
+    results = raw_results if isinstance(raw_results, list) else []
+    if raw_results is not results:
+        bundle["results"] = results
+
+    # Provider payloads are untrusted. Only this runtime may attest that a
+    # URL was downloaded and parsed as a PDF.
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        for field in _DIRECT_PDF_METADATA_FIELDS:
+            result.pop(field, None)
 
     if settings.enabled:
-        for result in results:
+        result_by_url = {
+            result["url"]: result
+            for result in results
             if (
-                direct_summary["attempted"] >= settings.max_files
-                or not isinstance(result, dict)
-            ):
-                continue
-            url = result.get("url")
+                isinstance(result, dict)
+                and isinstance(result.get("url"), str)
+            )
+        }
+        candidates = (
+            list(submitted_urls)
+            if submitted_urls is not None
+            else list(result_by_url)
+        )
+        for url in candidates:
+            if direct_summary["attempted"] >= settings.max_files:
+                break
             if not looks_like_pdf_url(url):
                 continue
+            result = result_by_url.get(url)
+            synthetic = result is None
+            if result is None:
+                result = {"url": url}
             direct_summary["attempted"] += 1
             result["pdf_direct_status"] = "attempted"
             try:
@@ -1175,8 +1344,11 @@ def _prepare_extract_results(
                 )
             except PDFDocumentError as exc:
                 direct_summary["failed"] += 1
-                result["pdf_direct_status"] = "failed"
-                result["pdf_direct_error_type"] = exc.__class__.__name__[:100]
+                if not synthetic:
+                    result["pdf_direct_status"] = "failed"
+                    result["pdf_direct_error_type"] = (
+                        exc.__class__.__name__[:100]
+                    )
                 continue
 
             result["pdf_sha256"] = evidence.sha256
@@ -1185,6 +1357,9 @@ def _prepare_extract_results(
             result["pdf_final_url_changed"] = (
                 evidence.final_url != evidence.requested_url
             )
+            result["pdf_final_hostname"] = _url_hostname(
+                evidence.final_url
+            )
             existing = result.get("raw_content")
             existing_text = existing if isinstance(existing, str) else ""
             direct_identity = text_contains_catalogue_identity(
@@ -1192,15 +1367,60 @@ def _prepare_extract_results(
                 lease.payload.get("product_name"),
                 evidence.text,
             )
-            if direct_identity or not existing_text.strip():
-                result["raw_content"] = evidence.text
+            existing_identity = (
+                bool(existing_text.strip())
+                and text_contains_catalogue_identity(
+                    lease.product_id,
+                    lease.payload.get("product_name"),
+                    existing_text,
+                )
+            )
+            direct_text = evidence.text
+            result.pop("raw_content_sha256", None)
+            if existing_text.strip():
+                combined_text = (
+                    direct_text.rstrip()
+                    + "\n\n"
+                    + existing_text.lstrip()
+                )
+                if len(combined_text) <= limit:
+                    result["raw_content"] = combined_text
+                    result["content_source"] = (
+                        "direct_pdf_text+exa_text"
+                    )
+                    result["truncated"] = bool(
+                        evidence.truncated or result.get("truncated")
+                    )
+                else:
+                    if existing_identity and not direct_identity:
+                        preferred_text = existing_text
+                        preferred_source = str(
+                            result.get("content_source") or "exa_full_text"
+                        )
+                    else:
+                        preferred_text = direct_text
+                        preferred_source = "direct_pdf_text"
+                    if len(preferred_text) > limit:
+                        result["raw_content_sha256"] = hashlib.sha256(
+                            preferred_text.encode("utf-8")
+                        ).hexdigest()
+                    result["raw_content"] = preferred_text[:limit]
+                    result["content_source"] = preferred_source
+                    result["truncated"] = True
+            else:
+                result["raw_content"] = direct_text
                 result["content_source"] = "direct_pdf_text"
                 result["truncated"] = bool(evidence.truncated)
+
+            if direct_identity:
                 result["pdf_direct_status"] = "used"
                 direct_summary["used"] += 1
             else:
                 result["pdf_direct_status"] = "identity_mismatch"
                 direct_summary["identity_mismatch"] += 1
+            if synthetic:
+                results.append(result)
+                result_by_url[url] = result
 
     for result in results:
         if not isinstance(result, dict):
@@ -1237,7 +1457,11 @@ def _run_extract(
     try:
         client = _make_search_client(timeout=timeout)
         bundle = client.extract_urls(submitted, query)
-        _prepare_extract_results(lease, bundle)
+        _prepare_extract_results(
+            lease,
+            bundle,
+            submitted_urls=submitted,
+        )
         successful_urls = [
             item["url"]
             for item in bundle.get("results", [])
@@ -1850,26 +2074,23 @@ def _run_research_extract(
                     "Exa extract returned a URL outside this action's "
                     "submitted set"
                 )
-            direct_pdf_summary = _prepare_extract_results(lease, bundle)
-            for result in results:
-                if not isinstance(result, dict):
-                    continue
-                content = result.get("raw_content")
-                if (
-                    isinstance(content, str)
-                    and bool(content.strip())
-                    and isinstance(result.get("url"), str)
-                    and result["url"] not in successful_url_set
-                ):
-                    successful_url_set.add(result["url"])
-                    successful_urls.append(result["url"])
-        else:
-            direct_pdf_summary = {
-                "attempted": 0,
-                "used": 0,
-                "failed": 0,
-                "identity_mismatch": 0,
-            }
+        direct_pdf_summary = _prepare_extract_results(
+            lease,
+            bundle,
+            submitted_urls=urls,
+        )
+        for result in bundle["results"]:
+            if not isinstance(result, dict):
+                continue
+            content = result.get("raw_content")
+            if (
+                isinstance(content, str)
+                and bool(content.strip())
+                and isinstance(result.get("url"), str)
+                and result["url"] not in successful_url_set
+            ):
+                successful_url_set.add(result["url"])
+                successful_urls.append(result["url"])
         store.finish_research_action(
             lease,
             round_number=round_number,
@@ -2089,6 +2310,7 @@ def _validate_decision_for_lease(
     evidence_text_by_url: dict[str, str] | None = None,
     allowed_classification_urls: set[str] | None = None,
     classification_text_by_url: dict[str, str] | None = None,
+    verified_primary_document_urls: set[str] | None = None,
 ) -> dict[str, Any]:
     """Validate a proposal without mutating the attempt's terminal outcome."""
 
@@ -2115,31 +2337,78 @@ def _validate_decision_for_lease(
             "a trusted catalogue-brand domain override requires an explicit "
             "public manufacturer alias"
         )
-    return validate_decision(
-        raw,
-        expected_product_id=lease.product_id,
-        expected_lease_token=lease.token,
-        minimum_confidence=min_publish_confidence(),
-        minimum_fact_confidence=min_fact_confidence(),
-        mirrors_allowed=allow_mirrors(),
-        allowed_evidence_urls=allowed_urls,
-        allowed_classification_urls=(
-            allowed_classification_urls
-            if allowed_classification_urls is not None
-            else allowed_urls
-        ),
-        trusted_source_domains=trusted_domains,
-        operator_manufacturer_identity=operator_manufacturer or None,
-        expected_product_name=str(
-            lease.payload.get("product_name") or ""
-        ),
-        evidence_text_by_url=evidence_text_by_url,
-        classification_text_by_url=(
-            classification_text_by_url
-            if classification_text_by_url is not None
-            else evidence_text_by_url
-        ),
-    )
+
+    def validate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+        return validate_decision(
+            candidate,
+            expected_product_id=lease.product_id,
+            expected_lease_token=lease.token,
+            minimum_confidence=min_publish_confidence(),
+            minimum_fact_confidence=min_fact_confidence(),
+            mirrors_allowed=allow_mirrors(),
+            allowed_evidence_urls=allowed_urls,
+            allowed_classification_urls=(
+                allowed_classification_urls
+                if allowed_classification_urls is not None
+                else allowed_urls
+            ),
+            trusted_source_domains=trusted_domains,
+            operator_manufacturer_identity=operator_manufacturer or None,
+            expected_product_name=str(
+                lease.payload.get("product_name") or ""
+            ),
+            evidence_text_by_url=evidence_text_by_url,
+            classification_text_by_url=(
+                classification_text_by_url
+                if classification_text_by_url is not None
+                else evidence_text_by_url
+            ),
+            verified_primary_document_urls=verified_primary_document_urls,
+        )
+
+    if raw.get("outcome") != "publish":
+        return validate(raw)
+
+    raw_facts = raw.get("facts")
+    if not isinstance(raw_facts, list):
+        return validate(raw)
+
+    # Facts are optional enrichment after the primary document passes. Before
+    # validating individual facts, discard every normalized-name group that
+    # appears more than once; choosing one duplicate would invent a conflict
+    # resolution that the evidence did not establish.
+    fact_name_counts: dict[str, int] = {}
+    fact_name_keys: list[str | None] = []
+    for item in raw_facts:
+        name = item.get("name") if isinstance(item, Mapping) else None
+        key = identity_key(name) if isinstance(name, str) else ""
+        normalized_key = key or None
+        fact_name_keys.append(normalized_key)
+        if normalized_key is not None:
+            fact_name_counts[normalized_key] = (
+                fact_name_counts.get(normalized_key, 0) + 1
+            )
+    unique_facts = [
+        item
+        for item, key in zip(raw_facts, fact_name_keys, strict=True)
+        if key is not None and fact_name_counts[key] == 1
+    ]
+
+    base = {**raw, "facts": []}
+    validated = validate(base)
+    retained_facts: list[Any] = []
+    for fact in unique_facts[:100]:
+        candidate = {
+            **raw,
+            "facts": [*retained_facts, fact],
+        }
+        try:
+            candidate_validated = validate(candidate)
+        except DecisionError:
+            continue
+        retained_facts.append(fact)
+        validated = candidate_validated
+    return validated
 
 
 def _apply_decision(
@@ -2151,6 +2420,7 @@ def _apply_decision(
     evidence_text_by_url: dict[str, str] | None = None,
     allowed_classification_urls: set[str] | None = None,
     classification_text_by_url: dict[str, str] | None = None,
+    verified_primary_document_urls: set[str] | None = None,
     validated_decision: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
@@ -2164,6 +2434,9 @@ def _apply_decision(
                 evidence_text_by_url=evidence_text_by_url,
                 allowed_classification_urls=allowed_classification_urls,
                 classification_text_by_url=classification_text_by_url,
+                verified_primary_document_urls=(
+                    verified_primary_document_urls
+                ),
             )
         )
     except SourceVerificationError as exc:
@@ -2543,10 +2816,16 @@ def _research_evidence_context(
     dict[str, str],
     set[str],
     dict[str, str],
+    set[str],
 ]:
     successful_extract_urls = set(store.allowed_evidence_urls(lease.token))
+    trusted_domains = trusted_source_domains_for_product(
+        str(lease.payload.get("brand_code") or ""),
+        None,
+    )
     evidence_text_by_url: dict[str, str] = {}
     classification_text_by_url: dict[str, str] = {}
+    verified_primary_document_urls: set[str] = set()
     results = extract.get("results")
     if isinstance(results, list):
         for item in results:
@@ -2563,10 +2842,34 @@ def _research_evidence_context(
             classification_text_by_url[url] = content
             if url in successful_extract_urls:
                 evidence_text_by_url[url] = content
+            sha256 = item.get("pdf_sha256")
+            page_count = item.get("pdf_page_count")
+            extracted_pages = item.get("pdf_extracted_pages")
+            if (
+                url in successful_extract_urls
+                and looks_like_pdf_url(url)
+                and item.get("pdf_direct_status")
+                in _DIRECT_PDF_SUCCESS_STATUSES
+                and isinstance(sha256, str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is not None
+                and isinstance(page_count, int)
+                and not isinstance(page_count, bool)
+                and page_count > 0
+                and isinstance(extracted_pages, int)
+                and not isinstance(extracted_pages, bool)
+                and 0 < extracted_pages <= page_count
+                and _pdf_redirect_allows_publication(
+                    url,
+                    item.get("pdf_final_hostname"),
+                    trusted_domains=trusted_domains,
+                )
+            ):
+                verified_primary_document_urls.add(url)
     return (
         evidence_text_by_url,
         set(classification_text_by_url),
         classification_text_by_url,
+        verified_primary_document_urls,
     )
 
 
@@ -3533,6 +3836,7 @@ def run_one(
                     evidence_text_by_url,
                     allowed_classification_urls,
                     classification_text_by_url,
+                    verified_primary_document_urls,
                 ) = _research_evidence_context(store, lease, extract)
                 try:
                     validated = _validate_decision_for_lease(
@@ -3542,6 +3846,9 @@ def run_one(
                         evidence_text_by_url=evidence_text_by_url,
                         allowed_classification_urls=allowed_classification_urls,
                         classification_text_by_url=classification_text_by_url,
+                        verified_primary_document_urls=(
+                            verified_primary_document_urls
+                        ),
                     )
                 except DecisionError as exc:
                     recoverable_gap = _validation_research_gap(exc)
@@ -3553,6 +3860,9 @@ def run_one(
                             evidence_text_by_url=evidence_text_by_url,
                             allowed_classification_urls=allowed_classification_urls,
                             classification_text_by_url=classification_text_by_url,
+                            verified_primary_document_urls=(
+                                verified_primary_document_urls
+                            ),
                             audit=_research_audit(
                                 model=ai_settings.model,
                                 search=search,
@@ -3631,6 +3941,9 @@ def run_one(
                     evidence_text_by_url=evidence_text_by_url,
                     allowed_classification_urls=allowed_classification_urls,
                     classification_text_by_url=classification_text_by_url,
+                    verified_primary_document_urls=(
+                        verified_primary_document_urls
+                    ),
                     audit=audit,
                     validated_decision=validated,
                 )

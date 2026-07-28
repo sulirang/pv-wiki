@@ -304,11 +304,21 @@ immediately.
 
 For multi-model datasheets, the AI may submit a structured evidence item with
 an exact `model_quote` header row and exact parameter `quote` row from the same
-Markdown-pipe/TSV table. Publication requires one unique target-model column
-and an unambiguous value in that same column. The verified primary manufacturer
-datasheet supplies specification facts; an independent source is required only
-to corroborate the manufacturer and complete model when automatic domain
-verification is used.
+Markdown-pipe, TSV, or deterministic normalized fixed-width PDF table.
+Publication requires one identifiable target-model column and an unambiguous
+value in that same column. The target may be one of many sibling models in the
+document. The verified primary manufacturer datasheet supplies every retained
+specification fact, but there is no minimum fact count; an unsafe row is
+omitted instead of blocking the document. An independent source is required
+only to corroborate the manufacturer and complete model when automatic domain
+verification is used. The original PDF URL remains the complete Wiki
+reference.
+
+Automatic publication additionally requires that primary URL to be a
+manufacturer PDF successfully downloaded and parsed by the worker. Keep
+`PV_WIKI_PDF_DIRECT_FETCH=true`; disabling it leaves discovery operational but
+causes the publication gate to fail closed. Manufacturer HTML pages,
+regulatory/authorized copies, and mirrors may be supplemental evidence only.
 
 After adding or replacing an Exa key, update `EXA_API_KEYS`, then recreate the
 worker so it receives the new environment:

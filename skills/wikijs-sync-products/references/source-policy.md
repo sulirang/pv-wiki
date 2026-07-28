@@ -79,10 +79,11 @@ Use community sources only for a clearly attributed review summary, never for
 identity, datasheets, or technical specifications. A review summary needs at
 least two extracted URLs and must describe reported experience without turning
 opinions into product facts. Omit it when reliable feedback is unavailable.
-Automatic publication normally needs at least one manufacturer source. A
-regulatory or authorized source may substitute when it contains the complete
-official document. A mirror may substitute only when explicitly enabled and
-corroborated by a second independent source.
+Automatic publication needs an original manufacturer PDF that the runtime
+successfully downloaded and parsed during the current evidence flow. A
+manufacturer HTML page, regulatory or authorized copy, and mirror may assist
+discovery or identity corroboration, but none may substitute for that primary
+PDF.
 
 `source_type` is an AI proposal, not an authorization decision.
 The bundled supplier registry is the normal narrow-host verification fast
@@ -102,8 +103,10 @@ may accept a manufacturer source only when all of these conditions hold:
   normalized catalogue product model;
 - a second independent HTTPS registrable organization has an extract that
   corroborates the same manufacturer and complete model; and
-- every published specification fact has an exact supporting quote from the
-  verified primary manufacturer datasheet.
+- the proposed primary URL was directly downloaded as a PDF and successfully
+  parsed by the bounded local PDF worker; and
+- every retained specification fact has an exact supporting quote from that
+  verified primary manufacturer PDF.
 
 The model cannot grant trust on its own. If the automatic gate cannot establish
 all conditions, the runtime returns `source_unverified`, publishes
@@ -112,10 +115,17 @@ per-product issue or asking for manual escalation. This automatic path is a
 cross-source confidence rule rather than cryptographic proof of domain
 ownership; configured overrides remain the deterministic fast path. The
 independent identity source need not duplicate every specification fact.
-Every specification must cite a verified primary source; explicitly enabled
-mirror fallback requires two independent mirror domains for every fact. A
-bounded extract may cover sibling models in the same series, but the model
-cannot grant product identity.
+Mirrors never grant publication authority. Every retained specification must
+cite the directly verified manufacturer PDF. Its extract must contain the
+complete target model as a document or series-table member. A bounded extract
+may cover any number of sibling models in the same series; the target does not
+need to be the only model, and the model cannot grant product identity.
+
+The low-level `pv-wiki publish --decision-file ...` command is an explicit
+operator override path for controlled recovery and acceptance testing; it does
+not synthesize runtime PDF-download attestation. The unattended `run-one`/n8n
+path never uses that override and always supplies an explicit verified-PDF set,
+including an empty set when no PDF passed.
 
 ## Evidence
 
@@ -127,7 +137,7 @@ fail-closed evidence forms are accepted:
 - ordinary prose or a target-only row uses `{url, quote}`; the grounded
   contiguous quote must contain the complete target model, field label, and
   selected value without a sibling model/revision;
-- a Markdown-pipe or TSV multi-model table uses
+- a Markdown-pipe, TSV, or normalized fixed-width PDF multi-model table uses
   `{url, model_quote, quote}`. `model_quote` is the exact model-header row and
   `quote` the exact parameter row from the same extracted URL. They must have
   the same explicit cell count, the complete target model must occur in one
@@ -136,15 +146,23 @@ fail-closed evidence forms are accepted:
 
 Translated labels belong in surrounding prose, not the verified fact name. Do
 not infer a value from a nearby model column or treat prose spacing as table
-structure. If the extract cannot preserve an unambiguous binding, return
-`ambiguous`. Capture detailed official specifications across
-efficiency, input, output, storage, protection, communication, and physical or
-environmental sections when present. Publication requires at least five cited
-specification facts. If sources conflict, add a `conflicts` entry and omit the
-disputed fact from the summary table unless clearly marked. Fact names are
-normalized for uniqueness, and conflict names use the same normalization.
+structure. The direct-PDF parser may add a labelled deterministic TSV view
+before the raw layout text; split repeated model prefixes and suffix rows are
+joined there without changing the source values. If a parameter row cannot
+preserve an unambiguous target-column binding, omit that fact. Use `ambiguous`
+only when the target model's membership or variant cannot be resolved.
+Capture detailed official specifications across efficiency, input, output,
+storage, protection, communication, and physical or environmental sections
+when present, but publication has no minimum fact count. Once the trusted
+primary datasheet and target-model membership pass, an invalid individual fact
+is dropped instead of blocking the page. If sources conflict, add a
+`conflicts` entry and omit the disputed fact from the summary table unless
+clearly marked. Fact names are normalized for uniqueness, and conflict names
+use the same normalization.
 
-Put datasheet documents in `datasheets` and other evidence pages in `sources`.
+Put the original full-document URL in `datasheets` and other evidence pages in
+`sources`; the Wiki reference links the complete PDF rather than an extracted
+span.
 Every cited URL must have been successfully selected for provider Extract during
 the same lease. Unrelated successfully extracted candidates do not have to
 contain the target identity and cannot invalidate otherwise cited evidence.

@@ -1338,7 +1338,8 @@ def build_decision_messages(
                         {
                             "url": "successful extracted URL",
                             "model_quote": (
-                                "one exact Markdown-pipe or TSV model header row"
+                                "one exact Markdown-pipe, TSV, or fixed-width "
+                                "PDF-layout model header row"
                             ),
                             "quote": (
                                 "one exact same-table parameter row containing "
@@ -1369,8 +1370,16 @@ def build_decision_messages(
         },
         "source_policy": [
             "Cite only URLs present in retrieval.extract.results.",
-            "A publish decision needs a primary datasheet from a manufacturer, "
-            "regulator, or authorized source and at least five cited facts.",
+            "A publish decision needs one trusted original primary manufacturer "
+            "PDF whose URL the runtime directly downloaded and locally parsed, "
+            "and whose extracted content contains the complete target model. "
+            "Mark only that item source_type=manufacturer and is_primary=true. "
+            "HTML pages, regulatory/authorized copies, and mirrors may be "
+            "supplemental evidence but cannot be primary publication authority. "
+            "There is no minimum fact count. Extract every target-model "
+            "specification that can be attributed safely, but the trusted PDF "
+            "remains sufficient when no individual fact can be grounded without "
+            "guessing.",
             "Infer the public manufacturer, model, and product category from "
             "the extracted public content; catalogue brand metadata may be absent.",
             "product.model is the runtime's strongest public model hint. "
@@ -1395,8 +1404,10 @@ def build_decision_messages(
             "catalogue identity, use insufficient_identity instead.",
             "product_category must be a reader-facing category, never an internal code.",
             "Keep conflicting claims out of facts and list them in conflicts.",
-            "A source document may cover multiple sibling models; do not reject "
-            "the document for that alone.",
+            "A primary datasheet may cover multiple sibling models. Treat the "
+            "target as one member of that series and do not require it to be "
+            "the only model in the document. Sibling columns are not an "
+            "identity conflict by themselves.",
             "For every fact, copy its name from the source field label. For "
             "ordinary prose or a target-only row, use exactly {url, quote}, "
             "where quote is one exact contiguous span containing the full target "
@@ -1404,11 +1415,17 @@ def build_decision_messages(
             "Direct PDF text may contain system-added [PDF page N/M] boundary "
             "markers. Use them to understand pagination, but never include a "
             "page marker in an evidence quote.",
-            "For a multi-model Markdown-pipe or TSV table, use exactly "
+            "Direct PDF text may also contain a system-generated normalized TSV "
+            "table view before the raw layout text. It deterministically joins "
+            "split model-prefix/suffix headers and collapses layout whitespace; "
+            "you may quote its exact TSV rows.",
+            "For a multi-model Markdown-pipe or TSV table, or a fixed-width "
+            "table preserved by direct PDF layout extraction, use exactly "
             "{url, model_quote, quote}. model_quote must be one exact model "
             "header row and quote one exact parameter row from the same extracted "
-            "document. Both rows must have the same number of explicit pipe/tab "
-            "cells; the complete target model must occur in exactly one header "
+            "document. Both rows must have the same number of explicit pipe, tab, "
+            "or two-or-more-space-delimited cells; the complete target model "
+            "must occur in exactly one header "
             "cell, the fact label in exactly one non-target parameter cell, and "
             "the target value and unit unambiguously in that same target column.",
             "When no configured manufacturer-domain override exists, a second "
@@ -1416,9 +1433,16 @@ def build_decision_messages(
             "manufacturer and complete model. Specification facts themselves "
             "must be quoted from the verified primary manufacturer datasheet; "
             "they do not each require a duplicate quote from the second source.",
-            "If a multi-model table does not provide an unambiguous same-column "
-            "model-to-value binding for every fact, return ambiguous; never "
-            "guess a nearby column or convert prose spacing into table cells.",
+            "If one multi-model table row does not provide an unambiguous "
+            "same-column model-to-value binding, omit that fact and still "
+            "publish from the trusted primary datasheet. Only return ambiguous "
+            "when "
+            "the target model's membership or variant cannot be resolved; "
+            "never guess a nearby column or treat single-space prose as table "
+            "cells. Never search merely to reach a fact-count quota.",
+            "Put the original successfully downloaded and locally parsed PDF "
+            "URL in datasheets so the complete document, not an excerpt, is "
+            "retained as the Wiki reference.",
             "Community sources may support review_summary only, never specifications.",
             "review_summary requires at least two review_evidence_urls.",
             "Use empty strings and empty arrays for unavailable optional material.",
@@ -1501,12 +1525,13 @@ def build_research_messages(
         }
         request["source_policy"].append(
             "trusted_source_policy is bounded operator-owned public context. "
-            "A successful HTTPS extract whose hostname equals or is a "
-            "subdomain of one listed trusted domain may be proposed as the "
-            "configured manufacturer primary source; independent-domain "
-            "corroboration is not required. The extract must still contain the "
-            "complete target model, and only the runtime decision gate can "
-            "authorize the source."
+            "A directly downloaded and locally parsed HTTPS PDF whose hostname "
+            "equals or is a subdomain of one listed trusted domain may be "
+            "proposed as the configured manufacturer primary source; "
+            "independent-domain corroboration is not required. The extract must "
+            "still contain the complete target model as a document or "
+            "series-table member; it does not need to be the document's only "
+            "model, and only the runtime decision gate can authorize the source."
         )
     request["action_contract"] = {
         "exact_top_level_shapes": {

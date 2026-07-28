@@ -25,7 +25,22 @@ OUTCOMES = frozenset(
 SOURCE_TYPES = frozenset(
     {"manufacturer", "regulatory", "authorized", "mirror", "community"}
 )
-TRUSTED_TYPES = frozenset({"manufacturer", "regulatory", "authorized"})
+_NAMED_FAMILY_TECHNICAL_SUFFIXES = frozenset(
+    {
+        "BCU",
+        "BESS",
+        "BMS",
+        "BMU",
+        "EMS",
+        "ESS",
+        "EVSE",
+        "HMI",
+        "MPPT",
+        "PCS",
+        "PDU",
+        "UPS",
+    }
+)
 _GENERIC_MANUFACTURER_TOKENS = frozenset(
     {
         "ag",
@@ -214,6 +229,12 @@ _SPECIFICATION_FRAGMENT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _ELLIPSIS_RE = re.compile(r"\s*(?:\.{3,}|…+)\s*")
+_DERIVED_TABLE_START_RE = re.compile(
+    r"\[Derived PDF layout table ([1-9]\d*)\]"
+)
+_DERIVED_TABLE_END_RE = re.compile(
+    r"\[End derived PDF layout table ([1-9]\d*)\]"
+)
 _PRODUCT_CATEGORY_ALIASES = {
     "heat pump": "热泵",
     "heat pumps": "热泵",
@@ -334,6 +355,22 @@ def _is_distinctive_model_identity(value: str) -> bool:
     )
 
 
+def _is_named_family_identity(value: str) -> bool:
+    """Recognize bounded all-letter catalogue families such as ``MIRA BMS``."""
+
+    normalized = " ".join(value.split())
+    tokens = re.findall(r"[^\W\d_]+", normalized, flags=re.UNICODE)
+    return (
+        2 <= len(tokens) <= 4
+        and 5 <= len(identity_key(normalized)) <= 40
+        and all(2 <= len(token) <= 20 for token in tokens)
+        and normalized == normalized.upper()
+        and tokens[-1] in _NAMED_FAMILY_TECHNICAL_SUFFIXES
+        and not _looks_like_organization_name(normalized)
+        and not _looks_like_product_description(normalized)
+    )
+
+
 def _distinctive_model_fragments(value: str) -> tuple[str, ...]:
     fragments: list[str] = []
     seen: set[str] = set()
@@ -397,8 +434,11 @@ def catalogue_model_candidates(
 
     if allow_product_id and stable_id:
         if (
-            not re.search(r"\s", stable_id)
-            and _is_distinctive_model_identity(stable_id)
+            (
+                not re.search(r"\s", stable_id)
+                and _is_distinctive_model_identity(stable_id)
+            )
+            or _is_named_family_identity(stable_id)
         ):
             add(stable_id)
         for fragment in _distinctive_model_fragments(stable_id):
@@ -886,13 +926,34 @@ def _numeric_value_pattern(value: int | float) -> str:
     number = format(float(value), ".15g") if isinstance(value, float) else str(value)
     if "e" in number.casefold():
         mantissa, exponent = re.split(r"[eE]", number, maxsplit=1)
-        mantissa_pattern = re.escape(mantissa).replace(r"\.", r"[.,]")
+        mantissa_pattern = re.escape(mantissa)
         return mantissa_pattern + r"[eE]" + re.escape(exponent)
-    if "." in number:
-        whole, fraction = number.split(".", maxsplit=1)
-        return re.escape(whole) + r"[.,]" + re.escape(fraction) + r"0*"
-    return re.escape(number) + (
-        r"(?:[.,]0+)?"
+    sign = ""
+    if number.startswith("-"):
+        sign = r"\-"
+    elif number.startswith("+"):
+        sign = r"\+"
+    unsigned = number.lstrip("+-")
+    whole, separator, fraction = unsigned.partition(".")
+    if len(whole) > 3:
+        first_group_length = len(whole) % 3 or 3
+        groups = [
+            whole[:first_group_length],
+            *[
+                whole[index:index + 3]
+                for index in range(first_group_length, len(whole), 3)
+            ],
+        ]
+        thousands_separator = r"(?:[,\u00a0\u202f ]?)"
+        whole_pattern = thousands_separator.join(
+            re.escape(group) for group in groups
+        )
+    else:
+        whole_pattern = re.escape(whole)
+    if separator:
+        return sign + whole_pattern + r"\." + re.escape(fraction) + r"0*"
+    return sign + whole_pattern + (
+        r"(?:\.0+)?"
         if isinstance(value, float)
         else ""
     )
@@ -981,7 +1042,13 @@ def _quote_supports_fact(
 
 
 def _table_row_cells(row: str) -> list[str] | None:
-    """Parse one explicit Markdown/TSV row; prose spacing is not structural."""
+    """Parse one explicit Markdown, TSV, or fixed-width PDF table row.
+
+    Direct PDF layout extraction preserves table columns as runs of at least
+    two spaces. A single ordinary prose space is never treated as a boundary.
+    The caller still requires the header and parameter rows to have identical
+    cell counts before it binds a value to a target-model column.
+    """
 
     lines = [line.strip() for line in row.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -996,8 +1063,136 @@ def _table_row_cells(row: str) -> list[str] | None:
     elif "\t" in line:
         cells = [cell.strip() for cell in line.split("\t")]
     else:
-        return None
+        cells = [
+            cell.strip()
+            for cell in re.split(r"[ \u00a0]{2,}", line)
+        ]
     return cells if len(cells) >= 2 and all(cells) else None
+
+
+def _derived_table_context_ids(lines: list[str]) -> list[int | None]:
+    """Map well-formed system-derived table blocks to unique local IDs."""
+
+    context_ids: list[int | None] = [None] * len(lines)
+    invalid_ids: set[int] = set()
+    active: tuple[int, str] | None = None
+    next_id = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        start = _DERIVED_TABLE_START_RE.fullmatch(stripped)
+        end = _DERIVED_TABLE_END_RE.fullmatch(stripped)
+        if start is not None:
+            if active is not None:
+                invalid_ids.add(active[0])
+            next_id += 1
+            active = (next_id, start.group(1))
+            context_ids[index] = next_id
+            continue
+        if active is None:
+            continue
+        context_ids[index] = active[0]
+        if end is not None:
+            if end.group(1) != active[1]:
+                invalid_ids.add(active[0])
+            active = None
+    if active is not None:
+        invalid_ids.add(active[0])
+    return [
+        0 if context_id in invalid_ids else context_id
+        for context_id in context_ids
+    ]
+
+
+def _table_row_starts_new_header_context(
+    row: str,
+    *,
+    model_header_cells: list[str],
+    expected_product_name: str,
+) -> bool:
+    cells = _table_row_cells(row)
+    if cells is None:
+        return False
+    return (
+        any(
+            text_contains_exact_identity(expected_product_name, cell)
+            and not text_contains_competing_identity(
+                expected_product_name,
+                cell,
+            )
+            for cell in cells
+        )
+        or (
+            len(cells) == len(model_header_cells)
+            and identity_key(cells[0]) == identity_key(model_header_cells[0])
+        )
+    )
+
+
+def _table_quotes_share_source_context(
+    *,
+    model_quote: str,
+    fact_quote: str,
+    expected_product_name: str,
+    source_body: str,
+) -> bool:
+    """Require two grounded rows to share one explicit source table context."""
+
+    if not source_body:
+        return False
+    model_header_cells = _table_row_cells(model_quote)
+    if model_header_cells is None:
+        return False
+    lines = source_body.splitlines()
+    model_line = model_quote.strip()
+    fact_line = fact_quote.strip()
+    model_indexes = [
+        index for index, line in enumerate(lines)
+        if line.strip() == model_line
+    ]
+    fact_indexes = [
+        index for index, line in enumerate(lines)
+        if line.strip() == fact_line
+    ]
+    if not model_indexes or not fact_indexes:
+        return False
+
+    derived_contexts = _derived_table_context_ids(lines)
+    for model_index in model_indexes:
+        for fact_index in fact_indexes:
+            if fact_index <= model_index:
+                continue
+            model_context = derived_contexts[model_index]
+            fact_context = derived_contexts[fact_index]
+            if model_context == 0 or fact_context == 0:
+                continue
+            if model_context is not None or fact_context is not None:
+                if model_context is None or model_context != fact_context:
+                    continue
+            else:
+                # Without runtime-authored table markers there is no reliable
+                # way to distinguish an intervening parameter row from a
+                # second table's abbreviated or reordered header. Bind only
+                # the immediately following row; marked derived tables retain
+                # full multi-row support.
+                if fact_index != model_index + 1:
+                    continue
+
+            # A later row containing the complete target is a nearer table
+            # header. A same-width row repeating the known header label is also
+            # a boundary even when the later table abbreviates all model cells.
+            # Both checks prevent one table's header from binding a parameter
+            # row from a subsequent, reordered table.
+            if any(
+                _table_row_starts_new_header_context(
+                    lines[index],
+                    model_header_cells=model_header_cells,
+                    expected_product_name=expected_product_name,
+                )
+                for index in range(model_index + 1, fact_index)
+            ):
+                continue
+            return True
+    return False
 
 
 def _cell_has_unambiguous_fact_value(
@@ -1013,16 +1208,26 @@ def _cell_has_unambiguous_fact_value(
 
     expected = float(value)
     numeric_tokens = re.findall(
-        r"(?<![\w.,])[+\-]?\d+(?:[.,]\d+)?(?![\w.,])",
+        r"(?<![\w.,])[+\-]?(?:"
+        r"\d{1,3}(?:[,\u00a0\u202f ]\d{3})+(?:\.\d+)?"
+        r"|\d+(?:\.\d+)?"
+        r")(?![\w.,])",
         unicodedata.normalize("NFKC", cell),
         flags=re.UNICODE,
     )
     for token in numeric_tokens:
         try:
-            candidate = float(token.replace(",", "."))
+            candidate = float(
+                re.sub(r"[,\u00a0\u202f ]", "", token)
+            )
         except ValueError:
             return False
-        if not math.isclose(candidate, expected, rel_tol=1e-12, abs_tol=1e-12):
+        if not math.isclose(
+            candidate,
+            expected,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
             return False
     return bool(numeric_tokens)
 
@@ -1035,15 +1240,27 @@ def _structured_table_quote_supports_fact(
     value: Any,
     unit: str,
     expected_product_name: str,
+    source_body: str | None = None,
 ) -> bool:
     """Bind a target model header cell to the same column in a fact row."""
 
+    context_body = (
+        source_body
+        if isinstance(source_body, str)
+        else f"{model_quote}\n{fact_quote}"
+    )
     header_cells = _table_row_cells(model_quote)
     fact_cells = _table_row_cells(fact_quote)
     if (
         header_cells is None
         or fact_cells is None
         or len(header_cells) != len(fact_cells)
+        or not _table_quotes_share_source_context(
+            model_quote=model_quote,
+            fact_quote=fact_quote,
+            expected_product_name=expected_product_name,
+            source_body=context_body,
+        )
     ):
         return False
     target_columns = [
@@ -1205,6 +1422,7 @@ def validate_decision(
     allowed_evidence_urls: set[str] | None = None,
     allowed_classification_urls: set[str] | None = None,
     trusted_source_domains: set[str] | frozenset[str] | None = None,
+    verified_primary_document_urls: set[str] | frozenset[str] | None = None,
     expected_product_name: str | None = None,
     operator_manufacturer_identity: str | None = None,
     evidence_text_by_url: Mapping[str, str] | None = None,
@@ -1212,6 +1430,9 @@ def validate_decision(
 ) -> dict[str, Any]:
     """Return a normalized decision or reject it before any Wiki mutation."""
 
+    # Retained in the public signature for compatibility. Mirrors may assist
+    # discovery or corroboration, but never authorize publication.
+    del mirrors_allowed
     if not isinstance(raw, Mapping):
         raise DecisionError("decision must be a JSON object")
     unknown = set(raw) - _TOP_LEVEL
@@ -1279,6 +1500,20 @@ def validate_decision(
         for domain in (trusted_source_domains or set())
         if isinstance(domain, str) and domain.strip()
     )
+    normalized_verified_primary_urls: frozenset[str] | None = None
+    if verified_primary_document_urls is not None:
+        if not isinstance(verified_primary_document_urls, (set, frozenset)):
+            raise DecisionError(
+                "verified_primary_document_urls must be a set of URLs"
+            )
+        if len(verified_primary_document_urls) > 10:
+            raise DecisionError(
+                "verified_primary_document_urls may contain at most 10 URLs"
+            )
+        normalized_verified_primary_urls = frozenset(
+            validate_public_url(url, "verified_primary_document_urls")
+            for url in verified_primary_document_urls
+        )
 
     datasheets: list[dict[str, Any]] = []
     for index, item in enumerate(_require_list(raw, "datasheets", 10)):
@@ -1433,17 +1668,6 @@ def validate_decision(
             evidence_body_by_url[url] = body
             normalized_evidence_text[url] = identity_key(body)
 
-    if outcome == "publish" and any(
-        url in evidence_body_by_url
-        and not text_contains_exact_identity(
-            model,
-            evidence_body_by_url[url],
-        )
-        for url in declared_urls
-    ):
-        raise DecisionError(
-            "cited publish evidence must contain the catalogue-bound model identity"
-        )
     auto_verified_urls = _auto_verified_manufacturer_urls(
         datasheets + sources,
         manufacturer=operator_manufacturer or manufacturer,
@@ -1614,6 +1838,10 @@ def validate_decision(
                             value=value,
                             unit=unit,
                             expected_product_name=model,
+                            source_body=evidence_body_by_url.get(
+                                quote_url,
+                                "",
+                            ),
                         )
                     )
                 elif grounded_quote is not None:
@@ -1807,17 +2035,13 @@ def validate_decision(
                 "hardware; return out_of_scope with exact classification "
                 "evidence"
             )
-        if len(facts) < 5:
-            raise DecisionError(
-                "publish requires at least 5 cited specification facts"
-            )
         primary = [item for item in datasheets if item["is_primary"]]
         if not primary:
             raise DecisionError("publish requires a primary datasheet")
         configured_primary = [
             item
             for item in primary
-            if item["source_type"] in TRUSTED_TYPES
+            if item["source_type"] == "manufacturer"
             and _url_has_trusted_domain(item["url"], trusted_domains)
         ]
         auto_primary = [
@@ -1826,56 +2050,73 @@ def validate_decision(
             if item["source_type"] == "manufacturer"
             and item["url"] in auto_verified_urls
         ]
-        trusted_primary = configured_primary + auto_primary
+        # A maintained supplier-domain registration is authoritative. Do not
+        # let the generic hostname/corroboration heuristic route a registered
+        # catalogue brand to a different domain. Automatic discovery remains
+        # available only when no registration exists.
+        trusted_primary = (
+            configured_primary
+            if trusted_domains
+            else auto_primary
+        )
         if not trusted_primary:
-            mirror_domains = {
-                ".".join((urlsplit(item["url"]).hostname or "").split(".")[-2:])
-                for item in primary
-                if item["source_type"] == "mirror"
-            }
-            if (
-                not mirrors_allowed
-                or len(primary) < 2
-                or len(mirror_domains) < 2
-                or any(item["source_type"] != "mirror" for item in primary)
-            ):
-                raise SourceVerificationError(
-                    "primary datasheet needs an automatically verified manufacturer "
-                    "source, a configured domain override, or two enabled independent "
-                    "mirrors"
-                )
+            raise SourceVerificationError(
+                "primary datasheet needs an original manufacturer source "
+                "authorized by automatic verification or a configured domain"
+            )
+        model_bound_primary = [
+            item
+            for item in trusted_primary
+            if text_contains_exact_identity(
+                model,
+                evidence_body_by_url.get(item["url"], ""),
+            )
+        ]
+        if not model_bound_primary:
+            raise SourceVerificationError(
+                "the trusted primary datasheet must be extracted locally and "
+                "contain the complete target model as a document or series-table "
+                "member"
+            )
+        publication_primary = (
+            model_bound_primary
+            if normalized_verified_primary_urls is None
+            else [
+                item
+                for item in model_bound_primary
+                if item["url"] in normalized_verified_primary_urls
+            ]
+        )
+        if not publication_primary:
+            raise SourceVerificationError(
+                "automatic publish requires a directly verified manufacturer "
+                "PDF primary datasheet"
+            )
         configured_primary_urls = {
-            item["url"] for item in configured_primary
+            item["url"]
+            for item in publication_primary
+            if item in configured_primary
         }
         auto_primary_urls = {
-            item["url"] for item in auto_primary
+            item["url"]
+            for item in publication_primary
+            if item in auto_primary
         }
         for index, fact in enumerate(facts):
             quoted_urls = {
                 item["url"] for item in fact["evidence_quotes"]
             }
-            if configured_primary:
+            if configured_primary_urls:
                 if not quoted_urls & configured_primary_urls:
                     raise SourceVerificationError(
                         f"facts[{index}] needs evidence from the configured "
                         "primary manufacturer datasheet"
                     )
-            elif auto_primary:
+            elif auto_primary_urls:
                 if not quoted_urls & auto_primary_urls:
                     raise SourceVerificationError(
                         f"facts[{index}] needs evidence from the automatically "
                         "verified primary manufacturer datasheet"
-                    )
-            else:
-                matching_mirror_domains = {
-                    ".".join((urlsplit(url).hostname or "").split(".")[-2:])
-                    for url in quoted_urls
-                    if source_types_by_url.get(url) == "mirror"
-                }
-                if len(matching_mirror_domains) < 2:
-                    raise DecisionError(
-                        f"facts[{index}] needs its value in two independent "
-                        "mirror extracts"
                     )
 
     return {

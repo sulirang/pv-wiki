@@ -149,10 +149,20 @@ The runtime strips/overwrites model attempts to
 set `schema_version`, `product_id`, or `lease_token`, requires the proposed
 model to match the catalogue name, allows series documents containing sibling
 models into analysis, and requires grounded fact evidence. A prose or
-target-only row uses one exact model/label/value quote. A Markdown-pipe or TSV
-table may instead provide an exact `model_quote` header row and exact parameter
-`quote` row; the runtime verifies one unique target-model column and the
-selected value in that same column.
+target-only row uses one exact model/label/value quote. A Markdown-pipe, TSV,
+or deterministic normalized fixed-width PDF table may instead provide an exact
+`model_quote` header row and exact parameter `quote` row; the runtime verifies
+one identifiable target-model column and the selected value in that same
+column. The complete target must occur in the trusted primary extract, but
+sibling models elsewhere in the same datasheet are expected. Automatic
+publication also requires that exact primary URL to have been downloaded and
+parsed as a PDF by the local bounded PDF worker; HTML pages and mirrored copies
+remain supplemental evidence only.
+
+`pv-wiki publish --decision-file ...` is a deliberate operator-only recovery
+path and does not replace the unattended PDF attestation flow. Normal n8n
+operation must call `run-one`, which always passes an explicit verified-PDF
+set and fails closed when it is empty.
 
 The bundled `pv_wiki/suppliers.json` file is the normal operator-owned mapping
 from catalogue `brand_code` to public manufacturer/category identity and
@@ -254,11 +264,13 @@ also explicitly states that the item is a nut, bolt, or fastener. The publish
 path independently rejects a generic-hardware model or public category.
 Every publication citation must be in that exact-match set. A series document
 may contain sibling models. Ordinary prose still requires a target-only
-model/label/value span; an explicit Markdown/TSV table may use separate
-`model_quote` and parameter `quote` rows only when their cell counts match, the
-target occurs in one unique header cell, and the selected value is unambiguous
-in the same column. Other multi-model rows fail closed into an audited
-non-publish outcome rather than guessing a column.
+model/label/value span; an explicit Markdown/TSV table or normalized
+fixed-width PDF table may use separate `model_quote` and parameter `quote` rows
+only when their cell counts match, the target occurs in one identifiable
+header cell, and the selected value is unambiguous in the same column. A
+parameter row that cannot be bound safely is omitted. It does not turn an
+otherwise trusted target-bearing primary datasheet into a non-publish outcome,
+and no minimum fact count applies.
 The low-level `publish` command therefore requires `--evidence-file` for a
 publish outcome. The fixed n8n `run-one` operation passes the bounded evidence
 in memory and does not persist source bodies.

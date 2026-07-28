@@ -132,7 +132,7 @@
                   "type": "string",
                   "minLength": 1,
                   "maxLength": 500,
-                  "description": "Optional exact Markdown/TSV model header row paired with quote as the same-table parameter row."
+                  "description": "Optional exact Markdown, TSV, or fixed-width PDF-layout model header row paired with quote as the same-table parameter row."
                 }
               }
             }
@@ -174,8 +174,7 @@
         "properties": {
           "product_category": {"minLength": 1},
           "summary": {"minLength": 1},
-          "datasheets": {"minItems": 1},
-          "facts": {"minItems": 5}
+          "datasheets": {"minItems": 1}
         }
       }
     },
