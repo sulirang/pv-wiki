@@ -38,6 +38,7 @@ from .ai import (
 from .config import (
     ConfigError,
     GlobalResearchBudgetSettings,
+    PDFSettings,
     ResearchSettings,
     WikiSettings,
     allow_mirrors,
@@ -54,6 +55,12 @@ from .config import (
     supplier_search_excluded_domains,
     trusted_source_domain_map,
     trusted_source_domains_for_product,
+)
+from .documents import (
+    PDF_EXTRACTION_CONTRACT_VERSION,
+    PDFDocumentError,
+    extract_pdf_evidence,
+    looks_like_pdf_url,
 )
 from .exa import (
     API_BASE_URL as EXA_API_BASE_URL,
@@ -124,7 +131,7 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
 VALIDATION_POLICY_VERSION = "2026-07-27.5"
-AI_RESEARCH_PROMPT_VERSION = "2026-07-27.5"
+AI_RESEARCH_PROMPT_VERSION = "2026-07-28.1"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
 )
@@ -773,6 +780,26 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             "error": _safe_error(exc),
         }
 
+    pdf_settings: PDFSettings | None = None
+    try:
+        pdf_settings = PDFSettings.from_env()
+        checks["pdf_document_config"] = {
+            "ok": True,
+            "enabled": pdf_settings.enabled,
+            "transport": "pinned-public-https",
+            "parser": "isolated-pypdf",
+            "max_files": pdf_settings.max_files,
+            "max_bytes": pdf_settings.max_bytes,
+            "max_pages": pdf_settings.max_pages,
+            "download_timeout_seconds": pdf_settings.download_timeout,
+            "parse_timeout_seconds": pdf_settings.parse_timeout,
+        }
+    except ConfigError as exc:
+        checks["pdf_document_config"] = {
+            "ok": False,
+            "error": _safe_error(exc),
+        }
+
     global_budget_settings: GlobalResearchBudgetSettings | None = None
     try:
         global_budget_settings = GlobalResearchBudgetSettings.from_env()
@@ -837,6 +864,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         and public_alias_mapping is not None
         and trusted_domain_mapping is not None
         and research_settings is not None
+        and pdf_settings is not None
         and global_budget_settings is not None
         and pg_sslmode
     ):
@@ -1106,6 +1134,97 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _prepare_extract_results(
+    lease: Lease,
+    bundle: dict[str, Any],
+) -> dict[str, int]:
+    """Prefer page-labelled direct PDF text and finalize bounded evidence."""
+
+    settings = PDFSettings.from_env()
+    limit = max_extract_chars()
+    direct_summary = {
+        "attempted": 0,
+        "used": 0,
+        "failed": 0,
+        "identity_mismatch": 0,
+    }
+    results = bundle.get("results")
+    if not isinstance(results, list):
+        return direct_summary
+
+    if settings.enabled:
+        for result in results:
+            if (
+                direct_summary["attempted"] >= settings.max_files
+                or not isinstance(result, dict)
+            ):
+                continue
+            url = result.get("url")
+            if not looks_like_pdf_url(url):
+                continue
+            direct_summary["attempted"] += 1
+            result["pdf_direct_status"] = "attempted"
+            try:
+                evidence = extract_pdf_evidence(
+                    url,
+                    max_bytes=settings.max_bytes,
+                    max_pages=settings.max_pages,
+                    max_chars=limit,
+                    download_timeout=settings.download_timeout,
+                    parse_timeout=settings.parse_timeout,
+                )
+            except PDFDocumentError as exc:
+                direct_summary["failed"] += 1
+                result["pdf_direct_status"] = "failed"
+                result["pdf_direct_error_type"] = exc.__class__.__name__[:100]
+                continue
+
+            result["pdf_sha256"] = evidence.sha256
+            result["pdf_page_count"] = evidence.page_count
+            result["pdf_extracted_pages"] = evidence.extracted_pages
+            result["pdf_final_url_changed"] = (
+                evidence.final_url != evidence.requested_url
+            )
+            existing = result.get("raw_content")
+            existing_text = existing if isinstance(existing, str) else ""
+            direct_identity = text_contains_catalogue_identity(
+                lease.product_id,
+                lease.payload.get("product_name"),
+                evidence.text,
+            )
+            if direct_identity or not existing_text.strip():
+                result["raw_content"] = evidence.text
+                result["content_source"] = "direct_pdf_text"
+                result["truncated"] = bool(evidence.truncated)
+                result["pdf_direct_status"] = "used"
+                direct_summary["used"] += 1
+            else:
+                result["pdf_direct_status"] = "identity_mismatch"
+                direct_summary["identity_mismatch"] += 1
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        content = result.get("raw_content")
+        if isinstance(content, str) and len(content) > limit:
+            result["raw_content_sha256"] = hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest()
+            result["raw_content"] = content[:limit]
+            result["truncated"] = True
+            content = result["raw_content"]
+        result["identity_verified"] = (
+            isinstance(content, str)
+            and bool(content.strip())
+            and text_contains_catalogue_identity(
+                lease.product_id,
+                lease.payload.get("product_name"),
+                content,
+            )
+        )
+    return direct_summary
+
+
 def _run_extract(
     store: StateStore,
     lease: Lease,
@@ -1118,25 +1237,7 @@ def _run_extract(
     try:
         client = _make_search_client(timeout=timeout)
         bundle = client.extract_urls(submitted, query)
-        limit = max_extract_chars()
-        for result in bundle.get("results", []):
-            content = result.get("raw_content")
-            if isinstance(content, str) and len(content) > limit:
-                result["raw_content_sha256"] = hashlib.sha256(
-                    content.encode("utf-8")
-                ).hexdigest()
-                result["raw_content"] = content[:limit]
-                result["truncated"] = True
-                content = result["raw_content"]
-            result["identity_verified"] = (
-                isinstance(content, str)
-                and bool(content.strip())
-                and text_contains_catalogue_identity(
-                    lease.product_id,
-                    lease.payload.get("product_name"),
-                    content,
-                )
-            )
+        _prepare_extract_results(lease, bundle)
         successful_urls = [
             item["url"]
             for item in bundle.get("results", [])
@@ -1238,6 +1339,7 @@ def _research_scope_fingerprints(
     max_results: int,
     research_settings: ResearchSettings,
 ) -> dict[str, str]:
+    pdf_settings = PDFSettings.from_env()
     provider_credential = getattr(
         search_client,
         "credential_fingerprint",
@@ -1304,6 +1406,16 @@ def _research_scope_fingerprints(
             **search_provider_scope,
             "version": extract_contract,
             "action": "extract",
+            "max_extract_chars": max_extract_chars(),
+            "direct_pdf": {
+                "contract_version": PDF_EXTRACTION_CONTRACT_VERSION,
+                "enabled": pdf_settings.enabled,
+                "max_files": pdf_settings.max_files,
+                "max_bytes": pdf_settings.max_bytes,
+                "max_pages": pdf_settings.max_pages,
+                "download_timeout": pdf_settings.download_timeout,
+                "parse_timeout": pdf_settings.parse_timeout,
+            },
         }
     )
     trusted_source_policy = _trusted_source_policy_for_product(product)
@@ -1335,6 +1447,8 @@ def _research_scope_fingerprints(
             "max_tokens": ai_settings.max_tokens,
             "max_evidence_chars": ai_settings.max_evidence_chars,
             "max_extract_chars": max_extract_chars(),
+            "pdf_extraction_contract": PDF_EXTRACTION_CONTRACT_VERSION,
+            "direct_pdf_enabled": pdf_settings.enabled,
             "retrieval_shape": {
                 "max_results": max_results,
                 "max_rounds": research_settings.max_rounds,
@@ -1721,7 +1835,6 @@ def _run_research_extract(
         if not isinstance(raw_bundle, dict):
             raise ExaResponseError("Exa extract result must be an object")
         bundle = dict(raw_bundle)
-        limit = max_extract_chars()
         successful_urls: list[str] = []
         successful_url_set: set[str] = set()
         results = bundle.get("results")
@@ -1737,27 +1850,11 @@ def _run_research_extract(
                     "Exa extract returned a URL outside this action's "
                     "submitted set"
                 )
+            direct_pdf_summary = _prepare_extract_results(lease, bundle)
             for result in results:
                 if not isinstance(result, dict):
                     continue
                 content = result.get("raw_content")
-                if isinstance(content, str) and len(content) > limit:
-                    result["raw_content_sha256"] = hashlib.sha256(
-                        content.encode("utf-8")
-                    ).hexdigest()
-                    result["raw_content"] = content[:limit]
-                    result["truncated"] = True
-                    content = result["raw_content"]
-                identity_verified = (
-                    isinstance(content, str)
-                    and bool(content.strip())
-                    and text_contains_catalogue_identity(
-                        lease.product_id,
-                        lease.payload.get("product_name"),
-                        content,
-                    )
-                )
-                result["identity_verified"] = identity_verified
                 if (
                     isinstance(content, str)
                     and bool(content.strip())
@@ -1766,6 +1863,13 @@ def _run_research_extract(
                 ):
                     successful_url_set.add(result["url"])
                     successful_urls.append(result["url"])
+        else:
+            direct_pdf_summary = {
+                "attempted": 0,
+                "used": 0,
+                "failed": 0,
+                "identity_mismatch": 0,
+            }
         store.finish_research_action(
             lease,
             round_number=round_number,
@@ -1780,6 +1884,7 @@ def _run_research_extract(
                     "last_operation_requests",
                     default=1,
                 ),
+                "direct_pdf": direct_pdf_summary,
             },
             credits=_credits(bundle),
         )

@@ -20,7 +20,11 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from .config import is_placeholder_value, supplier_search_excluded_domains
+from .config import (
+    is_placeholder_value,
+    max_extract_chars,
+    supplier_search_excluded_domains,
+)
 from .search import (
     EXTRACT_BUDGET_UNITS_PER_BATCH,
     MAX_EXTRACT_URLS,
@@ -41,7 +45,7 @@ from .search import (
 API_BASE_URL = "https://api.exa.ai"
 DEFAULT_TIMEOUT = 20.0
 SEARCH_CONTRACT_VERSION = "2026-07-27.5"
-EXTRACT_CONTRACT_VERSION = "2026-07-26.2"
+EXTRACT_CONTRACT_VERSION = "2026-07-28.1"
 MAX_HIGHLIGHT_CHARACTERS = 12_000
 
 
@@ -648,12 +652,14 @@ class ExaClient:
         clean_query = _clean_query(query)
 
         submitted: list[str] = []
+        submitted_by_key: dict[str, str] = {}
         seen: set[str] = set()
         for raw_url in urls:
             normalized, dedupe_key = _canonical_url(raw_url, validate_public=True)
             if dedupe_key not in seen:
                 seen.add(dedupe_key)
                 submitted.append(normalized)
+                submitted_by_key[dedupe_key] = normalized
         if not submitted:
             raise ValueError("at least one public HTTP(S) URL is required")
         if len(submitted) > MAX_EXTRACT_URLS:
@@ -668,6 +674,9 @@ class ExaClient:
                     "query": clean_query,
                     "maxCharacters": MAX_HIGHLIGHT_CHARACTERS,
                 },
+                "text": {
+                    "maxCharacters": max_extract_chars(),
+                },
                 "livecrawlTimeout": min(15_000, max(1_000, int(self.timeout * 500))),
             },
         )
@@ -679,25 +688,49 @@ class ExaClient:
         for item in raw_results:
             if not isinstance(item, Mapping):
                 continue
-            try:
-                result_url, _ = _canonical_url(
-                    item.get("url") or item.get("id"),
-                    validate_public=True,
-                )
-            except (TypeError, ValueError):
+            result_url: str | None = None
+            resolved_url: str | None = None
+            for raw_candidate in (item.get("id"), item.get("url")):
+                try:
+                    normalized, dedupe_key = _canonical_url(
+                        raw_candidate,
+                        validate_public=True,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if raw_candidate == item.get("url"):
+                    resolved_url = normalized
+                if dedupe_key in submitted_by_key and result_url is None:
+                    result_url = submitted_by_key[dedupe_key]
+            if result_url is None:
                 continue
             highlights = item.get("highlights")
-            content = (
+            highlight_content = (
                 "\n\n[...]\n\n".join(
                     part for part in highlights if isinstance(part, str)
                 )
                 if isinstance(highlights, list)
                 else ""
             )
+            full_text = item.get("text")
+            content = (
+                full_text
+                if isinstance(full_text, str) and full_text.strip()
+                else highlight_content
+            )
             result: dict[str, Any] = {
                 "url": result_url,
                 "raw_content": content,
+                "content_source": (
+                    "exa_full_text"
+                    if isinstance(full_text, str) and full_text.strip()
+                    else "exa_highlights"
+                ),
             }
+            if resolved_url is not None and resolved_url != result_url:
+                result["resolved_url"] = resolved_url
+            if isinstance(item.get("title"), str):
+                result["title"] = _clean_term(item["title"])
             if isinstance(item.get("favicon"), str):
                 result["favicon"] = item["favicon"]
             results.append(result)
@@ -728,7 +761,7 @@ class ExaClient:
             "provider": self.provider_name,
             "query": clean_query,
             "urls": submitted,
-            "extract_depth": "highlights",
+            "extract_depth": "full_text_with_highlights_fallback",
             "results": results,
             "failed_results": failed_results,
             "usage": {

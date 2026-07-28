@@ -1138,6 +1138,7 @@ def _research_result_summary_json(
                 "provider_fingerprint",
                 "http_status",
                 "error_type",
+                "direct_pdf",
             }
         ),
         "ai": frozenset(
@@ -1199,6 +1200,63 @@ def _research_result_summary_json(
                 summary[field],
                 name=field,
             )
+    if "direct_pdf" in summary:
+        direct_pdf = summary["direct_pdf"]
+        if not isinstance(direct_pdf, Mapping):
+            raise TypeError("direct_pdf must be a mapping")
+        direct_pdf_fields = frozenset(
+            {
+                "attempted",
+                "used",
+                "failed",
+                "identity_mismatch",
+            }
+        )
+        unsupported_direct_pdf = set(direct_pdf) - direct_pdf_fields
+        if unsupported_direct_pdf:
+            raise ValueError(
+                "direct_pdf contains unsupported fields: "
+                + ", ".join(
+                    sorted(
+                        str(field)
+                        for field in unsupported_direct_pdf
+                    )
+                )
+            )
+        if set(direct_pdf) != direct_pdf_fields:
+            missing_direct_pdf = direct_pdf_fields - set(direct_pdf)
+            raise ValueError(
+                "direct_pdf is missing fields: "
+                + ", ".join(sorted(missing_direct_pdf))
+            )
+        normalized_direct_pdf = {
+            field: _bounded_summary_count(
+                direct_pdf[field],
+                name=f"direct_pdf.{field}",
+            )
+            for field in sorted(direct_pdf_fields)
+        }
+        if normalized_direct_pdf["used"] > normalized_direct_pdf["attempted"]:
+            raise ValueError("direct_pdf.used cannot exceed attempted")
+        if normalized_direct_pdf["failed"] > normalized_direct_pdf["attempted"]:
+            raise ValueError("direct_pdf.failed cannot exceed attempted")
+        if (
+            normalized_direct_pdf["identity_mismatch"]
+            > normalized_direct_pdf["attempted"]
+        ):
+            raise ValueError(
+                "direct_pdf.identity_mismatch cannot exceed attempted"
+            )
+        if (
+            normalized_direct_pdf["used"]
+            + normalized_direct_pdf["failed"]
+            + normalized_direct_pdf["identity_mismatch"]
+            != normalized_direct_pdf["attempted"]
+        ):
+            raise ValueError(
+                "direct_pdf outcomes must sum to attempted"
+            )
+        summary["direct_pdf"] = normalized_direct_pdf
     if "known_partial_credits" in summary:
         summary["known_partial_credits"] = _bounded_summary_credits(
             summary["known_partial_credits"],

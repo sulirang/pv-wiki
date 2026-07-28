@@ -316,6 +316,54 @@ class ResearchSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class PDFSettings:
+    """Hard limits for optional direct retrieval of manufacturer PDFs."""
+
+    enabled: bool
+    max_files: int
+    max_bytes: int
+    max_pages: int
+    download_timeout: float
+    parse_timeout: float
+
+    @classmethod
+    def from_env(cls) -> "PDFSettings":
+        return cls(
+            enabled=_bool_env("PV_WIKI_PDF_DIRECT_FETCH", False),
+            max_files=_int_env(
+                "PV_WIKI_PDF_MAX_FILES",
+                2,
+                1,
+                5,
+            ),
+            max_bytes=_int_env(
+                "PV_WIKI_PDF_MAX_BYTES",
+                12_000_000,
+                1_000_000,
+                50_000_000,
+            ),
+            max_pages=_int_env(
+                "PV_WIKI_PDF_MAX_PAGES",
+                80,
+                1,
+                500,
+            ),
+            download_timeout=_float_env(
+                "PV_WIKI_PDF_DOWNLOAD_TIMEOUT_SECONDS",
+                20.0,
+                1.0,
+                120.0,
+            ),
+            parse_timeout=_float_env(
+                "PV_WIKI_PDF_PARSE_TIMEOUT_SECONDS",
+                15.0,
+                1.0,
+                60.0,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class GlobalResearchBudgetSettings:
     """UTC stop-loss limits across all products; zero disables one window."""
 
@@ -815,6 +863,7 @@ def missing_environment(names: list[str] | tuple[str, ...]) -> list[str]:
 __all__ = [
     "ConfigError",
     "GlobalResearchBudgetSettings",
+    "PDFSettings",
     "ResearchSettings",
     "TrustedSourceNotConfigured",
     "WikiSettings",

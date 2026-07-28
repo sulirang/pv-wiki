@@ -121,6 +121,11 @@ class ExaClientTests(unittest.TestCase):
                     "results": [
                         {
                             "url": "https://maker.example/model.pdf",
+                            "text": (
+                                "MODEL-42 Technical Specification\n"
+                                "Maximum efficiency 98.8%\n"
+                                "Rated output 420 W"
+                            ),
                             "highlights": [
                                 "MODEL-42 Technical Specification",
                                 "Maximum efficiency 98.8%",
@@ -162,10 +167,48 @@ class ExaClientTests(unittest.TestCase):
             payload["urls"],
         )
         self.assertEqual(12_000, payload["highlights"]["maxCharacters"])
+        self.assertEqual(30_000, payload["text"]["maxCharacters"])
         self.assertIn("MODEL-42", bundle["results"][0]["raw_content"])
+        self.assertIn("Rated output", bundle["results"][0]["raw_content"])
+        self.assertEqual(
+            "exa_full_text",
+            bundle["results"][0]["content_source"],
+        )
+        self.assertEqual(
+            "full_text_with_highlights_fallback",
+            bundle["extract_depth"],
+        )
         self.assertEqual("CRAWL_TIMEOUT", bundle["failed_results"][0]["error"])
         self.assertEqual(2, bundle["usage"]["credits"])
         self.assertEqual(0.002, bundle["usage"]["cost_dollars"])
+
+    def test_extract_falls_back_to_highlights_when_full_text_is_empty(self) -> None:
+        def fake_urlopen(request: object, *, timeout: float) -> FakeResponse:
+            del request, timeout
+            return FakeResponse(
+                {
+                    "results": [
+                        {
+                            "url": "https://maker.example/model.pdf",
+                            "text": "",
+                            "highlights": ["MODEL-42 rated output 420 W"],
+                        }
+                    ],
+                    "statuses": [],
+                }
+            )
+
+        client = exa.ExaClient(api_key="exa-test", opener=fake_urlopen)
+        bundle = client.extract_urls(
+            ["https://maker.example/model.pdf"],
+            "MODEL-42 specifications",
+        )
+
+        self.assertEqual(
+            "exa_highlights",
+            bundle["results"][0]["content_source"],
+        )
+        self.assertIn("420 W", bundle["results"][0]["raw_content"])
 
     def test_product_search_prefers_official_domains_without_open_fallback(
         self,

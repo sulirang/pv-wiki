@@ -223,6 +223,8 @@ class PromptTests(unittest.TestCase):
                     {
                         "url": "https://maker.example/pv-42.pdf",
                         "raw_content": "e" * 6000,
+                        "content_source": "direct_pdf_text",
+                        "pdf_page_count": 12,
                     }
                 ],
             },
@@ -289,6 +291,18 @@ class PromptTests(unittest.TestCase):
         self.assertTrue(prompt["retrieval"]["extract"]["results"][0]["truncated"])
         self.assertFalse(
             prompt["retrieval"]["extract"]["results"][0]["identity_verified"]
+        )
+        self.assertEqual(
+            "direct_pdf_text",
+            prompt["retrieval"]["extract"]["results"][0]["content_source"],
+        )
+        self.assertEqual(
+            12,
+            prompt["retrieval"]["extract"]["results"][0]["pdf_page_count"],
+        )
+        self.assertIn(
+            "never include a page marker",
+            " ".join(prompt["source_policy"]).casefold(),
         )
 
     def test_prompt_rejects_invalid_inputs(self) -> None:

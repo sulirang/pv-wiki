@@ -17,7 +17,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "wikijs-sync-products" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from pv_wiki import ai, cli, state  # noqa: E402
+from pv_wiki import ai, cli, documents, state  # noqa: E402
 
 
 def product() -> dict:
@@ -746,6 +746,175 @@ class CLITests(unittest.TestCase):
         with state.StateStore(self.state_path) as store:
             self.assertEqual([url], store.allowed_evidence_urls(token))
 
+    def test_extract_prefers_page_labelled_direct_pdf_text_when_enabled(
+        self,
+    ) -> None:
+        os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
+        token = self.claim()
+        url = "https://acme.example/pv-42.pdf"
+        self.prepare_search(token, url)
+        request = self.write_json(
+            "extract-direct-pdf.json",
+            {"urls": [url], "query": "PV-42 specifications"},
+        )
+        client = mock.Mock()
+        client.extract_urls.return_value = {
+            "results": [
+                {
+                    "url": url,
+                    "raw_content": "PV-42 Exa full text fallback",
+                    "content_source": "exa_full_text",
+                }
+            ],
+            "failed_results": [],
+            "usage": {"credits": 2},
+        }
+        direct = documents.PDFEvidence(
+            text=(
+                "[PDF page 1/2]\n"
+                "PV-42 Rated power 42 W Input voltage 48 V "
+                "Efficiency 98.5 percent\n"
+                "[End PDF page 1]"
+            ),
+            requested_url=url,
+            final_url="https://cdn.acme.example/pv-42.pdf",
+            sha256="a" * 64,
+            page_count=2,
+            extracted_pages=1,
+            truncated=False,
+        )
+        with (
+            mock.patch.object(cli, "ExaClient", return_value=client),
+            mock.patch.object(
+                cli,
+                "extract_pdf_evidence",
+                return_value=direct,
+            ) as extract_pdf,
+        ):
+            code, payload, error = self.run_cli(
+                "extract",
+                "--lease-token",
+                token,
+                "--request-file",
+                str(request),
+            )
+
+        self.assertEqual(0, code, error)
+        result = payload["extract"]["results"][0]
+        self.assertEqual("direct_pdf_text", result["content_source"])
+        self.assertEqual("used", result["pdf_direct_status"])
+        self.assertEqual(2, result["pdf_page_count"])
+        self.assertEqual("a" * 64, result["pdf_sha256"])
+        self.assertTrue(result["pdf_final_url_changed"])
+        self.assertTrue(result["identity_verified"])
+        self.assertIn("[PDF page 1/2]", result["raw_content"])
+        extract_pdf.assert_called_once_with(
+            url,
+            max_bytes=12_000_000,
+            max_pages=80,
+            max_chars=30_000,
+            download_timeout=20.0,
+            parse_timeout=15.0,
+        )
+
+    def test_extract_keeps_exa_text_when_direct_pdf_fails(self) -> None:
+        os.environ["PV_WIKI_PDF_DIRECT_FETCH"] = "true"
+        token = self.claim()
+        url = "https://acme.example/pv-42.pdf"
+        self.prepare_search(token, url)
+        request = self.write_json(
+            "extract-direct-pdf-fallback.json",
+            {"urls": [url], "query": "PV-42 specifications"},
+        )
+        client = mock.Mock()
+        client.extract_urls.return_value = {
+            "results": [
+                {
+                    "url": url,
+                    "raw_content": "PV-42 Exa full text fallback",
+                    "content_source": "exa_full_text",
+                }
+            ],
+            "failed_results": [],
+            "usage": {"credits": 2},
+        }
+        with (
+            mock.patch.object(cli, "ExaClient", return_value=client),
+            mock.patch.object(
+                cli,
+                "extract_pdf_evidence",
+                side_effect=documents.PDFDownloadError("blocked safely"),
+            ),
+        ):
+            code, payload, error = self.run_cli(
+                "extract",
+                "--lease-token",
+                token,
+                "--request-file",
+                str(request),
+            )
+
+        self.assertEqual(0, code, error)
+        result = payload["extract"]["results"][0]
+        self.assertEqual("exa_full_text", result["content_source"])
+        self.assertEqual("failed", result["pdf_direct_status"])
+        self.assertEqual(
+            "PDFDownloadError",
+            result["pdf_direct_error_type"],
+        )
+        self.assertTrue(result["identity_verified"])
+
+    def test_research_extract_summary_accepts_bounded_direct_pdf_counts(
+        self,
+    ) -> None:
+        serialized = state._research_result_summary_json(
+            "extract",
+            {
+                "submitted_urls": ["https://acme.example/pv-42.pdf"],
+                "successful_urls": ["https://acme.example/pv-42.pdf"],
+                "provider_requests": 1,
+                "direct_pdf": {
+                    "attempted": 2,
+                    "used": 1,
+                    "failed": 1,
+                    "identity_mismatch": 0,
+                },
+            },
+            require_successful_urls=True,
+        )
+
+        self.assertEqual(
+            {
+                "attempted": 2,
+                "failed": 1,
+                "identity_mismatch": 0,
+                "used": 1,
+            },
+            json.loads(serialized)["direct_pdf"],
+        )
+
+    def test_research_extract_summary_rejects_inconsistent_direct_pdf_counts(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "outcomes must sum to attempted",
+        ):
+            state._research_result_summary_json(
+                "extract",
+                {
+                    "submitted_urls": ["https://acme.example/pv-42.pdf"],
+                    "successful_urls": [],
+                    "direct_pdf": {
+                        "attempted": 1,
+                        "used": 1,
+                        "failed": 1,
+                        "identity_mismatch": 0,
+                    },
+                },
+                require_successful_urls=True,
+            )
+
     def test_extract_success_is_separate_from_identity_verification(self) -> None:
         with state.StateStore(self.state_path) as store:
             store.upsert_product(
@@ -1228,6 +1397,21 @@ class CLITests(unittest.TestCase):
         self.assertNotEqual(baseline["search"], changed_retrieval["search"])
         self.assertEqual(baseline["extract"], changed_retrieval["extract"])
         self.assertNotEqual(baseline["ai"], changed_retrieval["ai"])
+
+        with mock.patch.dict(
+            os.environ,
+            {"PV_WIKI_PDF_DIRECT_FETCH": "true"},
+        ):
+            direct_pdf = cli._research_scope_fingerprints(
+                product(),
+                settings,
+                search_client,
+                max_results=5,
+                research_settings=research,
+            )
+        self.assertEqual(baseline["search"], direct_pdf["search"])
+        self.assertNotEqual(baseline["extract"], direct_pdf["extract"])
+        self.assertNotEqual(baseline["ai"], direct_pdf["ai"])
 
     def test_search_identity_uses_public_model_code_for_descriptive_name(
         self,

@@ -81,6 +81,12 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
 - Uses Exa as the sole bounded search and extraction provider. A retrieval
   comparison supporting that decision is recorded in
   [`docs/search-provider-benchmark-2026-07-26.md`](docs/search-provider-benchmark-2026-07-26.md).
+- Requests bounded Exa full text for selected pages and PDFs, retaining
+  highlights as a fallback. An opt-in direct-PDF path can additionally fetch
+  explicit HTTPS `.pdf` URLs through DNS-pinned public connections and extract
+  page-labelled embedded text in a resource-bounded child process. Raw PDF
+  bytes remain in memory and are never persisted; scanned or image-only
+  documents fall back to Exa rather than weakening the evidence gate.
 - Calls a user-selected OpenAI-compatible model with bounded public discovery
   hints and extracts so it can identify the manufacturer and product type.
   Search-result URLs are withheld from the model; only successful Extract URLs

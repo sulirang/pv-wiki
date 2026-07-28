@@ -15,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS))
 from pv_wiki.config import (  # noqa: E402
     ConfigError,
     GlobalResearchBudgetSettings,
+    PDFSettings,
     ResearchSettings,
     TrustedSourceNotConfigured,
     WikiSettings,
@@ -256,6 +257,51 @@ class ConfigTests(unittest.TestCase):
             ):
                 with self.assertRaises(ConfigError):
                     ResearchSettings.from_env()
+
+    def test_pdf_settings_are_opt_in_and_strictly_bounded(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            settings = PDFSettings.from_env()
+        self.assertFalse(settings.enabled)
+        self.assertEqual(2, settings.max_files)
+        self.assertEqual(12_000_000, settings.max_bytes)
+        self.assertEqual(80, settings.max_pages)
+        self.assertEqual(20.0, settings.download_timeout)
+        self.assertEqual(15.0, settings.parse_timeout)
+
+        configured = {
+            "PV_WIKI_PDF_DIRECT_FETCH": "true",
+            "PV_WIKI_PDF_MAX_FILES": "3",
+            "PV_WIKI_PDF_MAX_BYTES": "20000000",
+            "PV_WIKI_PDF_MAX_PAGES": "120",
+            "PV_WIKI_PDF_DOWNLOAD_TIMEOUT_SECONDS": "30",
+            "PV_WIKI_PDF_PARSE_TIMEOUT_SECONDS": "25",
+        }
+        with mock.patch.dict(os.environ, configured, clear=True):
+            settings = PDFSettings.from_env()
+        self.assertTrue(settings.enabled)
+        self.assertEqual((3, 20_000_000, 120, 30.0, 25.0), (
+            settings.max_files,
+            settings.max_bytes,
+            settings.max_pages,
+            settings.download_timeout,
+            settings.parse_timeout,
+        ))
+
+        for name, value in (
+            ("PV_WIKI_PDF_DIRECT_FETCH", "sometimes"),
+            ("PV_WIKI_PDF_MAX_FILES", "0"),
+            ("PV_WIKI_PDF_MAX_BYTES", "999999"),
+            ("PV_WIKI_PDF_MAX_PAGES", "501"),
+            ("PV_WIKI_PDF_DOWNLOAD_TIMEOUT_SECONDS", "121"),
+            ("PV_WIKI_PDF_PARSE_TIMEOUT_SECONDS", "0"),
+        ):
+            with self.subTest(name=name), mock.patch.dict(
+                os.environ,
+                {name: value},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    PDFSettings.from_env()
 
     def test_global_research_budget_is_opt_in_and_bounded(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):

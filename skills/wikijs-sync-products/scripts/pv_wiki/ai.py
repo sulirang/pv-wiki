@@ -1198,6 +1198,16 @@ def _normalized_extract(
                     "truncated": bool(item.get("truncated"))
                     or len(content) < len(original_text),
                     "identity_verified": bool(item.get("identity_verified")),
+                    "content_source": _bounded_string(
+                        item.get("content_source"),
+                        64,
+                    ),
+                    "pdf_page_count": (
+                        item.get("pdf_page_count")
+                        if isinstance(item.get("pdf_page_count"), int)
+                        and not isinstance(item.get("pdf_page_count"), bool)
+                        else None
+                    ),
                 }
             )
     return {
@@ -1391,6 +1401,9 @@ def build_decision_messages(
             "ordinary prose or a target-only row, use exactly {url, quote}, "
             "where quote is one exact contiguous span containing the full target "
             "model, field label, and value with no sibling model or revision.",
+            "Direct PDF text may contain system-added [PDF page N/M] boundary "
+            "markers. Use them to understand pagination, but never include a "
+            "page marker in an evidence quote.",
             "For a multi-model Markdown-pipe or TSV table, use exactly "
             "{url, model_quote, quote}. model_quote must be one exact model "
             "header row and quote one exact parameter row from the same extracted "
