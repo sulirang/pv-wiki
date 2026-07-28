@@ -40,9 +40,11 @@ def decision(token: str, outcome: str = "publish") -> dict:
         "outcome": outcome,
         "confidence": 0.95 if outcome == "publish" else 0.6,
         "manufacturer": "Acme",
+        "manufacturer_zh": "Acme（制造商）" if outcome == "publish" else "",
         "model": "PV-42",
-        "product_category": "Solar Inverter",
-        "summary": "Exact product match.",
+        "display_title_zh": "PV-42 光伏逆变器" if outcome == "publish" else "",
+        "product_category": "光伏逆变器" if outcome == "publish" else "",
+        "summary": "PV-42 已与官方资料精确匹配。" if outcome == "publish" else "",
         "decision_notes": "Official manufacturer model and document agree.",
         "datasheets": [],
         "sources": [],
@@ -1555,7 +1557,12 @@ class CLITests(unittest.TestCase):
         self.assertTrue(payload["published"])
         self.assertEqual("products/p-42-c8d5a4d2d3", payload["wiki"]["path"])
         self.assertEqual("created", payload["wiki"]["action"])
-        tags = client.upsert_page.call_args.args[5]
+        publish_arguments = client.upsert_page.call_args.args
+        self.assertEqual("PV-42 光伏逆变器", publish_arguments[2])
+        self.assertEqual("PV-42 已与官方资料精确匹配。", publish_arguments[3])
+        self.assertIn("# PV-42 光伏逆变器", publish_arguments[4])
+        self.assertIn("| 品牌/制造商 | Acme（制造商） |", publish_arguments[4])
+        tags = publish_arguments[5]
         self.assertIn("managed-by-pv-wiki", tags)
         self.assertNotIn("managed-by-hermes", tags)
         self.assertNotIn("family-pv", tags)
@@ -1570,6 +1577,7 @@ class CLITests(unittest.TestCase):
         self.prepare_evidence(token, url)
         proposal = decision(token)
         proposal["facts"] = []
+        proposal["summary"] = "中" * 400
         decision_path = self.write_json("publish-no-facts.json", proposal)
         evidence_path = self.write_json(
             "publish-no-facts-evidence.json",
@@ -1613,7 +1621,10 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(0, code, error)
         self.assertTrue(payload["published"])
-        rendered = client.upsert_page.call_args.args[4]
+        publish_arguments = client.upsert_page.call_args.args
+        self.assertEqual(255, len(publish_arguments[3]))
+        rendered = publish_arguments[4]
+        self.assertIn("中" * 400, rendered)
         self.assertNotIn("## 规格参数", rendered)
         self.assertIn(f"]({url})（官方数据表）", rendered)
 
@@ -4060,8 +4071,8 @@ class CLITests(unittest.TestCase):
             {
                 "manufacturer": "Acme",
                 "model": "flange nut m8",
-                "product_category": "Fastener",
-                "summary": "A documented M8 flange nut.",
+                "product_category": "紧固件",
+                "summary": "该产品是一枚有资料记录的 M8 法兰螺母。",
             }
         )
         proposal["datasheets"][0]["url"] = url

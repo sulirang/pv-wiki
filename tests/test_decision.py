@@ -48,9 +48,11 @@ def valid_decision() -> dict:
         "outcome": "publish",
         "confidence": 0.95,
         "manufacturer": "Acme",
+        "manufacturer_zh": "Acme（制造商）",
         "model": "PV-42",
-        "product_category": "Solar Inverter",
-        "summary": "A documented product.",
+        "display_title_zh": "PV-42 光伏逆变器",
+        "product_category": "光伏逆变器",
+        "summary": "PV-42 是一款资料完整的光伏逆变器。",
         "decision_notes": "Exact model and official document match.",
         "datasheets": [
             {
@@ -1186,6 +1188,24 @@ class DecisionTests(unittest.TestCase):
                 expected_lease_token="1234567890abcdef",
             )
 
+    def test_publish_requires_safe_chinese_display_copy(self) -> None:
+        invalid_values = (
+            ("display_title_zh", "", "display_title_zh"),
+            ("manufacturer_zh", "Acme", "Simplified Chinese"),
+            ("product_category", "Grid-tied inverter", "Simplified Chinese"),
+            ("summary", "A documented product.", "Simplified Chinese"),
+        )
+        for field, value, message in invalid_values:
+            with self.subTest(field=field, value=value):
+                item = valid_decision()
+                item[field] = value
+                with self.assertRaisesRegex(DecisionError, message):
+                    validate_decision(
+                        item,
+                        expected_product_id="P-42",
+                        expected_lease_token="1234567890abcdef",
+                    )
+
     def test_restricts_decision_to_extracted_urls_when_provided(self) -> None:
         with self.assertRaisesRegex(DecisionError, "not extracted"):
             validate_decision(
@@ -1971,8 +1991,8 @@ class DecisionTests(unittest.TestCase):
     ) -> None:
         item = valid_decision()
         item["model"] = "flange nut m8"
-        item["product_category"] = "Fastener"
-        item["summary"] = "A documented M8 flange nut."
+        item["product_category"] = "紧固件"
+        item["summary"] = "该产品是一枚有资料记录的 M8 法兰螺母。"
         for fact in item["facts"]:
             fact["evidence_quotes"][0]["quote"] = (
                 fact["evidence_quotes"][0]["quote"].replace(

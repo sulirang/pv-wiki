@@ -247,6 +247,18 @@ class PromptTests(unittest.TestCase):
             " ".join(prompt["source_policy"]),
         )
         self.assertIn(
+            "display_title_zh",
+            prompt["output_contract"]["required_top_level_fields"],
+        )
+        self.assertIn(
+            "manufacturer_zh",
+            prompt["output_contract"]["required_top_level_fields"],
+        )
+        display_policy = " ".join(prompt["source_policy"])
+        self.assertIn("Simplified Chinese", display_policy)
+        self.assertIn("canonical model and manufacturer", display_policy)
+        self.assertIn("fluent Simplified Chinese prose", display_policy)
+        self.assertIn(
             "multiple sibling models",
             " ".join(prompt["source_policy"]),
         )

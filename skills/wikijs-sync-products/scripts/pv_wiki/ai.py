@@ -1280,7 +1280,9 @@ def build_decision_messages(
                 "outcome",
                 "confidence",
                 "manufacturer",
+                "manufacturer_zh",
                 "model",
+                "display_title_zh",
                 "product_category",
                 "summary",
                 "review_summary",
@@ -1307,6 +1309,15 @@ def build_decision_messages(
                 "mirror",
                 "community",
             ],
+            "display_title_zh": (
+                "concise Simplified Chinese product descriptor, at most 200 "
+                "characters; the runtime adds the canonical model when needed"
+            ),
+            "manufacturer_zh": (
+                "Simplified Chinese reader label for the manufacturer, at most "
+                "200 characters; the runtime adds the canonical manufacturer "
+                "when needed; do not invent a Chinese legal entity name"
+            ),
             "datasheet_item": {
                 "url": "string",
                 "title": "string",
@@ -1320,7 +1331,7 @@ def build_decision_messages(
             },
             "fact_item": {
                 "name": "exact source field label; do not translate",
-                "category": "string",
+                "category": "concise Simplified Chinese reader grouping",
                 "value": "string or number",
                 "unit": "string",
                 "confidence": "number from 0 to 1",
@@ -1402,7 +1413,16 @@ def build_decision_messages(
             "A durable out_of_scope decision requires identity_verified=true "
             "extract evidence and high confidence. If no extract verifies the "
             "catalogue identity, use insufficient_identity instead.",
-            "product_category must be a reader-facing category, never an internal code.",
+            "For publish, display_title_zh, manufacturer_zh, product_category, "
+            "and summary are reader-facing Simplified Chinese copy. The runtime "
+            "will retain the canonical model and manufacturer alongside these "
+            "labels. Do not invent a Chinese legal entity name; when no official "
+            "Chinese brand is supported, use a faithful Chinese reader label.",
+            "product_category must be a concise Simplified Chinese reader-facing "
+            "category, never an internal code.",
+            "summary must be fluent Simplified Chinese prose. Preserve model "
+            "numbers, measurements, standards, trademarks, and technical "
+            "abbreviations exactly rather than translating those tokens.",
             "Keep conflicting claims out of facts and list them in conflicts.",
             "A primary datasheet may cover multiple sibling models. Treat the "
             "target as one member of that series and do not require it to be "

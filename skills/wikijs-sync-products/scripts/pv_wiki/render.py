@@ -340,13 +340,90 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
     )
 
 
+def _display_identity_key(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", _plain_text(value)).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def product_display_title(product: Any, decision: Any) -> str:
+    """Return a Chinese reader title while always preserving the model."""
+
+    localized = _first(decision, ("display_title_zh",))
+    model = _first(
+        decision,
+        (
+            "model",
+            "model_number",
+            "part_number",
+            "mpn",
+            "sku",
+            "product_code",
+            "code",
+        ),
+    )
+    if localized is not None and _plain_text(localized):
+        localized_text = _plain_text(localized)
+        model_text = _plain_text(model)
+        if (
+            model_text
+            and _display_identity_key(model_text)
+            not in _display_identity_key(localized_text)
+        ):
+            return f"{model_text} {localized_text}"
+        return localized_text
+    fallback = _first(
+        decision,
+        ("model", "model_number", "part_number", "mpn", "sku"),
+    )
+    if fallback is None:
+        fallback = _first(
+            product,
+            ("product_name", "name", "title", "model", "product_id", "id"),
+        )
+    if fallback is None:
+        raise ValueError("product needs a display name, model, or id")
+    return _plain_text(fallback)
+
+
+def manufacturer_display_name(product: Any, decision: Any) -> str:
+    """Return a Chinese brand label while always preserving canonical identity."""
+
+    localized = _first(decision, ("manufacturer_zh",))
+    canonical = _first(
+        decision,
+        ("manufacturer", "brand", "vendor", "maker"),
+    )
+    if canonical is None:
+        canonical = _first(
+            product,
+            ("manufacturer", "brand", "vendor", "maker", "brand_code"),
+        )
+    localized_text = _plain_text(localized)
+    canonical_text = _plain_text(canonical)
+    if localized_text:
+        if (
+            canonical_text
+            and _display_identity_key(canonical_text)
+            not in _display_identity_key(localized_text)
+        ):
+            return f"{localized_text}（{canonical_text}）"
+        return localized_text
+    return canonical_text
+
+
 def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
     fields = (
         ("产品 ID", product, ("product_id", "id")),
         (
             "品牌/制造商",
             decision,
-            ("manufacturer", "brand", "vendor", "maker"),
+            (
+                "manufacturer_zh",
+                "manufacturer",
+                "brand",
+                "vendor",
+                "maker",
+            ),
         ),
         (
             "型号/料号",
@@ -366,17 +443,15 @@ def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
             decision,
             ("product_category", "category", "product_type", "type"),
         ),
-        ("产品名称", product, ("product_name", "name", "title")),
+        ("产品名称", decision, ("display_title_zh",)),
         ("计量单位", product, ("unit_of_measure", "uom", "unit")),
         ("数据库描述", product, ("description",)),
     )
     rows = []
     for label, owner, aliases in fields:
         value = _first(owner, aliases)
-        if value is None and label == "品牌/制造商":
-            value = _first(
-                product, ("manufacturer", "brand", "vendor", "maker", "brand_code")
-            )
+        if label == "品牌/制造商":
+            value = manufacturer_display_name(product, decision)
         elif value is None and label == "型号/料号":
             value = _first(
                 product,
@@ -390,6 +465,8 @@ def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
                     "code",
                 ),
             )
+        elif label == "产品名称":
+            value = product_display_title(product, decision)
         if value is not None:
             rows.append((label, value))
     return rows
@@ -644,9 +721,7 @@ def render_product_page(
     """
 
     decision = {} if decision is None else decision
-    title = _first(product, ("product_name", "name", "title", "model", "product_id", "id"))
-    if title is None:
-        raise ValueError("product needs a display name, model, or id")
+    title = product_display_title(product, decision)
 
     lines = [
         AUTO_BEGIN,

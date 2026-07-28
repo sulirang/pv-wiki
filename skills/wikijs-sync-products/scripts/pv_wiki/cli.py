@@ -85,7 +85,14 @@ from .decision import (
     text_contains_catalogue_identity,
     validate_decision,
 )
-from .render import render_home_page, render_product_page, stable_path, stable_slug
+from .render import (
+    manufacturer_display_name,
+    product_display_title,
+    render_home_page,
+    render_product_page,
+    stable_path,
+    stable_slug,
+)
 from .server import WorkerConfigError, WorkerSettings, serve
 from .state import (
     AttemptBudgetError,
@@ -133,7 +140,7 @@ MAX_RESEARCH_SEARCH_RESULTS = 15
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
 RESEARCH_LEASE_TAIL_SECONDS = 1200
-VALIDATION_POLICY_VERSION = "2026-07-28.4"
+VALIDATION_POLICY_VERSION = "2026-07-28.5"
 AI_RESEARCH_PROMPT_VERSION = "2026-07-28.4"
 DEFINITIVE_REJECT_HTTP_STATUSES = frozenset(
     {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}
@@ -792,7 +799,8 @@ def _wiki_tags(product: dict[str, Any], decision: dict[str, Any]) -> list[str]:
     for item in decision["datasheets"] + decision["sources"]:
         tags.add(f"source-{item['source_type']}")
     brand_tag = _tag_slug(
-        "brand", decision.get("manufacturer") or product.get("brand_code")
+        "brand",
+        manufacturer_display_name(product, decision),
     )
     if brand_tag:
         tags.add(brand_tag)
@@ -833,10 +841,8 @@ def _home_catalogue_product(item: Any, *, path_prefix: str) -> dict[str, Any]:
     return {
         "product_id": item.product_id,
         "product_name": payload.get("product_name"),
-        "model": decision.get("model") or payload.get("product_name"),
-        "manufacturer": (
-            decision.get("manufacturer") or payload.get("brand_code")
-        ),
+        "model": product_display_title(payload, decision),
+        "manufacturer": manufacturer_display_name(payload, decision),
         "product_category": _decision_product_category(decision),
         "wiki_path": item.wiki_path or stable_path(payload, prefix=path_prefix),
         "published_at": item.published_at,
@@ -2509,21 +2515,14 @@ def _apply_decision(
         path = stable_path(lease.payload, prefix=settings.path_prefix)
         product = {
             **lease.payload,
-            "manufacturer": decision.get("manufacturer")
-            or lease.payload.get("brand_code"),
+            "manufacturer": manufacturer_display_name(lease.payload, decision),
             "model": decision.get("model") or lease.payload.get("product_name"),
         }
-        title = " ".join(
-            str(
-                decision.get("model")
-                or lease.payload.get("product_name")
-                or lease.product_id
-            ).split()
-        )
+        title = " ".join(product_display_title(lease.payload, decision).split())
         summary = " ".join(str(decision.get("summary") or "").split())
         description = (
             summary or f"Datasheet and cited specifications for {title}."
-        )[:500]
+        )[:255]
         managed = render_product_page(
             product, decision, datetime.now(timezone.utc)
         )
@@ -2677,10 +2676,12 @@ def _nonpublish_decision(
         "outcome": outcome,
         "confidence": 1.0,
         "manufacturer": "",
+        "manufacturer_zh": "",
         "model": preferred_catalogue_model(
             lease.product_id,
             lease.payload.get("product_name"),
         ),
+        "display_title_zh": "",
         "product_category": "",
         "summary": "",
         "review_summary": "",

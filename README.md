@@ -98,6 +98,12 @@ state database is separate from the catalogue, n8n, and Wiki.js databases.
   are visible as citation candidates.
   The model may return only a final proposal or one of six fixed evidence gaps
   with one or two locally validated, exact-model-bound supplemental queries.
+- Keeps canonical manufacturer and model fields separate from Wiki presentation.
+  A publish proposal must provide Simplified Chinese display copy for the title,
+  manufacturer label, product category, and summary. The renderer preserves the
+  canonical model and manufacturer alongside those localized labels, so
+  translation cannot authorize or replace a source identity. Wiki.js page
+  descriptions are capped at its 255-character database limit.
 - Lets the model classify matching generic hardware such as screws, bolts,
   nuts, and washers as out of scope, without using `family_code` for routing.
   The local gate requires an exact contiguous quote tying the complete product

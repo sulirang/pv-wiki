@@ -210,9 +210,11 @@ class RenderTests(unittest.TestCase):
                 "outcome": "publish",
                 "confidence": 0.93,
                 "manufacturer": "Acme",
+                "manufacturer_zh": "艾克米（Acme）",
                 "model": "PV-42",
+                "display_title_zh": "PV-42 商用光伏并网逆变器",
                 "product_category": "光伏逆变器",
-                "summary": "Acme PV-42 is a grid-connected inverter for commercial rooftops.",
+                "summary": "艾克米 PV-42 是一款面向商用屋顶的光伏并网逆变器。",
                 "review_summary": "Installers praise its compact enclosure and clear commissioning workflow.",
                 "datasheets": [
                     {
@@ -254,7 +256,14 @@ class RenderTests(unittest.TestCase):
             },
         )
 
+        self.assertIn("# PV-42 商用光伏并网逆变器", rendered)
+        self.assertIn("| 品牌/制造商 | 艾克米（Acme） |", rendered)
         self.assertIn("| 产品类别 | 光伏逆变器 |", rendered)
+        self.assertIn("| 产品名称 | PV-42 商用光伏并网逆变器 |", rendered)
+        self.assertIn(
+            "艾克米 PV-42 是一款面向商用屋顶的光伏并网逆变器。",
+            rendered,
+        )
         self.assertIn("| 直流输入 | Input voltage | 48 V |", rendered)
         self.assertIn("**市场与用户反馈：**", rendered)
         self.assertIn("（官方数据表）", rendered)

@@ -259,7 +259,9 @@ _TOP_LEVEL = frozenset(
         "outcome",
         "confidence",
         "manufacturer",
+        "manufacturer_zh",
         "model",
+        "display_title_zh",
         "product_category",
         "summary",
         "review_summary",
@@ -273,6 +275,7 @@ _TOP_LEVEL = frozenset(
         "conflicts",
     }
 )
+_HAN_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 
 class DecisionError(ValueError):
@@ -301,6 +304,26 @@ def _text(value: Any, field: str, *, required: bool = False, limit: int = 2000) 
     if len(value) > limit:
         raise DecisionError(f"{field} exceeds {limit} characters")
     return value
+
+
+def _chinese_display_text(
+    value: Any,
+    field: str,
+    *,
+    required: bool = False,
+    limit: int = 2000,
+) -> str:
+    """Validate reader-facing Simplified Chinese display copy.
+
+    Canonical manufacturer/model fields remain separate and continue to own
+    identity and source verification. This helper only constrains display
+    copy, so translating a label cannot authorize a manufacturer or product.
+    """
+
+    text = _text(value, field, required=required, limit=limit)
+    if text and _HAN_TEXT_RE.search(text) is None:
+        raise DecisionError(f"{field} must contain Simplified Chinese")
+    return text
 
 
 def _confidence(value: Any, field: str) -> float:
@@ -1474,9 +1497,44 @@ def validate_decision(
             "catalogue brand identity"
         )
     model = _text(raw.get("model"), "model", limit=300)
+    display_title_zh = _text(
+        raw.get("display_title_zh"),
+        "display_title_zh",
+        limit=200,
+    )
+    manufacturer_zh = _text(
+        raw.get("manufacturer_zh"),
+        "manufacturer_zh",
+        limit=200,
+    )
     product_category = canonical_product_category(
         _text(raw.get("product_category"), "product_category", limit=100)
     )
+    if outcome == "publish":
+        display_title_zh = _chinese_display_text(
+            display_title_zh,
+            "display_title_zh",
+            required=True,
+            limit=200,
+        )
+        manufacturer_zh = _chinese_display_text(
+            manufacturer_zh,
+            "manufacturer_zh",
+            required=True,
+            limit=200,
+        )
+        product_category = _chinese_display_text(
+            product_category,
+            "product_category",
+            required=True,
+            limit=100,
+        )
+        summary = _chinese_display_text(
+            summary,
+            "summary",
+            required=True,
+            limit=2000,
+        )
     catalogue_name = expected_product_name or ""
     model_is_catalogue_bound = model_matches_catalogue_identity(
         model,
@@ -2126,7 +2184,9 @@ def validate_decision(
         "outcome": outcome,
         "confidence": confidence,
         "manufacturer": manufacturer,
+        "manufacturer_zh": manufacturer_zh,
         "model": model,
+        "display_title_zh": display_title_zh,
         "product_category": product_category,
         "summary": summary,
         "review_summary": review_summary,
