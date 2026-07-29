@@ -14,7 +14,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v11"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v12"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v5"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -229,8 +229,8 @@ _RAW_CLAIM_SUFFIX_BLOCK_RE = re.compile(
     r"[\u3400-\u9fff])"
 )
 _HAN_NUMBER_PATTERN = (
-    r"[零〇一二两三四五六七八九十百千万亿"
-    r"壹贰叁肆伍陆柒捌玖拾佰仟萬单双俩半]+"
+    r"[零〇○一二两兩三四五六七八九十百千万萬亿億"
+    r"壹贰貳叁參肆伍陆陸柒捌玖拾佰仟单双單雙俩倆半]+"
 )
 _HAN_NUMERIC_UNIT_RE = re.compile(
     rf"{_HAN_NUMBER_PATTERN}\s*(?:{_UNIT_TOKEN_PATTERN})"
@@ -253,10 +253,90 @@ _HAN_ENGINEERING_TOPOLOGY_RE = re.compile(
     r"(?:相)?线制|电平(?:拓扑|结构)?|相制)",
     re.IGNORECASE,
 )
+_HAN_DERIVED_METRIC_RE = re.compile(
+    rf"(?:百分之{_HAN_NUMBER_PATTERN}|"
+    rf"(?:{_HAN_NUMBER_PATTERN}又)?{_HAN_NUMBER_PATTERN}分之"
+    rf"{_HAN_NUMBER_PATTERN}|{_HAN_NUMBER_PATTERN}[点點]"
+    rf"{_HAN_NUMBER_PATTERN}|{_HAN_NUMBER_PATTERN}\s*"
+    rf"(?:倍|成|折|比(?:例|值)?)|"
+    rf"{_HAN_NUMBER_PATTERN}\s*个百分点|"
+    rf"{_HAN_NUMBER_PATTERN}\s*[∶:：]\s*{_HAN_NUMBER_PATTERN})",
+    re.IGNORECASE,
+)
+_HAN_IMPLICIT_DERIVED_METRIC_RE = re.compile(
+    r"(?:(?:一|壹)半(?!导体|導體)|半数|半數|减半|減半|折半|"
+    r"(?<!针)(?<!針)对半(?!导体|導體)|對半(?!導體)|"
+    r"翻\s*(?:了\s*)?(?:(?:一|壹|二|两|兩|貳)\s*)?番(?!茄)|翻倍|"
+    r"(?:数|數|几|幾|若干)倍|倍(?:減|减)|"
+    r"(?:能力|功率|容量|数值|數值|规模|規模|输出|輸出|输入|輸入|"
+    r"电压|電壓|电流|電流|效率|数量|數量|幅度|水平|结果|結果)"
+    r"\s*(?:已经|已經|已|将|將|会|會|可|能够|能夠)?\s*加倍|"
+    r"(?:呈|为|為|达到|達到|实现|實現|形成|发生|發生)\s*"
+    r"(?:加倍|倍增|成倍)(?:趋势|趨勢|关系|關係|结果|結果|幅度|"
+    r"水平|增长|增長|增加|提升|扩大|擴大|下降|变化|變化|增幅|降幅)?|"
+    r"(?:加倍|倍增|成倍)\s*(?:趋势|趨勢|关系|關係|结果|結果|"
+    r"幅度|水平|增长|增長|增加|提升|扩大|擴大|下降|变化|變化|"
+    r"增幅|降幅))",
+    re.IGNORECASE,
+)
+_HAN_COUNT_CIRCUMLOCUTION_RE = re.compile(
+    rf"(?:{_HAN_NUMBER_PATTERN}\s*(?:MPPT|通道|回路|支路|线路|線路|"
+    r"端口|接口|模块|模組|组串|組串|跟踪器|追踪器|追蹤器|"
+    r"跟踪通道|追踪通道|追蹤通道|跟踪回路|追踪回路|追蹤回路)|"
+    rf"{_HAN_NUMBER_PATTERN}\s*(?:个|個|项|項|路|组|組|套|台|相|"
+    r"对|對|只|条|條)\s*[\u3400-\u9fff]{0,24}"
+    r"(?:MPPT|通道|回路|支路|线路|線路|端口|接口|模块|模組|"
+    r"组串|組串|跟踪器|追踪器|追蹤器|跟踪通道|追踪通道|"
+    r"追蹤通道|跟踪回路|追踪回路|追蹤回路))",
+    re.IGNORECASE,
+)
+_DERIVED_ARITHMETIC_RESULT_RE = re.compile(
+    r"(?:总和|總和|合计|合計|加总|加總|之和|差值|之差|乘积|乘積|"
+    r"之积|之積|商值|之商|比值|比率|比例|倍数|倍數|容配比|利用率)"
+    r"[\s，,：:]{0,12}(?:为|為|是(?!否|不)|就是|即|即为|即為|恰为|恰為|"
+    r"等于|等於|达到|達到)|"
+    r"(?:相加|加上|相减|相減|减去|減去|相乘|乘以|相除|除以|"
+    r"加总|加總|计算|計算)[^；;。！？!?]{0,80}?"
+    r"(?:为|為|是(?!否|不)|就是|即|即为|即為|恰为|恰為|等于|等於|"
+    r"得到|得出|可得|计算得|計算得|推导得|推導得|获得|獲得)|"
+    r"(?:等于|等於|相当于|相當於|就是|即|即为|即為|恰为|恰為)"
+    r"[^；;。！？!?]{0,80}?(?:总和|總和|之和|差值|之差|乘积|乘積|"
+    r"之积|之積|商值|之商|比值|比率|比例|倍数|倍數|容配比|利用率)|"
+    r"\b(?:sum|difference|product|quotient|ratio|multiple)\s+"
+    r"(?:is|equals?)\b|\b(?:calculated|derived)\s+(?:as|to be)\b",
+    re.IGNORECASE,
+)
+_MULTI_ROW_REFERENCE_RE = re.compile(
+    r"(?:两者|兩者|二者|双方|雙方|前者.{0,24}后者|前者.{0,24}後者|"
+    r"上述两项|上述兩項|这两项|這兩項|两个参数|兩個參數)"
+)
+_ENGLISH_NUMBER_WORD_PATTERN = (
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+    r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    r"hundred|half)"
+)
+_ENGLISH_DERIVED_METRIC_RE = re.compile(
+    rf"(?<![A-Za-z])(?:{_ENGLISH_NUMBER_WORD_PATTERN}\s+point\s+"
+    rf"{_ENGLISH_NUMBER_WORD_PATTERN}(?:\s+(?:times?|fold|percent))?|"
+    rf"{_ENGLISH_NUMBER_WORD_PATTERN}(?:\s+and\s+(?:a\s+)?half)?"
+    rf"\s+(?:times?|fold|percent)|twice|one[-\s]+half|"
+    r"(?:has|have|had|is|was|were)\s+doubled|"
+    r"(?:is|equals?|becomes?|became)\s+double"
+    r"(?!\s+(?:insulation|isolation|pole|stage|layer|winding))|"
+    rf"{_ENGLISH_NUMBER_WORD_PATTERN}(?:[-\s]+"
+    rf"{_ENGLISH_NUMBER_WORD_PATTERN})?\s+percent)(?![A-Za-z])",
+    re.IGNORECASE,
+)
 _HAN_BRACKETED_UNIT_RE = re.compile(
     rf"{_HAN_NUMBER_PATTERN}\s*[\[(（]\s*(?:{_UNIT_TOKEN_PATTERN})"
 )
 _COUNT_SOURCE_NAME_RE = re.compile(r"\b(?:Number|Count|Quantity)\b", re.IGNORECASE)
+_COUNT_ASSIGNMENT_PATTERN = (
+    r"(?:为|為|是|共(?:有|计|計)?|有|设有|設有|配有|配备|配備|"
+    r"配置(?:为|為|成|了|有)?|采用|採用|体现为|體現為|写成|寫成|"
+    r"改写成|改寫成|达到|達到)"
+)
 _COUNT_CLASSIFIER_RE = re.compile(
     r"^\s*(?P<classifier>个|路|组|项|套)(?![\u3400-\u9fff])"
 )
@@ -652,6 +732,8 @@ def _reject_added_han_numeric_claims(
         _HAN_BRACKETED_UNIT_RE,
         _HAN_CLASSIFIED_COUNT_RE,
         _HAN_ENGINEERING_TOPOLOGY_RE,
+        _HAN_DERIVED_METRIC_RE,
+        _HAN_COUNT_CIRCUMLOCUTION_RE,
         _HAN_COUNT_CLAIM_RE,
     ):
         for match in pattern.finditer(translated):
@@ -1292,6 +1374,91 @@ def _count_classifier_is_professional(label: str, classifier: str) -> bool:
     return classifier in {"个", "路", "组", "项", "套"}
 
 
+def _reject_cross_row_arithmetic_claims(
+    text: str,
+    labels: Sequence[str],
+    field: str,
+) -> None:
+    """Reject definite arithmetic assertions spanning cited rows."""
+
+    active_labels = list(dict.fromkeys(label for label in labels if label))
+    if len(active_labels) < 2:
+        return
+    for sentence_match in re.finditer(r"[^；;。！？!?]+", text):
+        sentence = sentence_match.group()
+        present_labels = {
+            label for label in active_labels if label in sentence
+        }
+        multi_row_reference = len(present_labels) >= 2 or bool(
+            present_labels and _MULTI_ROW_REFERENCE_RE.search(sentence)
+        )
+        if not multi_row_reference:
+            continue
+        label_spans = [
+            label_match.span()
+            for label in present_labels
+            for label_match in re.finditer(re.escape(label), sentence)
+        ]
+        semantic_sentence = sentence
+        for label in sorted(present_labels, key=len, reverse=True):
+            semantic_sentence = semantic_sentence.replace(
+                label,
+                " " * len(label),
+            )
+        for arithmetic_match in _DERIVED_ARITHMETIC_RESULT_RE.finditer(
+            semantic_sentence
+        ):
+            result_label_follows = any(
+                start >= arithmetic_match.end()
+                and start - arithmetic_match.end() <= 80
+                for start, _end in label_spans
+            )
+            if result_label_follows:
+                raise ParameterAnalysisError(
+                    f"{field} contains a prohibited cross-row arithmetic result"
+                )
+            matched_text = arithmetic_match.group().rstrip()
+            immediate_suffix = semantic_sentence[
+                arithmetic_match.end() : arithmetic_match.end() + 16
+            ]
+            asks_for_unknown_result = bool(
+                re.search(r"(?:达到|達到)$", matched_text)
+                and re.match(r"\s*(?:何种|何種|如何|多少)", immediate_suffix)
+            )
+            explains_source = bool(
+                re.search(r"是$", matched_text)
+                and re.match(r"\s*由(?:于|於)?", immediate_suffix)
+            )
+            if asks_for_unknown_result or explains_source:
+                continue
+            raise ParameterAnalysisError(
+                f"{field} contains a prohibited cross-row arithmetic result"
+            )
+
+def _reject_han_count_restatements(
+    text: str,
+    basis_rows: Sequence[Mapping[str, Any]],
+    labels: Sequence[str],
+    field: str,
+) -> None:
+    """Reject Chinese-number restatements of an actual count parameter."""
+
+    for row, label in zip(basis_rows, labels, strict=True):
+        source_name = unicodedata.normalize("NFKC", str(row["name"]))
+        if not label or _COUNT_SOURCE_NAME_RE.search(source_name) is None:
+            continue
+        count_claim = re.compile(
+            rf"{re.escape(label)}\s*(?:参数|方面)?\s*(?:被\s*)?"
+            rf"{_COUNT_ASSIGNMENT_PATTERN}\s*"
+            rf"(?:约|約|大约|大約)?\s*{_HAN_NUMBER_PATTERN}",
+            re.IGNORECASE,
+        )
+        if count_claim.search(text):
+            raise ParameterAnalysisError(
+                f"{field} contains unsupported Chinese numeric text"
+            )
+
+
 def _measurement_spans(
     text: str,
     exact_measurements: Mapping[
@@ -1468,6 +1635,10 @@ def _measurement_spans(
         _HAN_BRACKETED_UNIT_RE,
         _HAN_CLASSIFIED_COUNT_RE,
         _HAN_ENGINEERING_TOPOLOGY_RE,
+        _HAN_DERIVED_METRIC_RE,
+        _HAN_IMPLICIT_DERIVED_METRIC_RE,
+        _HAN_COUNT_CIRCUMLOCUTION_RE,
+        _ENGLISH_DERIVED_METRIC_RE,
         _HAN_COUNT_CLAIM_RE,
     ):
         for han_claim in pattern.finditer(text):
@@ -1477,6 +1648,46 @@ def _measurement_spans(
             invalid[region] = _bounded_descriptor(han_claim.group())
             occupied.append(region)
     return verified, invalid
+
+
+def _reject_unreferenced_parameter_labels(
+    text_values: Sequence[str],
+    referenced_ids: Sequence[str],
+    labels_by_id: Mapping[str, str],
+    field: str,
+) -> None:
+    """Require every mentioned complete parameter label to be cited."""
+
+    referenced = set(referenced_ids)
+    referenced_labels = [
+        label for parameter_id, label in labels_by_id.items()
+        if parameter_id in referenced and label
+    ]
+    unreferenced = [
+        (parameter_id, label)
+        for parameter_id, label in labels_by_id.items()
+        if parameter_id not in referenced and label
+    ]
+    offending_ids: list[str] = []
+    for raw_text in text_values:
+        text = unicodedata.normalize("NFKC", raw_text)
+        referenced_spans = [
+            match.span()
+            for label in referenced_labels
+            for match in re.finditer(re.escape(label), text)
+        ]
+        for parameter_id, label in unreferenced:
+            for match in re.finditer(re.escape(label), text):
+                if _span_is_covered(match.span(), referenced_spans):
+                    continue
+                offending_ids.append(parameter_id)
+                break
+    if offending_ids:
+        raise ParameterAnalysisError(
+            f"{field} contains numeric text or an unreferenced parameter label; "
+            f"add these IDs to basis_parameter_ids: "
+            f"{', '.join(list(dict.fromkeys(offending_ids))[:8])}"
+        )
 
 
 def _ground_numbers(
@@ -1531,6 +1742,13 @@ def _ground_numbers(
     invalid_measurements: list[str] = []
     for raw_text in text_values:
         text = unicodedata.normalize("NFKC", raw_text)
+        _reject_han_count_restatements(
+            text,
+            basis_rows,
+            normalized_labels,
+            field,
+        )
+        _reject_cross_row_arithmetic_claims(text, normalized_labels, field)
         verified_regions, invalid_regions = _measurement_spans(
             text,
             exact_measurements,
@@ -1695,6 +1913,10 @@ def validate_parameter_enrichment(
     translation_by_id = {
         item["parameter_id"]: item for item in translations
     }
+    narrative_label_by_id = {
+        parameter_id: _normalized_analysis_label(item["name_zh"])
+        for parameter_id, item in translation_by_id.items()
+    }
 
     sections_raw = raw.get("sections")
     minimum_sections = 5 if len(source_rows) >= 30 else (
@@ -1838,8 +2060,15 @@ def validate_parameter_enrichment(
             )
             basis_rows = [source_by_id[item] for item in basis_ids]
             basis_labels = [translation_by_id[item]["name_zh"] for item in basis_ids]
+            paragraph_text_values = [analysis_zh, *conditions, *limitations]
+            _reject_unreferenced_parameter_labels(
+                paragraph_text_values,
+                basis_ids,
+                narrative_label_by_id,
+                paragraph_prefix,
+            )
             _ground_numbers(
-                [analysis_zh, *conditions, *limitations],
+                paragraph_text_values,
                 basis_rows,
                 paragraph_prefix,
                 basis_labels=basis_labels,

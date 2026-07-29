@@ -778,6 +778,16 @@ class PromptTests(unittest.TestCase):
             "no_numeric_restatement",
             prompt["numeric_narrative_mode_rules"],
         )
+        paragraph_rules = " ".join(prompt["paragraph_construction_rules"])
+        self.assertIn("Never calculate or state a new numeric result", paragraph_rules)
+        self.assertIn("Never transliterate a rejected result", paragraph_rules)
+        self.assertIn("cite every complete parameter label", paragraph_rules)
+        self.assertIn("newly derived ratios", paragraph_rules)
+        self.assertIn("二, 两, 三, 双", paragraph_rules)
+        self.assertIn(
+            "apply equally to analysis_zh",
+            policy_text,
+        )
         value_contract = prompt["output_contract"]["translations"]["item"][
             "value_zh"
         ]
@@ -1308,6 +1318,15 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertIn("do not repeat numeric standard identifiers", repair_content)
         self.assertIn("technical-token source order and multiplicity", repair_content)
         self.assertIn("professional Arabic count expressions", repair_content)
+        self.assertIn("ratios, multiples, percentages", repair_content)
+        self.assertIn(
+            "transliterating it into Chinese or English number words",
+            repair_content,
+        )
+        self.assertIn("never move an offending result", repair_content)
+        self.assertIn("cite every used complete parameter label", repair_content)
+        self.assertIn("一, 二, 两, 三, or 双", repair_content)
+        self.assertIn("accumulated across prior attempts", repair_content)
         self.assertIn("product name, ID, model, or series", repair_content)
         self.assertIn("Feed-in=3L+N+PE", repair_content)
         self.assertIn("keep value_zh empty", repair_content)
@@ -1317,6 +1336,126 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             "translations must contain exactly one item",
             repair_content,
         )
+
+    def test_parameter_analysis_accumulates_two_repair_requirements(self) -> None:
+        calls: list[dict] = []
+        derived = valid_parameter_enrichment()
+        derived["sections"][0]["paragraphs"][0]["analysis_zh"] += (
+            " 参数之间另行计算得到 1.5 倍。"
+        )
+        responses = [
+            {"translations": [], "sections": [], "overall_limitations_zh": []},
+            derived,
+            valid_parameter_enrichment(),
+        ]
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            result = responses[len(calls) - 1]
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps(result)},
+                        }
+                    ],
+                    "usage": {"total_tokens": 321},
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(max_response_bytes=20_000, max_evidence_chars=12_000),
+            opener=fake_open,
+        )
+        result = client.analyze_parameters(
+            product={"name": "R5-10K-T2-15"},
+            parameters=analysis_parameters(),
+        )
+
+        self.assertEqual(3, client.last_parameter_analysis_provider_requests)
+        self.assertEqual(3, len(calls))
+        self.assertTrue(result["input_complete"])
+        final_repair = calls[2]["messages"][-1]["content"]
+        self.assertIn("Retry again", final_repair)
+        self.assertIn(
+            "translations must contain exactly one item",
+            final_repair,
+        )
+        self.assertIn("numeric text", final_repair)
+
+    def test_parameter_analysis_stops_after_three_invalid_outputs(self) -> None:
+        calls: list[dict] = []
+        invalid = {"translations": [], "sections": [], "overall_limitations_zh": []}
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps(invalid)},
+                        }
+                    ]
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(max_response_bytes=20_000, max_evidence_chars=12_000),
+            opener=fake_open,
+        )
+        with self.assertRaises(ai.ParameterAnalysisError):
+            client.analyze_parameters(
+                product={"name": "R5-10K-T2-15"},
+                parameters=analysis_parameters(),
+            )
+
+        self.assertEqual(3, client.last_parameter_analysis_provider_requests)
+        self.assertEqual(3, len(calls))
+
+    def test_parameter_analysis_resets_audit_state_before_prompt_build(
+        self,
+    ) -> None:
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del request, timeout
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": json.dumps(
+                                    valid_parameter_enrichment()
+                                )
+                            },
+                        }
+                    ],
+                    "usage": {"total_tokens": 99},
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(max_response_bytes=20_000, max_evidence_chars=12_000),
+            opener=fake_open,
+        )
+        client.analyze_parameters(
+            product={"name": "R5-10K-T2-15"},
+            parameters=analysis_parameters(),
+        )
+        self.assertEqual(1, client.last_parameter_analysis_provider_requests)
+        self.assertTrue(client.last_response_metadata)
+
+        with self.assertRaises(ai.ParameterAnalysisError):
+            client.analyze_parameters(
+                product={"name": "R5-10K-T2-15"},
+                parameters=[],
+            )
+
+        self.assertEqual(0, client.last_parameter_analysis_provider_requests)
+        self.assertEqual([], client.last_response_metadata)
 
     def test_optional_thinking_controls_are_sent_as_provider_extensions(
         self,

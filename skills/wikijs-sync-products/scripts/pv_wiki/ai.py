@@ -53,6 +53,7 @@ MAX_RESEARCH_QUERY_CHARS = 400
 MAX_RESEARCH_QUERIES = 2
 MAX_RESEARCH_QUERY_HISTORY = 20
 MAX_VALIDATION_FEEDBACK_CHARS = 300
+PARAMETER_ANALYSIS_MAX_PROVIDER_REQUESTS = 3
 
 
 class ResearchGap(str, Enum):
@@ -1400,7 +1401,8 @@ def build_parameter_analysis_messages(
             ),
         },
         "paragraph_construction_rules": [
-            "Choose basis_parameter_ids before writing. Start every non-limitation "
+            "Choose basis_parameter_ids before writing and cite every complete "
+            "parameter label used in any paragraph field. Start every non-limitation "
             "paragraph directly with the complete name_zh narrative label core of "
             "a referenced row; never start with a product introduction.",
             "Never copy the product name, ID, model, series, or any fragment of them "
@@ -1412,7 +1414,24 @@ def build_parameter_analysis_messages(
             "Never write Chinese-number topology or count phrases such as 三相 or "
             "双路. For a no_numeric_restatement row such as Feed-in=3L+N+PE, never "
             "write 3L, 3L+N+PE, or a numeric translation; discuss it qualitatively "
-            "without numeric text or omit it.",
+            "without any numeric value or synonym, including Arabic digits, Chinese "
+            "or English number words, fractions, percentages, topology codes, or "
+            "ratio, multiple, and 倍 expressions; otherwise omit it.",
+            "Never calculate or state a new numeric result from multiple rows, even "
+            "when the arithmetic is exact. Do not write newly derived ratios, multiples, "
+            "percentages, sums, differences, products, quotients, oversizing factors, "
+            "or utilization values. If one source row does not contain the exact "
+            "expression, describe the relationship only qualitatively without any "
+            "numeric value or synonym in Arabic digits, Chinese or English number "
+            "words, fractions, percentages, ratio or multiple terms, or 倍 expressions. "
+            "Never transliterate a rejected result into another numeric notation. "
+            "This remains forbidden when the result equals another supplied row or "
+            "is disguised as 一半, 翻番, or 倍增.",
+            "Never spell a parameter count with Chinese-number words including 一, "
+            "二, 两, 三, 双, or their formal variants. For a narrated count, use only "
+            "the exact Arabic source expression and an approved classifier immediately "
+            "after the complete name_zh narrative label core. Do not replace it with "
+            "双通道, 两个独立跟踪通道, or formal Chinese numerals.",
         ],
         "controlled_section_translations": SECTION_TRANSLATIONS,
         "controlled_terms": {
@@ -1500,22 +1519,15 @@ def build_parameter_analysis_messages(
                                 "a limitation; never use ranges, labels, or objects"
                             ),
                             "analysis_zh": (
-                                "one professional Chinese paragraph, 40-500 "
-                                "characters; every numeric expression must be backed "
-                                "by a referenced parameter and preserve its operator, "
-                                "sign, complete range, order, decimal meaning, and "
-                                "adjacent unit; only exact W/kW or Wp/kWp conversion "
-                                "backed by a referenced scalar is permitted; every "
-                                "numeric claim, including a numeric technical token, "
-                                "must have that parameter's narrative label core "
-                                "immediately before it: use full name_zh after removing "
-                                "only bracketed unit/technical annotations, STC/NMOT, "
-                                "and @<number+unit> working-point annotations; use "
-                                "<完整语义 name_zh 核心>为<已验证完整表达式+单位>. "
-                                "Each non-limitation paragraph must name at least one "
-                                "referenced label core; only an exact technical-token "
-                                "list from one source row may share one label, while "
-                                "preserving that row's token order and multiplicity"
+                                "one professional Chinese paragraph, 40-500 characters; "
+                                "obey numeric_narrative_mode_rules and analysis_policy. "
+                                "Every numeric claim must put its referenced parameter's "
+                                "narrative label core immediately before the complete "
+                                "verified expression and adjacent unit; use "
+                                "<完整语义 name_zh 核心>为<已验证完整表达式+单位>. Each "
+                                "non-limitation paragraph must name a referenced core; "
+                                "only an exact technical-token list from one source row "
+                                "may share one label, preserving token order and multiplicity"
                             ),
                             "conditions_zh": (
                                 "0-2 explicit conditions, each professional Chinese"
@@ -1558,8 +1570,10 @@ def build_parameter_analysis_messages(
             "exact_technical_tokens_only, use only listed exact tokens in their source "
             "order and without repetition; never copy unlisted neighboring source "
             "characters or translate a token into a Chinese-number phrase; for "
-            "no_numeric_restatement, discuss the row qualitatively without digits, "
-            "topology codes, or Chinese-number equivalents.",
+            "no_numeric_restatement, discuss the row qualitatively without any "
+            "numeric value or synonym in Arabic digits, Chinese or English number "
+            "words, fractions, percentages, topology codes, ratio or multiple terms, "
+            "or 倍 expressions.",
             "Preserve each complete numeric expression: comparison operator, explicit "
             "sign, range endpoints and order, decimal or thousands meaning, and unit. "
             "Write the expression directly with its unit; never separate them with a "
@@ -1577,6 +1591,18 @@ def build_parameter_analysis_messages(
             "The runtime verifies exact W/kW and Wp/kWp conversions against each "
             "paragraph's referenced scalar parameters. Never convert temperatures, "
             "dimensions, currents, voltages, ratios, or any other unit.",
+            "Never calculate a new numeric metric across parameters, including a "
+            "ratio, multiple, percentage, sum, difference, product, or quotient. "
+            "Even an arithmetically exact derived value is not source evidence; "
+            "state only a qualitative relationship without any numeric value or "
+            "synonym in Arabic digits, Chinese or English number words, fractions, "
+            "percentages, ratio or multiple terms, or 倍 expressions. Never "
+            "transliterate a rejected result into another numeric notation. This "
+            "remains forbidden when the result equals another supplied row or is "
+            "disguised as 一半, 翻番, or 倍增.",
+            "All numeric-narrative and no-derived-metric rules apply equally to "
+            "analysis_zh, conditions_zh, limitations_zh, and overall_limitations_zh. "
+            "Never move an offending result to another field.",
             "Never claim suitability for a residence, commercial site, climate, "
             "grid code, string design, component, or project without the missing "
             "site-specific inputs. State the limitation instead.",
@@ -2787,13 +2813,13 @@ class OpenAICompatibleClient:
     ) -> dict[str, Any]:
         """Translate every verified parameter and return grounded analysis."""
 
+        self.last_parameter_analysis_provider_requests = 0
+        self._reset_response_metadata()
         messages = build_parameter_analysis_messages(
             product=product,
             parameters=parameters,
             max_evidence_chars=self.settings.max_evidence_chars,
         )
-        self.last_parameter_analysis_provider_requests = 0
-        self._reset_response_metadata()
 
         def post(
             request_messages: Sequence[Mapping[str, str]],
@@ -2801,56 +2827,82 @@ class OpenAICompatibleClient:
             self.last_parameter_analysis_provider_requests += 1
             return self._post(request_messages)
 
-        try:
-            return validate_parameter_enrichment(
-                post(messages),
-                parameters,
-            )
-        except (AIInvalidOutputError, ParameterAnalysisError) as error:
-            validation_requirement = " ".join(str(error).split())[:300] or (
-                "output must satisfy the documented contract"
-            )
-            repair_messages = [
-                *messages,
-                {
-                    "role": "user",
-                    "content": (
-                        "Retry once. Return one complete JSON object matching the "
-                        "parameter-analysis output contract. Include exactly one "
-                        "translation for every input parameter in the original "
-                        "order; keep value_zh empty for composite topology codes "
-                        "such as 3L+N+PE; preserve every protected token and controlled "
-                        "term; reference only supplied parameter IDs; follow every "
-                        "row's numeric_narrative mode and use only "
-                        "exact source numeric expressions whenever possible; only "
-                        "use exact W/kW or Wp/kWp conversions with the matching "
-                        "narrative label core immediately before the value; every "
-                        "non-limitation paragraph must start directly with a "
-                        "referenced complete name_zh narrative label core; delete "
-                        "every clause that copies the product name, ID, model, or "
-                        "series, or uses a number plus power unit as a product class, "
-                        "level, model, product, or inverter phrase; never write "
-                        "Chinese-number topology or count phrases such as 三相 or "
-                        "双路; for a no_numeric_restatement row such as "
-                        "Feed-in=3L+N+PE, never write 3L, 3L+N+PE, or a numeric "
-                        "translation; discuss it qualitatively or omit it; every "
-                        "non-limitation paragraph must name a referenced label core; "
-                        "preserve technical-token source order and multiplicity; use "
-                        "only professional Arabic count expressions; do not repeat "
-                        "numeric standard identifiers; include professional multi-"
-                        "section Chinese analysis and at least "
-                        "one overall limitation. Keep it compact: normally one "
-                        "60-240 character paragraph per section, a second only if "
-                        "essential, and no repeated conditions or limitations. "
-                        "No prose or Markdown outside JSON. Local validation "
-                        f"requirement: {validation_requirement}."
-                    ),
-                },
-            ]
-            return validate_parameter_enrichment(
-                post(repair_messages),
-                parameters,
-            )
+        validation_requirements: list[str] = []
+        request_messages = messages
+        for provider_attempt in range(PARAMETER_ANALYSIS_MAX_PROVIDER_REQUESTS):
+            try:
+                return validate_parameter_enrichment(
+                    post(request_messages),
+                    parameters,
+                )
+            except (AIInvalidOutputError, ParameterAnalysisError) as error:
+                validation_requirement = " ".join(str(error).split())[:300] or (
+                    "output must satisfy the documented contract"
+                )
+                if validation_requirement not in validation_requirements:
+                    validation_requirements.append(validation_requirement)
+                if (
+                    provider_attempt + 1
+                    >= PARAMETER_ANALYSIS_MAX_PROVIDER_REQUESTS
+                ):
+                    raise
+                retry_word = "once" if provider_attempt == 0 else "again"
+                accumulated_requirements = " | ".join(validation_requirements)
+                request_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Retry {retry_word}. Return one complete JSON object "
+                            "matching the parameter-analysis output contract. Include "
+                            "exactly one translation for every input parameter in the "
+                            "original order; keep value_zh empty for composite topology "
+                            "codes such as 3L+N+PE; preserve every protected token and "
+                            "controlled term; reference only supplied parameter IDs and "
+                            "cite every used complete parameter label; "
+                            "follow every row's numeric_narrative mode; an exact source "
+                            "numeric expression is mandatory for every narrated number; "
+                            "only use exact W/kW or Wp/kWp conversions with the matching "
+                            "narrative label core immediately before the value; never "
+                            "calculate or state a numeric result across rows, including "
+                            "ratios, multiples, percentages, sums, differences, products, "
+                            "or quotients, even if the result equals another supplied "
+                            "row; delete every derived result, ratio or 倍 "
+                            "expression instead of replacing it with another calculation "
+                            "or transliterating it into Chinese or English number words, "
+                            "fractions, percentages, another numeric notation, or an "
+                            "implicit phrase such as 一半, 翻番, or 倍增; every "
+                            "non-limitation "
+                            "paragraph must start directly with a referenced complete "
+                            "name_zh narrative label core; delete every clause that "
+                            "copies the product name, ID, model, or series, or uses a "
+                            "number plus power unit as a product class, level, model, "
+                            "product, or inverter phrase; never spell a count with "
+                            "Chinese-number words including 一, 二, 两, 三, or 双; use "
+                            "only professional Arabic count expressions copied from one "
+                            "cited row with an approved classifier; never use 双通道, "
+                            "两个独立跟踪通道, 一对跟踪器, 两只跟踪器, or formal "
+                            "Chinese numerals; for a "
+                            "no_numeric_restatement row such as Feed-in=3L+N+PE, never "
+                            "write 3L, 3L+N+PE, 三相, 三线制, or a numeric translation; "
+                            "discuss it qualitatively or omit it; every non-limitation "
+                            "paragraph must name a referenced label core; preserve "
+                            "technical-token source order and multiplicity; do not repeat "
+                            "numeric standard identifiers; include professional multi-"
+                            "section Chinese analysis and at least one overall limitation. "
+                            "Keep it compact: normally one 60-240 character paragraph "
+                            "per section, a second only if essential, and no repeated "
+                            "conditions or limitations. All numeric and no-derived-metric "
+                            "rules apply equally to analysis_zh, conditions_zh, "
+                            "limitations_zh, and overall_limitations_zh; never move an "
+                            "offending result to another field. Omit an optional offending "
+                            "claim instead of inventing a replacement. No prose or Markdown "
+                            "outside JSON. Local validation requirements accumulated "
+                            f"across prior attempts: {accumulated_requirements}."
+                        ),
+                    },
+                ]
+        raise AssertionError("parameter analysis retry loop is unreachable")
 
     def decide(
         self,

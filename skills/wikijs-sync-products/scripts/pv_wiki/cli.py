@@ -1928,10 +1928,11 @@ def _ai_response_audit(client: Any) -> dict[str, Any]:
             if total <= 1_000_000_000:
                 usage_totals[key] = total
 
-    for item in metadata[:2]:
+    for item in metadata[:3]:
         reason = getattr(item, "finish_reason", None)
         if (
-            isinstance(reason, str)
+            len(finish_reasons) < 2
+            and isinstance(reason, str)
             and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", reason)
         ):
             finish_reasons.append(reason)

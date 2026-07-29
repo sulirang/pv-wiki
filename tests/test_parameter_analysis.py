@@ -1434,6 +1434,231 @@ class ParameterAnalysisTests(unittest.TestCase):
                 with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
                     validate_parameter_enrichment(item, parameters())
 
+    def test_rejects_spelled_derived_metrics_in_all_analysis_fields(self) -> None:
+        for claim in (
+            "一点五倍",
+            "壹点伍倍",
+            "一又二分之一倍",
+            "百分之一百五十",
+            "一倍半",
+            "高出一半",
+            "翻一番",
+            "倍增",
+            "输出能力已经翻番",
+            "输出能力翻番",
+            "输出能力翻了一番",
+            "输出能力翻了番",
+            "输出能力翻两番",
+            "输入规模呈倍增趋势",
+            "该功率减半",
+            "one point five times",
+            "is twice",
+            "is one half",
+            "has doubled",
+            "is double",
+            "fifty percent",
+        ):
+            with self.subTest(claim=claim):
+                item = copy.deepcopy(enrichment())
+                item["sections"][0]["paragraphs"][0]["analysis_zh"] += (
+                    f" 参数之间另行派生的关系为{claim}。"
+                )
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "numeric text",
+                ):
+                    validate_parameter_enrichment(item, parameters())
+
+        for field in ("conditions_zh", "limitations_zh"):
+            with self.subTest(field=field):
+                item = copy.deepcopy(enrichment())
+                item["sections"][0]["paragraphs"][0][field] = [
+                    "不得将参数间派生结果改写成一点五倍后移入其他字段。"
+                ]
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "numeric text",
+                ):
+                    validate_parameter_enrichment(item, parameters())
+
+        overall = copy.deepcopy(enrichment())
+        overall["overall_limitations_zh"] = [
+            "不得将参数间派生结果改写成一点五倍后移入总体限制。"
+        ]
+        with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
+            validate_parameter_enrichment(overall, parameters())
+
+    def test_rejects_cross_row_arithmetic_even_when_result_matches_basis(self) -> None:
+        source = parameters()
+        source[0].update(
+            name="Rated AC Power [W]",
+            section="Output (AC)",
+            value="10000",
+            unit="W",
+        )
+        source[1].update(
+            name="Backup AC Power [W]",
+            section="Output (AC)",
+            value="5000",
+            unit="W",
+        )
+        source[2].update(
+            name="Max. AC Power [W]",
+            section="Output (AC)",
+            value="15000",
+            unit="W",
+        )
+        item = copy.deepcopy(enrichment())
+        labels = ("额定交流功率 [W]", "备用交流功率 [W]", "最大交流功率 [W]")
+        for translation, label in zip(item["translations"], labels, strict=True):
+            translation["name_zh"] = label
+            translation["section_zh"] = "交流输出（AC）"
+        paragraph = item["sections"][0]["paragraphs"][0]
+        paragraph["basis_parameter_ids"] = ["p001", "p002", "p003"]
+
+        paragraph["analysis_zh"] = (
+            "额定交流功率、备用交流功率与最大交流功率应分别核对；"
+            "数据表参数不应直接用于跨行相加或相减，系统边界仍需结合"
+            "制造商说明与具体应用条件确认。"
+        )
+        validate_parameter_enrichment(item, source)
+
+        qualitative = copy.deepcopy(item)
+        qualitative["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "最大交流功率的利用率达到何种水平仍需结合现场条件评估；"
+            "额定交流功率与备用交流功率仅作为数据表事实分别核对。"
+        )
+        validate_parameter_enrichment(qualitative, source)
+
+        for claim in (
+            "额定交流功率与备用交流功率的总和等于最大交流功率为 15 kW；"
+            "该结果虽等于另一来源行，仍属于禁止发布的跨行计算。",
+            "额定交流功率与备用交流功率的总和，等于最大交流功率为 15 kW；"
+            "逗号不能切断跨行算术结果的校验。",
+            "额定交流功率与备用交流功率的总和即最大交流功率为 15 kW；"
+            "即字不能把派生等式伪装成来源事实。",
+            "额定交流功率加上备用交流功率，得到最大交流功率为 15 kW；"
+            "分隔后的计算动词仍属于跨行派生。",
+            "额定交流功率与备用交流功率合计就是最大交流功率为 15 kW；"
+            "合计关系不得借用第三行相同数值获得授权。",
+            "最大交流功率与额定交流功率的差值等于备用交流功率为 5 kW；"
+            "该结果虽等于另一来源行，仍属于禁止发布的跨行计算。",
+            "最大交流功率等于额定交流功率与备用交流功率之和；"
+            "不写数字也不能发布跨行等式，该断言仍是数据表没有直接给出的计算结论。",
+            "额定交流功率与备用交流功率的总和等于最大交流功率；"
+            "第三行标签本身不能充当派生结果，这仍是数据表没有直接给出的计算结论。",
+            "额定交流功率为 10 kW，备用交流功率为 5 kW；"
+            "两者之和即最大交流功率为 15 kW。",
+            "最大交流功率为 15 kW，额定交流功率为 10 kW；"
+            "两者之差恰为备用交流功率为 5 kW。",
+            "最大交流功率为 15 kW，恰为额定交流功率与备用交流功率之和，"
+            "仍需核对其他条件。",
+            "最大交流功率为 15 kW，等于额定交流功率与备用交流功率之和，"
+            "是否适用仍需评估。",
+            "备用交流功率为 5 kW，恰为最大交流功率与额定交流功率之差，"
+            "需要核对额定条件。",
+        ):
+            with self.subTest(claim=claim):
+                invalid = copy.deepcopy(item)
+                invalid["sections"][0]["paragraphs"][0]["analysis_zh"] = claim
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "cross-row arithmetic",
+                ):
+                    validate_parameter_enrichment(invalid, source)
+
+        for safe_analysis in (
+            "额定交流功率为 10 kW，最大交流功率为 15 kW，两者差值是否"
+            "需要进一步核对仍取决于制造商定义。",
+            "额定交流功率为 10 kW，最大交流功率为 15 kW，两者的差值"
+            "是由不同额定条件造成的，具体定义仍需制造商确认。",
+            "额定交流功率为 10 kW，最大交流功率为 15 kW，最大交流功率"
+            "的利用率达到何种水平仍需结合现场条件评估。",
+            "额定交流功率为 10 kW，最大交流功率为 15 kW，两者总和是否"
+            "具有工程意义仍需结合系统定义评估。",
+        ):
+            with self.subTest(safe_analysis=safe_analysis):
+                safe = copy.deepcopy(item)
+                safe["sections"][0]["paragraphs"][0]["analysis_zh"] = safe_analysis
+                validate_parameter_enrichment(safe, source)
+
+        unreferenced = copy.deepcopy(item)
+        unreferenced_paragraph = unreferenced["sections"][0]["paragraphs"][0]
+        unreferenced_paragraph["basis_parameter_ids"] = ["p003"]
+        unreferenced_paragraph["analysis_zh"] = (
+            "最大交流功率为 15 kW；该来源值恰好等于额定交流功率与"
+            "备用交流功率之和，但后两项未列入本段依据。"
+        )
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            "unreferenced parameter label",
+        ):
+            validate_parameter_enrichment(unreferenced, source)
+
+    def test_accepts_single_row_native_arithmetic_metrics(self) -> None:
+        cases = (
+            (
+                "DC/AC Ratio",
+                "1.5",
+                "",
+                "直流/交流比值",
+                "直流/交流比值为 1.5；该数值直接来自同一数据表参数行，"
+                "分析不再跨行计算其他比例。",
+            ),
+            (
+                "Power Difference [W]",
+                "5000",
+                "W",
+                "功率差值 [W]",
+                "功率差值为 5 kW；该值直接来自同一数据表参数行，并非由"
+                "本段对其他功率参数相减得到。",
+            ),
+            (
+                "Power Sum [W]",
+                "15000",
+                "W",
+                "功率总和 [W]",
+                "功率总和为 15 kW；该值直接来自同一数据表参数行，并非由"
+                "本段对其他功率参数相加得到。",
+            ),
+        )
+        for source_name, source_value, source_unit, label, analysis in cases:
+            with self.subTest(source_name=source_name):
+                source = parameters()
+                source[0].update(
+                    name=source_name,
+                    value=source_value,
+                    unit=source_unit,
+                )
+                item = copy.deepcopy(enrichment())
+                item["translations"][0]["name_zh"] = label
+                paragraph = item["sections"][0]["paragraphs"][0]
+                paragraph["basis_parameter_ids"] = ["p001"]
+                paragraph["analysis_zh"] = analysis
+                validate_parameter_enrichment(item, source)
+
+    def test_accepts_professional_voltage_multiplier_translation(self) -> None:
+        source = parameters()
+        source[0].update(
+            name="Voltage Multiplier Circuit",
+            value="Listed",
+            unit="",
+        )
+        for name_zh in ("电压倍增电路", "电压倍增器"):
+            with self.subTest(name_zh=name_zh):
+                item = translation_enrichment()
+                item["translations"][0]["name_zh"] = name_zh
+                validate_parameter_enrichment(item, source)
+                professional = copy.deepcopy(item)
+                paragraph = professional["sections"][0]["paragraphs"][0]
+                paragraph["basis_parameter_ids"] = ["p001"]
+                paragraph["analysis_zh"] = (
+                    f"{name_zh}涉及集成倍增器、倍增效应与半导体器件术语；"
+                    "工程应用中应加倍关注资料边界，但这些措辞本身不构成"
+                    "新的数值结论。"
+                )
+                validate_parameter_enrichment(professional, source)
+
     def test_rejects_invisible_unicode_format_characters(self) -> None:
         for character in ("\u200b", "\u034f", "\u0301", "\ufe0f"):
             for field in ("analysis_zh", "name_zh", "value_zh"):
@@ -1501,6 +1726,13 @@ class ParameterAnalysisTests(unittest.TestCase):
                 )
                 validate_parameter_enrichment(valid_count, count_source)
 
+        non_count_terms = copy.deepcopy(count_item)
+        non_count_terms["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "MPPT 数量为 2 路；统一跟踪策略与双重绝缘属于普通技术措辞，"
+            "不应被中文计数扫描误判，具体功能仍须依据制造商资料核对。"
+        )
+        validate_parameter_enrichment(non_count_terms, count_source)
+
     def test_rejects_technical_postfixes_and_ungrounded_chinese_counts(self) -> None:
         protection_source = parameters()
         protection_source[0].update(
@@ -1547,6 +1779,18 @@ class ParameterAnalysisTests(unittest.TestCase):
             "MPPT 数量为 2；另称采用四相输出",
             "MPPT 数量为 2；另称配置九组直流输入",
             "MPPT 数量为 2；另称配备半组直流输入",
+            "MPPT 数量采用双通道",
+            "MPPT 数量体现为两个独立跟踪通道",
+            "MPPT 数量为貳路",
+            "MPPT 数量采用一对跟踪器",
+            "MPPT 数量配置两只跟踪器",
+            "MPPT 数量体现为两个完全独立的跟踪通道",
+            "MPPT 数量采用一对相互隔离的跟踪器",
+            "MPPT 数量体现为两条完全独立的最大功率点跟踪路径",
+            "MPPT 数量配置了俩个彼此分离的控制域",
+            "MPPT 数量写成雙重最大功率点跟踪能力",
+            "MPPT 数量方面体现为两条独立的最大功率点跟踪路径",
+            "MPPT 数量参数被写成雙重最大功率点跟踪能力",
         ):
             with self.subTest(claim=claim):
                 invalid = copy.deepcopy(count_item)

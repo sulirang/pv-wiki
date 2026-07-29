@@ -2803,14 +2803,29 @@ class CLITests(unittest.TestCase):
                     "provider_note": "discard",
                 },
             ),
+            ai.AIResponseMetadata(
+                finish_reason="stop",
+                usage={
+                    "prompt_tokens": 120,
+                    "completion_tokens": 6,
+                    "provider_note": "discard",
+                },
+            ),
+            ai.AIResponseMetadata(
+                finish_reason="stop",
+                usage={
+                    "prompt_tokens": 1_000,
+                    "completion_tokens": 1_000,
+                },
+            ),
         ]
 
         self.assertEqual(
             {
                 "finish_reasons": ["length", "stop"],
                 "usage_totals": {
-                    "prompt_tokens": 210,
-                    "completion_tokens": 18,
+                    "prompt_tokens": 330,
+                    "completion_tokens": 24,
                     "reasoning_tokens": 4,
                 },
             },
