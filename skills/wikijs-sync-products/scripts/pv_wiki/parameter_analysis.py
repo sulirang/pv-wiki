@@ -14,8 +14,8 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v14"
-PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v5"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v15"
+PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v6"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
 
@@ -253,6 +253,53 @@ _HAN_ENGINEERING_TOPOLOGY_RE = re.compile(
     r"(?:相)?线制|电平(?:拓扑|结构)?|相制)",
     re.IGNORECASE,
 )
+_GROUNDED_THREE_PHASE_RE = re.compile(r"三相")
+_HAN_PHASE_TOPOLOGY_RE = re.compile(
+    rf"{_HAN_NUMBER_PATTERN}(?:[\W_]{{0,3}})相",
+    re.IGNORECASE,
+)
+_HAN_LINE_TOPOLOGY_RE = re.compile(
+    rf"{_HAN_NUMBER_PATTERN}(?:[\W_]{{0,3}})(?:线|線)"
+    r"(?=\s*(?:(?:[，,：:]\s*)?(?:制|配置|接线|接線|连接|連接|"
+    r"系统|系統|拓扑|拓撲|结构|結構|方式)|[；;。.!！?？]|$))",
+    re.IGNORECASE,
+)
+_CONNECTION_TOPOLOGY_RE = re.compile(
+    r"(?:(?:星形|星型|三角形|三角型)|"
+    r"(?<![A-Za-z0-9])(?:star|delta|Y|Δ)(?![A-Za-z0-9]))"
+    r"\s*(?:[，,：:]\s*)?"
+    r"(?:接法|连接|連接|接线|接線|配置|拓扑|拓撲|系统|系統|方式|"
+    r"connections?|configurations?|wirings?|topolog(?:y|ies)|systems?|methods?)",
+    re.IGNORECASE,
+)
+_PHASE_CONTRADICTION_DISCOURSE = (
+    r"(?:但|但是|然而|不过|可是|惟|唯|实际上|實際上|事实上|事實上|"
+    r"其实|其實|实则|實則)"
+)
+_PHASE_CONTRADICTION_SUBJECT = (
+    r"(?:(?:(?:该|該|此|这一|這一|这个|這個|这种|這種|这项|這項|"
+    r"上述|前述)\s*)?(?:结论|結論|判断|判斷|说法|說法|表述|信息|"
+    r"資訊|事实|事實|配置|断言|斷言)|"
+    r"(?:(?:是否)?(?:确|確)?(?:为|為)如此|是否如此))"
+)
+_PHASE_CONTRADICTION_STANCE = r"(?:(?:并|並|仍|尚|也|却|卻|依然|仍然)\s*)?"
+_PHASE_CONTRADICTION_PREDICATE = (
+    r"(?:并非如此|並非如此|(?:并|並)?不成立|"
+    r"(?:仍|尚)?未(?:(?:经|經|获|獲|得到|被)\s*)?"
+    r"(?:确认|確認|证实|證實)|"
+    r"(?:尚待|有待)(?:确认|確認|证实|證實)|"
+    r"(?:无法|無法|不能|不可)(?:确认|確認|证实|證實)|"
+    r"(?:尚)?(?:无|無)定论|(?:尚)?不(?:确定|確定)|"
+    r"可能(?:有误|有誤|错误|錯誤)|不可靠|存疑)"
+)
+_GROUNDED_PHASE_CONTRADICTION_RE = re.compile(
+    rf"^\s*(?:{_PHASE_CONTRADICTION_DISCOURSE}\s*[，,]?\s*)?"
+    rf"(?:{_PHASE_CONTRADICTION_PREDICATE}|"
+    rf"{_PHASE_CONTRADICTION_SUBJECT}\s*"
+    rf"{_PHASE_CONTRADICTION_STANCE}"
+    rf"{_PHASE_CONTRADICTION_PREDICATE})",
+    re.IGNORECASE,
+)
 _HAN_DERIVED_METRIC_RE = re.compile(
     rf"(?:百分之{_HAN_NUMBER_PATTERN}|"
     rf"(?:{_HAN_NUMBER_PATTERN}又)?{_HAN_NUMBER_PATTERN}分之"
@@ -328,6 +375,11 @@ _ENGLISH_DERIVED_METRIC_RE = re.compile(
     rf"{_ENGLISH_NUMBER_WORD_PATTERN})?\s+percent)(?![A-Za-z])",
     re.IGNORECASE,
 )
+_ENGLISH_PHASE_TOPOLOGY_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:phases?|triphasic)(?![A-Za-z0-9])|"
+    r"(?<![A-Za-z0-9])(?:three|tri|3)[\W_]*phases?(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
 _HAN_BRACKETED_UNIT_RE = re.compile(
     rf"{_HAN_NUMBER_PATTERN}\s*[\[(（]\s*(?:{_UNIT_TOKEN_PATTERN})"
 )
@@ -348,6 +400,14 @@ _COMPOSITE_TOPOLOGY_VALUE_RE = re.compile(
     r"^\s*\d+L(?:\s*[+/]\s*(?:N|PE))+\s*$",
     re.IGNORECASE,
 )
+_THREE_PHASE_COMPOSITE_VALUE_RE = re.compile(
+    r"^\s*3L\s*\+\s*N\s*\+\s*PE\s*$",
+    re.IGNORECASE,
+)
+_THREE_PHASE_SOURCE_TEXT_RE = re.compile(
+    r"^\s*(?:three|3)(?:[\s-]+)phase\s*$",
+    re.IGNORECASE,
+)
 _CODE_ONLY_ALPHA_VALUES = frozenset({"AFD"})
 _TECHNICAL_TOKEN_SHARE_GAP_RE = re.compile(
     r"^\s*(?:(?:[，,、/+]|和|及|与|以及)\s*)$"
@@ -358,6 +418,18 @@ _UNSUPPORTED_TRANSLATED_HAN_NUMBER_RE = re.compile(
     r"(?<![\u3400-\u9fff])半(?![\u3400-\u9fff])"
 )
 _HAN_NUMBER_TOKEN_RE = re.compile(_HAN_NUMBER_PATTERN)
+
+
+def _source_value_supports_three_phase(value: Any) -> bool:
+    """Recognize only complete source values that explicitly mean three-phase."""
+
+    normalized = unicodedata.normalize("NFKC", str(value)).strip()
+    return bool(
+        _THREE_PHASE_COMPOSITE_VALUE_RE.fullmatch(normalized)
+        or _THREE_PHASE_SOURCE_TEXT_RE.fullmatch(normalized)
+    )
+
+
 _SIMPLE_HAN_NUMBER_VALUES = {
     "零": Fraction(0),
     "〇": Fraction(0),
@@ -1121,6 +1193,9 @@ def parameter_numeric_guidance(parameter: Mapping[str, Any]) -> dict[str, Any]:
         mode = "complete_count_expression"
     elif expression is not None:
         mode = "complete_unitless_expression"
+    elif _source_value_supports_three_phase(source_value):
+        mode = "grounded_three_phase_topology"
+        technical_tokens = []
     elif _COMPOSITE_TOPOLOGY_VALUE_RE.fullmatch(source_value):
         mode = "no_numeric_restatement"
         technical_tokens = []
@@ -1250,6 +1325,7 @@ def _basis_measurement_evidence(
     dict[tuple[_NumericExpression, str], set[str]],
     dict[_NumericExpression, set[str]],
     dict[_NumericExpression, set[str]],
+    set[str],
     dict[str, set[tuple[int, str]]],
     dict[int, tuple[str, ...]],
 ]:
@@ -1269,6 +1345,7 @@ def _basis_measurement_evidence(
     ] = {}
     raw_expressions: dict[_NumericExpression, set[str]] = {}
     count_expressions: dict[_NumericExpression, set[str]] = {}
+    grounded_three_phase_labels: set[str] = set()
     technical_tokens: dict[str, set[tuple[int, str]]] = {}
     technical_token_sequences: dict[int, tuple[str, ...]] = {}
 
@@ -1282,6 +1359,8 @@ def _basis_measurement_evidence(
         ).strip()
         source_unit = _canonical_unit(str(item["unit"]))
         label = _normalized_analysis_label(raw_label)
+        if label and _source_value_supports_three_phase(source_value):
+            grounded_three_phase_labels.add(label)
         value_match = _NUMERIC_EXPRESSION_RE.fullmatch(source_value)
         value_expression = _numeric_expression(value_match) if value_match else None
 
@@ -1346,6 +1425,7 @@ def _basis_measurement_evidence(
         technical_measurements,
         raw_expressions,
         count_expressions,
+        grounded_three_phase_labels,
         technical_tokens,
         technical_token_sequences,
     )
@@ -1505,6 +1585,7 @@ def _measurement_spans(
         tuple[_NumericExpression, str],
         set[str],
     ],
+    grounded_three_phase_labels: set[str],
     technical_tokens: Mapping[str, set[tuple[int, str]]],
     technical_token_sequences: Mapping[int, tuple[str, ...]],
     all_labels: Sequence[str],
@@ -1516,6 +1597,41 @@ def _measurement_spans(
 
     verified: list[tuple[int, int]] = []
     invalid: dict[tuple[int, int], str] = {}
+    grounded_phase_regions: list[tuple[int, int]] = []
+    phase_clause_terminators = "；;。.!！"
+    for phase_match in _GROUNDED_THREE_PHASE_RE.finditer(text):
+        left = max(
+            (text.rfind(mark, 0, phase_match.start()) for mark in phase_clause_terminators),
+            default=-1,
+        ) + 1
+        right_candidates = [
+            index
+            for mark in phase_clause_terminators
+            if (index := text.find(mark, phase_match.end())) >= 0
+        ]
+        right = min(right_candidates, default=len(text))
+        clause = text[left:right]
+        next_clause = ""
+        if right < len(text):
+            next_start = right + 1
+            next_right_candidates = [
+                index
+                for mark in phase_clause_terminators
+                if (index := text.find(mark, next_start)) >= 0
+            ]
+            next_right = min(next_right_candidates, default=len(text))
+            next_clause = text[next_start:next_right]
+        is_exact_affirmative_clause = any(
+            re.fullmatch(
+                rf"\s*{re.escape(label)}\s*为\s*三相\s*",
+                clause,
+            )
+            is not None
+            for label in grounded_three_phase_labels
+        ) and _GROUNDED_PHASE_CONTRADICTION_RE.search(next_clause) is None
+        if is_exact_affirmative_clause:
+            verified.append(phase_match.span())
+            grounded_phase_regions.append(phase_match.span())
     protected_regions: list[tuple[int, int]] = []
     verified_token_rows: list[tuple[int, set[int]]] = []
     token_cursors: dict[int, int] = {}
@@ -1673,15 +1789,27 @@ def _measurement_spans(
         _HAN_BRACKETED_UNIT_RE,
         _HAN_CLASSIFIED_COUNT_RE,
         _HAN_ENGINEERING_TOPOLOGY_RE,
+        _HAN_PHASE_TOPOLOGY_RE,
+        _HAN_LINE_TOPOLOGY_RE,
+        _CONNECTION_TOPOLOGY_RE,
         _HAN_DERIVED_METRIC_RE,
         _HAN_IMPLICIT_DERIVED_METRIC_RE,
         _HAN_COUNT_CIRCUMLOCUTION_RE,
+        _ENGLISH_PHASE_TOPOLOGY_RE,
         _ENGLISH_DERIVED_METRIC_RE,
         _HAN_COUNT_CLAIM_RE,
     ):
         for han_claim in pattern.finditer(text):
             region = han_claim.span()
+            if _span_is_covered(region, grounded_phase_regions):
+                continue
             if any(_spans_overlap(region, item) for item in occupied):
+                if any(
+                    _spans_overlap(region, item)
+                    for item in grounded_phase_regions
+                ):
+                    invalid[region] = _bounded_descriptor(han_claim.group())
+                    occupied.append(region)
                 continue
             invalid[region] = _bounded_descriptor(han_claim.group())
             occupied.append(region)
@@ -1802,6 +1930,7 @@ def _ground_numbers(
         technical_measurements,
         raw_expressions,
         count_expressions,
+        grounded_three_phase_labels,
         technical_tokens,
         technical_token_sequences,
     ) = _basis_measurement_evidence(basis_rows, normalized_labels)
@@ -1822,6 +1951,7 @@ def _ground_numbers(
             exact_measurements,
             power_conversions,
             technical_measurements,
+            grounded_three_phase_labels,
             technical_tokens,
             technical_token_sequences,
             normalized_labels,

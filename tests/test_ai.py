@@ -688,6 +688,8 @@ class PromptTests(unittest.TestCase):
             "translate_and_analyze_complete_verified_parameter_set",
             prompt["task"],
         )
+        self.assertEqual("pv-parameter-analysis-v15", prompt["prompt_version"])
+        self.assertEqual("pv-zh-technical-v6", prompt["glossary_version"])
         self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
         self.assertTrue(
             prompt["input_guarantees"]["complete_within_runtime_budget"]
@@ -740,6 +742,7 @@ class PromptTests(unittest.TestCase):
         )
         self.assertIn("comparison operator, explicit sign", policy_text)
         self.assertIn("no_numeric_restatement", policy_text)
+        self.assertIn("grounded_three_phase_topology", policy_text)
         self.assertEqual(
             {"AC": "交流", "DC": "直流", "PV": "光伏"},
             {
@@ -785,6 +788,20 @@ class PromptTests(unittest.TestCase):
         self.assertIn(
             "no_numeric_restatement",
             prompt["numeric_narrative_mode_rules"],
+        )
+        self.assertIn(
+            "grounded_three_phase_topology",
+            prompt["numeric_narrative_mode_rules"],
+        )
+        self.assertIn(
+            "end at ；, ;, 。, ., !, ！, or paragraph end",
+            prompt["numeric_narrative_mode_rules"][
+                "grounded_three_phase_topology"
+            ],
+        )
+        self.assertIn(
+            "<完整语义 name_zh 核心>为三相",
+            " ".join(prompt["paragraph_construction_rules"]),
         )
         paragraph_rules = " ".join(prompt["paragraph_construction_rules"])
         self.assertIn("Never calculate or state a new numeric result", paragraph_rules)
@@ -1331,7 +1348,24 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             "<verbatim row.value><verbatim row.unit><punctuation>",
             repair_content,
         )
-        self.assertIn("For every other numeric_narrative mode, omit", repair_content)
+        self.assertIn(
+            "For every other numeric_narrative mode, omit",
+            repair_content,
+        )
+        self.assertIn(
+            "For grounded_three_phase_topology",
+            repair_content,
+        )
+        self.assertIn(
+            "independent affirmative clause exactly "
+            "<complete name_zh narrative label core>为三相",
+            repair_content,
+        )
+        self.assertIn(
+            "No prefix, negation, question, later contradiction, "
+            "topology continuation",
+            repair_content,
+        )
         self.assertIn(
             "between unsupported: and the next semicolon",
             repair_content,

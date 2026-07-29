@@ -1336,7 +1336,7 @@ class ParameterAnalysisTests(unittest.TestCase):
                     "value": "3L+N+PE",
                     "unit": "",
                 },
-                "no_numeric_restatement",
+                "grounded_three_phase_topology",
                 [],
             ),
             (
@@ -1359,7 +1359,45 @@ class ParameterAnalysisTests(unittest.TestCase):
                     parameter_numeric_guidance(row),
                 )
 
-    def test_compound_feed_in_is_translation_only_in_narrative(self) -> None:
+        for source_value in (
+            "3L+N",
+            "3L+PE",
+            "2L+N+PE",
+            "13L+N+PE",
+            "Not Three Phase",
+            "Single/Three Phase",
+            "Three Phase Optional",
+            "3",
+        ):
+            with self.subTest(unsupported_three_phase_source=source_value):
+                guidance = parameter_numeric_guidance(
+                    {
+                        "name": "Feed-in",
+                        "value": source_value,
+                        "unit": "",
+                    }
+                )
+                self.assertNotEqual(
+                    "grounded_three_phase_topology",
+                    guidance["mode"],
+                )
+
+        for source_value in ("Three Phase", "Three-Phase", "3-phase"):
+            with self.subTest(grounded_three_phase_source=source_value):
+                self.assertEqual(
+                    "grounded_three_phase_topology",
+                    parameter_numeric_guidance(
+                        {
+                            "name": "Grid Phase",
+                            "value": source_value,
+                            "unit": "",
+                        }
+                    )["mode"],
+                )
+
+    def test_compound_feed_in_allows_only_grounded_three_phase_narrative(
+        self,
+    ) -> None:
         source = parameters()
         source[0].update(
             name="Feed-in",
@@ -1376,11 +1414,125 @@ class ParameterAnalysisTests(unittest.TestCase):
         )
         validate_parameter_enrichment(valid, source)
 
+        grounded = copy.deepcopy(valid)
+        grounded["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "并网接线方式为三相；该专业相制描述直接绑定制造商数据表的"
+            "接线配置，具体工程设计仍需核对现场电网与接地要求。"
+        )
+        validate_parameter_enrichment(grounded, source)
+
+        for terminator in ("；", ";", "。", ".", "!", "！"):
+            with self.subTest(grounded_clause_terminator=terminator):
+                terminated = copy.deepcopy(valid)
+                terminated["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+                    f"并网接线方式为三相{terminator}"
+                    "该专业相制描述直接绑定制造商数据表的接线配置，"
+                    "具体工程设计仍需核对现场电网与接地要求。"
+                )
+                validate_parameter_enrichment(terminated, source)
+
+        qualified = copy.deepcopy(valid)
+        qualified["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "并网接线方式为三相；但现场适用性尚不确定，仍需核对项目所在地"
+            "电网制式与接地要求，且不能据此确认具体接地方案。"
+        )
+        validate_parameter_enrichment(qualified, source)
+
+        for legitimate_context in (
+            "具体工程设计仍需结合现场单线图、接地方案、保护配置和当地"
+            "并网规范逐项核对。",
+            "一线运维人员仍需核对现场电网制式，二线支持不能替代项目"
+            "设计审查。",
+            "该结论仅限于数据表所列并网接线方式，不构成认证结论。",
+            "该信息未涵盖现场电网条件，工程适用性仍需另行确认。",
+        ):
+            with self.subTest(legitimate_context=legitimate_context):
+                contextual = copy.deepcopy(valid)
+                contextual["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+                    f"并网接线方式为三相；{legitimate_context}"
+                    "具体工程边界仍应结合项目资料逐项核对。"
+                )
+                validate_parameter_enrichment(contextual, source)
+
+        auto_cited = copy.deepcopy(grounded)
+        auto_cited["sections"][0]["paragraphs"][0][
+            "basis_parameter_ids"
+        ] = ["p002"]
+        normalized = validate_parameter_enrichment(auto_cited, source)
+        self.assertEqual(
+            ["p002", "p001"],
+            normalized["sections"][0]["paragraphs"][0][
+                "basis_parameter_ids"
+            ],
+        )
+        self.assertEqual(
+            normalized,
+            validate_parameter_enrichment(normalized, source),
+        )
+
         for forbidden in (
             "并网接线方式为 3L；",
             "并网接线方式为 3L+N+PE；",
-            "并网接线方式为三相；",
             "并网接线方式采用三线制；",
+            "并网接线方式采用三相制；",
+            "并网接线方式采用三相拓扑；",
+            "并网接线方式为三相逆变器；",
+            "并网接线方式为三相四线制；",
+            "并网接线方式为三相五线；",
+            "并网接线方式为三相MPPT；",
+            "并网接线方式为三相独立MPPT；",
+            "并网接线方式为三相或两相；",
+            "数据表未表明并网接线方式为三相；",
+            "并网接线方式为三相？",
+            "现场并网接线方式为三相；",
+            "并网接线方式为三相，五线配置；",
+            "并网接线方式为三相：四线配置；",
+            "并网接线方式为三相；五线配置仍需核对；",
+            "并网接线方式为三相；五线，配置仍需核对；",
+            "并网接线方式为三相。三角形连接仍需核对；",
+            "并网接线方式为三相。三角形，连接仍需核对；",
+            "并网接线方式为三相；Y 接线仍需核对；",
+            "并网接线方式为三相；Delta connection 仍需核对；",
+            "并网接线方式为三相；但该结论并不成立；",
+            "并网接线方式为三相；但这一结论不成立。",
+            "并网接线方式为三相；但是这个结论不成立。",
+            "并网接线方式为三相；上述判断不成立。",
+            "并网接线方式为三相；该判断尚未确认。",
+            "并网接线方式为三相；实际上并非如此。",
+            "并网接线方式为三相；该说法尚待确认。",
+            "并网接线方式为三相；该配置未被证实。",
+            "并网接线方式为三相；该结论可能有误。",
+            "并网接线方式为三相；该结论并不可靠。",
+            "并网接线方式为三相；该结论仍不确定。",
+            "并网接线方式为三相；该结论并未确认。",
+            "并网接线方式为三相；不过是否确为如此仍不确定。",
+            "并网接线方式可能为三相；",
+            "并网接线方式不是三相；",
+            "该产品为三相；",
+            "第三相不能作为接线方式结论；",
+            "MPPT 电压范围为三相；",
+            "并网接线方式为两相；",
+            "并网接线方式为四相；",
+            "并网接线方式为叁相；",
+            "并网接线方式为 three phase；",
+            "并网接线方式为 3-phase；",
+            "并网接线方式为 threephase；",
+            "并网接线方式为 three phases；",
+            "并网接线方式为 three_phase；",
+            "并网接线方式为 three‑phase；",
+            "并网接线方式为 three/phase；",
+            "并网接线方式为 three.phase；",
+            "并网接线方式为 tri-phase；",
+            "并网接线方式为 triphasic；",
+            "并网接线方式为 3phase；",
+            "并网接线方式为三-相；",
+            "并网接线方式为三_相；",
+            "并网接线方式为三/相；",
+            "并网接线方式为三·相；",
+            "并网接线方式为三‑相；",
+            "并网接线方式为三:相；",
+            "并网接线方式为三.相；",
+            "并网接线方式为三•相；",
             "并网接线方式包含三根相线；",
             "并网接线方式采用三电平拓扑；",
             "R5-10K-T2-15 是该并网接线方式对应的产品型号；",
@@ -1397,6 +1549,47 @@ class ParameterAnalysisTests(unittest.TestCase):
                     "numeric text",
                 ):
                     validate_parameter_enrichment(invalid, source)
+
+        unbound = copy.deepcopy(valid)
+        unbound["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "三相只能在完整参数标签局部绑定后复述；并网接线方式仍需"
+            "结合现场电网制式、接地要求与制造商定义逐项核对。"
+        )
+        with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
+            validate_parameter_enrichment(unbound, source)
+
+        for source_value in (
+            "3L+N",
+            "3L+PE",
+            "2L+N+PE",
+            "4L+N+PE",
+            "13L+N+PE",
+            "3",
+        ):
+            with self.subTest(unsupported_source_value=source_value):
+                unsupported_source = copy.deepcopy(source)
+                unsupported_source[0]["value"] = source_value
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "numeric text",
+                ):
+                    validate_parameter_enrichment(
+                        grounded,
+                        unsupported_source,
+                    )
+
+        explicit_source = copy.deepcopy(source)
+        explicit_source[0]["value"] = "Three Phase"
+        explicit = copy.deepcopy(grounded)
+        explicit["translations"][0]["value_zh"] = "三相"
+        validate_parameter_enrichment(explicit, explicit_source)
+
+        negated_source = copy.deepcopy(source)
+        negated_source[0]["value"] = "Not Three Phase"
+        negated = copy.deepcopy(grounded)
+        negated["translations"][0]["value_zh"] = "非三相"
+        with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
+            validate_parameter_enrichment(negated, negated_source)
 
         for value_zh in (
             "3L（三相）",
