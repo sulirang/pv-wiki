@@ -1217,6 +1217,10 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         repair_content = calls[1]["messages"][-1]["content"]
         self.assertIn("Retry once", repair_content)
         self.assertIn("every input parameter", repair_content)
+        self.assertIn(
+            "translations must contain exactly one item",
+            repair_content,
+        )
 
     def test_optional_thinking_controls_are_sent_as_provider_extensions(
         self,

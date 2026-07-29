@@ -12,7 +12,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 1
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v2"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v3"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v1"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -117,6 +117,44 @@ def _clean_text(
     if cleaned and _MARKDOWN_OR_HTML_RE.search(cleaned):
         raise ParameterAnalysisError(f"{field} cannot contain Markdown or HTML")
     return cleaned
+
+def _identifier_only_heading(value: str) -> bool:
+    """Whether a heading is a model/code label with no prose to translate."""
+
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    return (
+        bool(re.search(r"\d", normalized))
+        and re.fullmatch(r"[A-Za-z0-9_.+/@() /\-]+", normalized) is not None
+        and re.search(
+            r"(?<![A-Za-z0-9])[A-Za-z]{3,}(?![A-Za-z0-9])",
+            normalized,
+        )
+        is None
+    )
+
+
+def _heading_translation(
+    raw_value: Any,
+    source_value: str,
+    field: str,
+) -> str:
+    identifier_only = _identifier_only_heading(source_value)
+    translated = _clean_text(
+        raw_value,
+        field,
+        required=bool(source_value) and not identifier_only,
+        limit=100,
+    )
+    if translated and _HAN_RE.search(translated) is None:
+        source_key = unicodedata.normalize("NFKC", source_value).casefold()
+        translated_key = unicodedata.normalize("NFKC", translated).casefold()
+        if identifier_only and source_key == translated_key:
+            return ""
+        raise ParameterAnalysisError(
+            f"{field} must contain professional Chinese"
+
+        )
+    return translated
 
 
 def _as_parameter_rows(
@@ -250,12 +288,10 @@ def _validate_translation(
             )
 
     source_section = str(source["section"])
-    section_zh = _clean_text(
+    section_zh = _heading_translation(
         raw.get("section_zh", ""),
+        source_section,
         f"{prefix}.section_zh",
-        required=bool(source_section),
-        limit=100,
-        require_han=bool(source_section),
     )
     expected_section = SECTION_TRANSLATIONS.get(source_section.casefold())
     if expected_section is not None and section_zh != expected_section:
@@ -263,18 +299,16 @@ def _validate_translation(
             f"{prefix}.section_zh must use the controlled section translation"
         )
     for token in _PROTECTED_TOKEN_RE.findall(source_section):
-        if token not in section_zh:
+        if section_zh and token not in section_zh:
             raise ParameterAnalysisError(
                 f"{prefix}.section_zh must preserve protected token {token}"
             )
 
     source_subsection = str(source["subsection"])
-    subsection_zh = _clean_text(
+    subsection_zh = _heading_translation(
         raw.get("subsection_zh", ""),
+        source_subsection,
         f"{prefix}.subsection_zh",
-        required=bool(source_subsection),
-        limit=100,
-        require_han=bool(source_subsection),
     )
     expected_subsection = SECTION_TRANSLATIONS.get(source_subsection.casefold())
     if expected_subsection is not None and subsection_zh != expected_subsection:
@@ -283,7 +317,7 @@ def _validate_translation(
             "translation"
         )
     for token in _PROTECTED_TOKEN_RE.findall(source_subsection):
-        if token not in subsection_zh:
+        if subsection_zh and token not in subsection_zh:
             raise ParameterAnalysisError(
                 f"{prefix}.subsection_zh must preserve protected token {token}"
             )

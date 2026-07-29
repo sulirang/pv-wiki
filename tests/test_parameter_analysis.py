@@ -134,6 +134,27 @@ class ParameterAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ParameterAnalysisError, "does not match"):
             validate_parameter_enrichment(tampered, parameters())
 
+    def test_model_code_table_heading_may_remain_source_only(self) -> None:
+        code = "R5-8K/9K/10K/12K-T2-15"
+        source = parameters()
+        for row in source:
+            row["subsection"] = row["section"]
+            row["section"] = code
+        item = enrichment()
+        for translation in item["translations"]:
+            translation["subsection_zh"] = translation["section_zh"]
+            translation["section_zh"] = code
+
+        result = validate_parameter_enrichment(item, source)
+        self.assertEqual(
+            ["", "", ""],
+            [value["section_zh"] for value in result["translations"]],
+        )
+        blank = copy.deepcopy(item)
+        for translation in blank["translations"]:
+            translation["section_zh"] = ""
+        validate_parameter_enrichment(blank, source)
+
     def test_requires_exactly_one_translation_per_parameter(self) -> None:
         item = enrichment()
         item["translations"] = item["translations"][:-1]

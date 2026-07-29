@@ -1394,12 +1394,14 @@ def build_parameter_analysis_messages(
                     ),
                     "section_zh": (
                         "professional translation of section; use the controlled "
-                        "translation verbatim when one exists"
+                        "translation verbatim when one exists; use empty string "
+                        "for a model/code-only table heading because it has no "
+                        "prose to translate"
                     ),
                     "subsection_zh": (
                         "professional translation of subsection or empty string; "
                         "use the controlled translation verbatim when one "
-                        "exists"
+                        "exists; use empty string for a model/code-only heading"
                     ),
                     "value_zh": (
                         "optional professional translation only for a textual "
@@ -2687,7 +2689,10 @@ class OpenAICompatibleClient:
                 post(messages),
                 parameters,
             )
-        except (AIInvalidOutputError, ParameterAnalysisError):
+        except (AIInvalidOutputError, ParameterAnalysisError) as error:
+            validation_requirement = " ".join(str(error).split())[:300] or (
+                "output must satisfy the documented contract"
+            )
             repair_messages = [
                 *messages,
                 {
@@ -2703,7 +2708,8 @@ class OpenAICompatibleClient:
                         "one overall limitation. Keep it compact: normally one "
                         "60-240 character paragraph per section, a second only if "
                         "essential, and no repeated conditions or limitations. "
-                        "No prose or Markdown outside JSON."
+                        "No prose or Markdown outside JSON. Local validation "
+                        f"requirement: {validation_requirement}."
                     ),
                 },
             ]
