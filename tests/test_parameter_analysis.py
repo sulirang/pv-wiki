@@ -1337,6 +1337,56 @@ class ParameterAnalysisTests(unittest.TestCase):
                 ):
                     validate_parameter_enrichment(invalid_value, source)
 
+    def test_rejects_translation_for_code_only_source_values(self) -> None:
+        cases = (
+            ("AFD", "AFD（防孤岛检测）"),
+            ("MC4", "MC4 连接器"),
+            ("IP65", "IP65 防护等级"),
+            ("RS485", "RS485 通信接口"),
+        )
+        for source_value, invalid_translation in cases:
+            with self.subTest(source_value=source_value):
+                source = parameters()
+                source[0].update(
+                    name="Protection Mode",
+                    value=source_value,
+                    unit="",
+                )
+                valid = translation_enrichment()
+                valid["translations"][0]["name_zh"] = "保护模式"
+                valid["translations"][0]["value_zh"] = ""
+                validate_parameter_enrichment(valid, source)
+
+                invalid = copy.deepcopy(valid)
+                invalid["translations"][0]["value_zh"] = invalid_translation
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "must be empty for a code-only source value",
+                ):
+                    validate_parameter_enrichment(invalid, source)
+
+    def test_accepts_uppercase_and_code_bearing_textual_values(self) -> None:
+        cases = (
+            ("INTEGRATED", "集成"),
+            ("OPTIONAL", "可选"),
+            ("YES", "是"),
+            ("NO", "否"),
+            ("MC4 compatible", "兼容 MC4"),
+            ("AFD enabled", "启用 AFD"),
+        )
+        for source_value, translation in cases:
+            with self.subTest(source_value=source_value):
+                source = parameters()
+                source[0].update(
+                    name="Feature Status",
+                    value=source_value,
+                    unit="",
+                )
+                valid = translation_enrichment()
+                valid["translations"][0]["name_zh"] = "功能状态"
+                valid["translations"][0]["value_zh"] = translation
+                validate_parameter_enrichment(valid, source)
+
     def test_rejects_unicode_operator_scope_and_dimension_bypasses(self) -> None:
         source = parameters()
         source[0].update(

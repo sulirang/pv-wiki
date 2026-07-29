@@ -792,6 +792,7 @@ class PromptTests(unittest.TestCase):
             "value_zh"
         ]
         self.assertIn("composite topology codes", value_contract)
+        self.assertIn("AFD, MC4, and IP65", value_contract)
         self.assertIn(
             "never use ranges, labels, or objects",
             prompt["output_contract"]["sections"]["item"]["paragraphs"][
@@ -1329,7 +1330,11 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertIn("accumulated across prior attempts", repair_content)
         self.assertIn("product name, ID, model, or series", repair_content)
         self.assertIn("Feed-in=3L+N+PE", repair_content)
-        self.assertIn("keep value_zh empty", repair_content)
+        self.assertIn(
+            "keep value_zh empty for numeric values, ranges, standards, symbols, units",
+            repair_content,
+        )
+        self.assertNotIn("value_zh empty only when", repair_content)
         self.assertIn("三相", repair_content)
         self.assertNotIn("without conversion", repair_content)
         self.assertIn(

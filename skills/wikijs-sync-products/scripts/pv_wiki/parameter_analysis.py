@@ -14,7 +14,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v12"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v13"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v5"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -348,6 +348,7 @@ _COMPOSITE_TOPOLOGY_VALUE_RE = re.compile(
     r"^\s*\d+L(?:\s*[+/]\s*(?:N|PE))+\s*$",
     re.IGNORECASE,
 )
+_CODE_ONLY_ALPHA_VALUES = frozenset({"AFD"})
 _TECHNICAL_TOKEN_SHARE_GAP_RE = re.compile(
     r"^\s*(?:(?:[，,、/+]|和|及|与|以及)\s*)$"
 )
@@ -538,6 +539,16 @@ def _identifier_only_heading(value: str) -> bool:
             normalized,
         )
         is None
+    )
+
+
+def _code_only_source_value(value: str) -> bool:
+    """Whether a source value is one standalone, non-translatable code."""
+
+    normalized = unicodedata.normalize("NFKC", value).strip().upper()
+    return (
+        normalized in _CODE_ONLY_ALPHA_VALUES
+        or _NUMERIC_TECHNICAL_TOKEN_RE.fullmatch(normalized) is not None
     )
 
 
@@ -910,16 +921,23 @@ def _validate_translation(
                 f"{prefix}.subsection_zh must preserve protected token {token}"
             )
 
+    source_value = str(source["value"])
     value_zh = _clean_text(
         raw.get("value_zh", ""),
         f"{prefix}.value_zh",
         limit=200,
-        require_han=bool(raw.get("value_zh")),
     )
-    source_value = str(source["value"])
     if value_zh and _COMPOSITE_TOPOLOGY_VALUE_RE.fullmatch(source_value):
         raise ParameterAnalysisError(
             f"{prefix}.value_zh must be empty for a composite topology code"
+        )
+    if value_zh and _code_only_source_value(source_value):
+        raise ParameterAnalysisError(
+            f"{prefix}.value_zh must be empty for a code-only source value"
+        )
+    if value_zh and _HAN_RE.search(value_zh) is None:
+        raise ParameterAnalysisError(
+            f"{prefix}.value_zh must contain professional Chinese"
         )
     _reject_added_numeric_tokens(value_zh, source_value, f"{prefix}.value_zh")
     for token in _PROTECTED_TOKEN_RE.findall(source_value):

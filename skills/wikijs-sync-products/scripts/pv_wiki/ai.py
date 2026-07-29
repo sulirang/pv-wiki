@@ -1478,27 +1478,24 @@ def build_parameter_analysis_messages(
                 "item": {
                     "parameter_id": "exact input parameter_id",
                     "name_zh": (
-                        "professional Simplified Chinese translation of name; "
-                        "preserve bracketed units, technical abbreviations, "
-                        "symbols, standards, and distinctions such as rated, "
-                        "nominal, maximum, and minimum"
+                        "professional Simplified Chinese name; preserve bracketed units, "
+                        "abbreviations, symbols, standards, and rated/nominal/maximum/"
+                        "minimum distinctions"
                     ),
                     "section_zh": (
-                        "professional translation of section; use the controlled "
-                        "translation verbatim when one exists; use empty string "
-                        "for a model/code-only table heading because it has no "
-                        "prose to translate"
+                        "professional section translation; use controlled translation "
+                        "verbatim; empty for a model/code-only heading without prose"
                     ),
                     "subsection_zh": (
-                        "professional translation of subsection or empty string; "
-                        "use the controlled translation verbatim when one "
-                        "exists; use empty string for a model/code-only heading"
+                        "professional subsection translation or empty; use controlled "
+                        "translation verbatim; empty for a model/code-only heading"
                     ),
                     "value_zh": (
-                        "optional professional translation only for a textual "
-                        "source value; use empty string for numeric values, ranges, "
-                        "standards, symbols, units, and composite topology codes "
-                        "such as 3L+N+PE; never replace source value"
+                        "professionally translate textual values; otherwise empty for "
+                        "numbers, ranges, standards, symbols, units, whole-value "
+                        "standalone codes (AFD, MC4, and IP65), and composite topology "
+                        "codes (3L+N+PE). If a code is embedded in prose, preserve it "
+                        "and translate the prose; never replace source value"
                     ),
                 },
             },
@@ -2856,8 +2853,12 @@ class OpenAICompatibleClient:
                             f"Retry {retry_word}. Return one complete JSON object "
                             "matching the parameter-analysis output contract. Include "
                             "exactly one translation for every input parameter in the "
-                            "original order; keep value_zh empty for composite topology "
-                            "codes such as 3L+N+PE; preserve every protected token and "
+                            "original order; keep value_zh empty for numeric values, "
+                            "ranges, standards, symbols, units, whole-value standalone "
+                            "codes such as AFD, MC4, or IP65, and composite topology "
+                            "codes such as 3L+N+PE; when a code is embedded in prose, "
+                            "preserve it and translate the surrounding prose; preserve "
+                            "every protected token and "
                             "controlled term; reference only supplied parameter IDs and "
                             "cite every used complete parameter label; "
                             "follow every row's numeric_narrative mode; an exact source "
