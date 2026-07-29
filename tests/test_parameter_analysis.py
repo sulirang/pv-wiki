@@ -1030,6 +1030,47 @@ class ParameterAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
             validate_parameter_enrichment(swapped, source)
 
+        bounded = copy.deepcopy(item)
+        bounded["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "最大直流电压不超过 1100 V，额定直流电压为 600 V；这些边界"
+            "表达直接来自参数名中的最大与额定语义，仍需逐项绑定对应标签。"
+        )
+        validate_parameter_enrichment(bounded, source)
+
+        paraphrased = copy.deepcopy(item)
+        paraphrased["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "最大直流电压用于定义设计边界，直流侧最大电压不超过 1100 V；"
+            "额定直流电压为 600 V，工程校核仍需结合现场条件与制造商资料。"
+        )
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            'must be immediately preceded by exact label "最大直流电压"',
+        ):
+            validate_parameter_enrichment(paraphrased, source)
+
+        numeric_label_source = copy.deepcopy(source)
+        numeric_label_source[0]["name"] = "Input 2 Max. DC Voltage [V]"
+        numeric_label = copy.deepcopy(item)
+        numeric_label["translations"][0]["name_zh"] = "输入 2 最大直流电压 [V]"
+        numeric_paragraph = numeric_label["sections"][0]["paragraphs"][0]
+        numeric_paragraph["basis_parameter_ids"] = ["p001", "p002"]
+        numeric_paragraph["analysis_zh"] = (
+            "MPPT 电压范围用于定义组串工作窗口，直流侧最大电压不超过 "
+            "1100 V；两项参数需要分别绑定原始标签，工程校核仍需结合现场条件。"
+        )
+        with self.assertRaises(ParameterAnalysisError) as raised:
+            validate_parameter_enrichment(numeric_label, numeric_label_source)
+        message = str(raised.exception)
+        unsupported = message.split("unsupported:", 1)[1].split(
+            "; basis permits:",
+            1,
+        )[0].strip()
+        self.assertEqual("1100", unsupported)
+        self.assertIn(
+            'exact label "输入 2 最大直流电压"',
+            message,
+        )
+
     def test_rejects_disguised_units_nonprofessional_case_and_qualifiers(self) -> None:
         original = enrichment()["sections"][0]["paragraphs"][0]["analysis_zh"]
         replacements = (

@@ -1370,6 +1370,20 @@ def _bounded_descriptor(value: str, limit: int = 100) -> str:
     return cleaned if len(cleaned) <= limit else f"{cleaned[:limit - 3]}..."
 
 
+def _missing_label_descriptor(
+    descriptor: str,
+    labels: Sequence[str],
+) -> str:
+    expected = sorted({label for label in labels if label})[:3]
+    if not expected:
+        return descriptor
+    quoted = " or ".join(f'"{label}"' for label in expected)
+    return _bounded_descriptor(
+        f"{descriptor} must be immediately preceded by exact label {quoted}",
+        220,
+    )
+
+
 def _claim_prefix_is_blocked(text: str, start: int) -> bool:
     prefix = text[:start]
     if _CLAIM_PREFIX_BLOCK_RE.search(prefix):
@@ -1608,7 +1622,10 @@ def _measurement_spans(
             ):
                 verified.append(region)
                 continue
-            invalid[region] = descriptor
+            invalid[region] = _missing_label_descriptor(
+                descriptor,
+                technical_labels,
+            )
             continue
 
         labels = exact_measurements.get((expression, unit), set())
@@ -1621,7 +1638,7 @@ def _measurement_spans(
             ):
                 verified.append(region)
                 continue
-            invalid[region] = descriptor
+            invalid[region] = _missing_label_descriptor(descriptor, labels)
             continue
 
         output_spec = _POWER_UNIT_FACTORS.get(unit)
@@ -1637,13 +1654,16 @@ def _measurement_spans(
                 for source_unit, label in evidence
                 if source_unit != unit and label
             )
-            if labels and _label_is_locally_bound(
-                text,
-                labels,
-                claim.start(),
-                all_labels=all_labels,
-            ):
-                verified.append(region)
+            if labels:
+                if _label_is_locally_bound(
+                    text,
+                    labels,
+                    claim.start(),
+                    all_labels=all_labels,
+                ):
+                    verified.append(region)
+                    continue
+                invalid[region] = _missing_label_descriptor(descriptor, labels)
                 continue
         invalid[region] = descriptor
 
@@ -1776,10 +1796,12 @@ def _ground_numbers(
             technical_token_sequences,
             normalized_labels,
         )
-        invalid_measurements.extend(invalid_regions.values())
         occupied_regions = [*verified_regions, *invalid_regions]
-        for descriptor in invalid_regions.values():
-            unsupported.extend(_ANY_DIGIT_RE.findall(descriptor))
+        for region, descriptor in invalid_regions.items():
+            invalid_measurements.append(descriptor)
+            unsupported.extend(
+                _ANY_DIGIT_RE.findall(text[region[0] : region[1]])
+            )
 
         raw_regions: list[tuple[int, int]] = []
         for match in _NUMERIC_EXPRESSION_SCAN_RE.finditer(text):
