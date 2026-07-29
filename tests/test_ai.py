@@ -723,6 +723,12 @@ class PromptTests(unittest.TestCase):
             "Do not repeat the product name or model",
             " ".join(prompt["analysis_policy"]),
         )
+        self.assertIn(
+            "never use ranges, labels, or objects",
+            prompt["output_contract"]["sections"]["item"]["paragraphs"][
+                "item"
+            ]["basis_parameter_ids"],
+        )
         self.assertEqual(
             2,
             prompt["output_contract"]["sections"]["item"]["paragraphs"][

@@ -1430,8 +1430,9 @@ def build_parameter_analysis_messages(
                         "item": {
                             "analysis_kind": sorted(ANALYSIS_KINDS),
                             "basis_parameter_ids": (
-                                "1-8 exact IDs for an interpretation or conditional "
-                                "guidance; 0-8 for a limitation"
+                                "1-8 separate exact parameter_id strings copied "
+                                "verbatim for interpretation or guidance; 0-8 for "
+                                "a limitation; never use ranges, labels, or objects"
                             ),
                             "analysis_zh": (
                                 "one professional Chinese paragraph, 40-500 "

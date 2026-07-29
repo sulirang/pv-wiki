@@ -12,7 +12,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v6"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v7"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v2"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -623,15 +623,56 @@ def validate_parameter_enrichment(
                 )
             basis_ids = paragraph_raw.get("basis_parameter_ids")
             minimum_basis = 0 if analysis_kind == "limitation" else 1
-            if (
-                not isinstance(basis_ids, list)
-                or not minimum_basis <= len(basis_ids) <= 8
-                or len(set(basis_ids)) != len(basis_ids)
-                or any(item not in source_by_id for item in basis_ids)
-            ):
+            if not isinstance(basis_ids, list):
                 raise ParameterAnalysisError(
-                    f"{paragraph_prefix}.basis_parameter_ids are invalid"
+                    f"{paragraph_prefix}.basis_parameter_ids must be an array"
                 )
+            if not minimum_basis <= len(basis_ids) <= 8:
+                raise ParameterAnalysisError(
+                    f"{paragraph_prefix}.basis_parameter_ids must contain "
+                    f"{minimum_basis}-8 IDs; received {len(basis_ids)}"
+                )
+            non_strings = [
+                str(index)
+                for index, item in enumerate(basis_ids)
+                if not isinstance(item, str)
+            ]
+            if non_strings:
+                raise ParameterAnalysisError(
+                    f"{paragraph_prefix}.basis_parameter_ids must contain only "
+                    f"string IDs; invalid indexes: {', '.join(non_strings[:8])}"
+                )
+            normalized_basis_ids = list(basis_ids)
+            malformed_indexes = [
+                str(index)
+                for index, item in enumerate(normalized_basis_ids)
+                if re.fullmatch(r"p\d{3}", item) is None
+            ]
+            if malformed_indexes:
+                raise ParameterAnalysisError(
+                    f"{paragraph_prefix}.basis_parameter_ids must match pNNN; "
+                    f"invalid indexes: {', '.join(malformed_indexes[:8])}"
+                )
+            duplicate_ids = [
+                item
+                for index, item in enumerate(normalized_basis_ids)
+                if item in normalized_basis_ids[:index]
+            ]
+            if duplicate_ids:
+                raise ParameterAnalysisError(
+                    f"{paragraph_prefix}.basis_parameter_ids contains duplicate "
+                    f"IDs: {', '.join(dict.fromkeys(duplicate_ids))}"
+                )
+            unknown_ids = [
+                item for item in normalized_basis_ids if item not in source_by_id
+            ]
+            if unknown_ids:
+                raise ParameterAnalysisError(
+                    f"{paragraph_prefix}.basis_parameter_ids contains unknown IDs: "
+                    f"{', '.join(unknown_ids[:8])}; valid IDs are "
+                    f"p001-p{len(source_rows):03d}"
+                )
+            basis_ids = normalized_basis_ids
             analysis_zh = _clean_text(
                 paragraph_raw.get("analysis_zh"),
                 f"{paragraph_prefix}.analysis_zh",
