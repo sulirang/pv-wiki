@@ -207,6 +207,20 @@ class ParameterAnalysisTests(unittest.TestCase):
             ["", "", ""],
             [value["section_zh"] for value in result["translations"]],
         )
+        translated_variant = copy.deepcopy(item)
+        for translation in translated_variant["translations"]:
+            translation["section_zh"] = "R5-8K/9K/10K/12K-T2 系列"
+        variant_result = validate_parameter_enrichment(
+            translated_variant,
+            source,
+        )
+        self.assertEqual(
+            ["", "", ""],
+            [
+                value["section_zh"]
+                for value in variant_result["translations"]
+            ],
+        )
         blank = copy.deepcopy(item)
         for translation in blank["translations"]:
             translation["section_zh"] = ""

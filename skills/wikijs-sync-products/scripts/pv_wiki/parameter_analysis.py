@@ -448,11 +448,9 @@ def _heading_translation(
         required=bool(source_value) and not identifier_only,
         limit=100,
     )
+    if identifier_only:
+        return ""
     if translated and _HAN_RE.search(translated) is None:
-        source_key = unicodedata.normalize("NFKC", source_value).casefold()
-        translated_key = unicodedata.normalize("NFKC", translated).casefold()
-        if identifier_only and source_key == translated_key:
-            return ""
         raise ParameterAnalysisError(
             f"{field} must contain professional Chinese"
         )
