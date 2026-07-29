@@ -689,7 +689,7 @@ class PromptTests(unittest.TestCase):
             "translate_and_analyze_complete_verified_parameter_set",
             prompt["task"],
         )
-        self.assertEqual("pv-parameter-analysis-v20", prompt["prompt_version"])
+        self.assertEqual("pv-parameter-analysis-v21", prompt["prompt_version"])
         self.assertEqual("pv-zh-technical-v6", prompt["glossary_version"])
         self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
         self.assertTrue(
@@ -1752,11 +1752,140 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             "fallback changes narrative fields only, never translations",
             final_repair,
         )
+        self.assertIn(
+            "sections must be a JSON array of exactly 1 unique section object "
+            "in documented display order",
+            final_repair,
+        )
+        self.assertIn(
+            "basis_parameter_ids is a JSON array of exactly one supplied ID",
+            final_repair,
+        )
+        self.assertIn(
+            "Each paragraph must use exactly one of these two shapes; no other "
+            "paragraph shape is allowed",
+            final_repair,
+        )
+        self.assertIn(
+            "complete name_zh narrative label core occurs for exactly one "
+            "translation",
+            final_repair,
+        )
+        self.assertIn(
+            "basis_parameter_ids is the empty JSON array []",
+            final_repair,
+        )
+        self.assertIn(
+            "conditions_zh and limitations_zh must each be the empty JSON array []",
+            final_repair,
+        )
+        self.assertIn(
+            "overall_limitations_zh must be a JSON array of exactly one "
+            "qualitative string",
+            final_repair,
+        )
         self.assertNotIn("phase clause required exactly:", final_repair)
         self.assertNotIn("phase clause unavailable in cited basis", final_repair)
         self.assertNotIn("unsupported: 10", final_repair)
         self.assertNotIn("basis permits: 10000", final_repair)
         self.assertNotIn("invalid measurements: 10", final_repair)
+
+    def test_large_parameter_set_final_fallback_requires_five_sections(
+        self,
+    ) -> None:
+        calls: list[dict] = []
+        source = [
+            copy.deepcopy(row)
+            for _batch in range(10)
+            for row in analysis_parameters()
+        ]
+        invalid = {
+            "translations": [],
+            "sections": [],
+            "overall_limitations_zh": [],
+        }
+        base_translations = valid_parameter_enrichment()["translations"]
+        translations = []
+        for index in range(30):
+            translation = copy.deepcopy(base_translations[index % 3])
+            translation["parameter_id"] = f"p{index + 1:03d}"
+            translations.append(translation)
+        limitation_text = (
+            "制造商数据表未提供完成项目级判断所需的现场边界与设计输入，"
+            "因此本段仅说明证据范围，不据此形成适配性、合规性、性能"
+            "保证或采购结论。"
+        )
+        qualitative_fallback = {
+            "translations": translations,
+            "sections": [
+                {
+                    "section_code": section_code,
+                    "paragraphs": [
+                        {
+                            "analysis_kind": "limitation",
+                            "basis_parameter_ids": [],
+                            "analysis_zh": limitation_text,
+                            "conditions_zh": [],
+                            "limitations_zh": [],
+                        }
+                    ],
+                }
+                for section_code in list(ai.ANALYSIS_SECTION_TITLES)[:5]
+            ],
+            "overall_limitations_zh": [
+                "本分析仅解释制造商数据表提供的信息，不能替代项目设计、"
+                "现场核验、法规审查或制造商确认。"
+            ],
+        }
+        responses = [invalid, invalid, invalid, qualitative_fallback]
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": json.dumps(
+                                    responses[len(calls) - 1]
+                                )
+                            },
+                        }
+                    ]
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(max_response_bytes=20_000, max_evidence_chars=70_000),
+            opener=fake_open,
+        )
+        result = client.analyze_parameters(
+            product={"name": "R5-10K-T2-15"},
+            parameters=source,
+        )
+
+        self.assertEqual(4, len(calls))
+        self.assertEqual(30, result["input_parameter_count"])
+        self.assertEqual(5, len(result["sections"]))
+        self.assertTrue(
+            all(
+                section["paragraphs"][0]["analysis_kind"] == "limitation"
+                and section["paragraphs"][0]["basis_parameter_ids"] == []
+                for section in result["sections"]
+            )
+        )
+        final_repair = calls[3]["messages"][-1]["content"]
+        self.assertIn(
+            "sections must be a JSON array of exactly 5 unique section objects "
+            "in documented display order",
+            final_repair,
+        )
+        self.assertIn(
+            "Each paragraphs field must be a JSON array of exactly one object",
+            final_repair,
+        )
 
     def test_parameter_analysis_stops_after_four_invalid_outputs(self) -> None:
         calls: list[dict] = []

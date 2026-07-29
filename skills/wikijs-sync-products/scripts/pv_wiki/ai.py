@@ -2937,6 +2937,15 @@ class OpenAICompatibleClient:
                         "continuation, source code, or expanded topology phrase. "
                     )
                 )
+                final_section_count = (
+                    5 if len(parameters) >= 30
+                    else (3 if len(parameters) >= 10 else 1)
+                )
+                final_section_noun = (
+                    "section object"
+                    if final_section_count == 1
+                    else "section objects"
+                )
                 final_narrative_fallback_rule = (
                     "Mandatory final-request narrative fallback overrides every "
                     "earlier numeric and phase template: keep every required "
@@ -2947,9 +2956,28 @@ class OpenAICompatibleClient:
                     "ratios, multiples, standards, topology/model/technical codes, "
                     "or 三相. Do not convert, spell, or transliterate an omitted value. "
                     "Choose referenced parameters whose narrative label cores contain "
-                    "none of those tokens. Use [] for conditions_zh and limitations_zh "
-                    "unless a distinct qualitative sentence is essential. This "
-                    "fallback changes narrative fields only, never translations. "
+                    "none of those tokens. "
+                    f"sections must be a JSON array of exactly {final_section_count} "
+                    f"unique {final_section_noun} in documented display order. Each "
+                    "paragraphs field must be a JSON array of exactly one object. "
+                    "Each paragraph must use exactly one of these two shapes; no "
+                    "other paragraph shape is allowed. Shape A: analysis_kind is "
+                    "engineering_interpretation; basis_parameter_ids is a JSON array "
+                    "of exactly one supplied ID whose complete name_zh narrative label "
+                    "core occurs for exactly one translation; analysis_zh is 60-180 "
+                    "characters and starts directly with that unique core. Discuss only "
+                    "that parameter, name no other complete parameter label, and prefer "
+                    "a different unique ID in each section. Shape B: analysis_kind is "
+                    "limitation, "
+                    "basis_parameter_ids is the empty JSON array [], and analysis_zh "
+                    "is a 60-180 "
+                    "character qualitative evidence-boundary analysis_zh. Use Shape A "
+                    "when a safe unique core is available for that section; otherwise "
+                    "use Shape B. "
+                    "conditions_zh and limitations_zh must each be the empty JSON array "
+                    "[]. overall_limitations_zh must be a JSON array of exactly one "
+                    "qualitative string. "
+                    "This fallback changes narrative fields only, never translations. "
                     if next_request_is_final
                     else ""
                 )
