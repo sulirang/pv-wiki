@@ -761,6 +761,8 @@ class CLITests(unittest.TestCase):
             api_key="secret",
             model="analysis-model",
             max_evidence_chars=12_000,
+            thinking_mode="enabled",
+            reasoning_effort="high",
         )
         arguments = (
             "refresh-content",
@@ -775,7 +777,7 @@ class CLITests(unittest.TestCase):
             mock.patch.object(cli, "AISettings") as settings_type,
             mock.patch.object(
                 cli, "OpenAICompatibleClient", return_value=model_client
-            ),
+            ) as client_type,
             mock.patch.object(
                 cli,
                 "_refresh_decision_parameters_from_primary_pdf",
@@ -791,6 +793,10 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, second_code, second_error)
         self.assertTrue(second_payload["ok"])
         self.assertEqual(1, model_client.analyze_parameters.call_count)
+        dedicated_settings = client_type.call_args.args[0]
+        self.assertEqual("disabled", dedicated_settings.thinking_mode)
+        self.assertIsNone(dedicated_settings.reasoning_effort)
+        self.assertEqual(model_settings.max_tokens, dedicated_settings.max_tokens)
         enrichment_audit = second_payload["refreshed"][0]["parameter_enrichment"]
         self.assertTrue(enrichment_audit["analysis_reused"])
         self.assertEqual(0, enrichment_audit["provider_requests"])

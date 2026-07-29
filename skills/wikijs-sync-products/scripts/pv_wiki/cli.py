@@ -3475,6 +3475,10 @@ def _parameter_analysis_request_fingerprint(
     payload = {
         "schema_version": PARAMETER_ANALYSIS_SCHEMA_VERSION,
         "model": settings.model,
+        "max_tokens": settings.max_tokens,
+        "thinking_mode": settings.thinking_mode,
+        "reasoning_effort": settings.reasoning_effort,
+        "json_response_format": settings.json_response_format,
         "messages": messages,
     }
     return hashlib.sha256(
@@ -3573,6 +3577,10 @@ def _enrich_refreshed_parameters(
                 )
             except (AIError, ParameterAnalysisError, TypeError, ValueError) as exc:
                 usage = _ai_response_audit(client)
+                usage["request_max_tokens"] = settings.max_tokens
+                usage["request_thinking_mode"] = (
+                    settings.thinking_mode or "default"
+                )
                 usage["provider_requests"] = _provider_request_count(
                     client,
                     "last_parameter_analysis_provider_requests",
@@ -3584,6 +3592,10 @@ def _enrich_refreshed_parameters(
                 )
                 raise
             usage = _ai_response_audit(client)
+            usage["request_max_tokens"] = settings.max_tokens
+            usage["request_thinking_mode"] = (
+                settings.thinking_mode or "default"
+            )
             usage["provider_requests"] = _provider_request_count(
                 client,
                 "last_parameter_analysis_provider_requests",
@@ -3612,6 +3624,8 @@ def _enrich_refreshed_parameters(
             "prompt_version": run.prompt_version,
             "glossary_version": run.glossary_version,
             "model": run.model,
+            "request_max_tokens": settings.max_tokens,
+            "request_thinking_mode": settings.thinking_mode or "default",
             "input_parameter_count": len(parameters),
             "input_complete": True,
             "provider_requests": (
@@ -5046,7 +5060,16 @@ def _cmd_refresh_content(args: argparse.Namespace) -> int:
         analysis_settings: AISettings | None = None
         analysis_client: OpenAICompatibleClient | None = None
         if args.analyze_parameters and candidates:
-            analysis_settings = AISettings.from_env()
+            configured_analysis_settings = AISettings.from_env()
+            analysis_settings = (
+                replace(
+                    configured_analysis_settings,
+                    thinking_mode="disabled",
+                    reasoning_effort=None,
+                )
+                if configured_analysis_settings.thinking_mode == "enabled"
+                else configured_analysis_settings
+            )
             analysis_client = OpenAICompatibleClient(analysis_settings)
         for candidate in candidates:
             try:

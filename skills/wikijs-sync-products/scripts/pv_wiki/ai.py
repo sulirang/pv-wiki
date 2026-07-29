@@ -1415,7 +1415,7 @@ def build_parameter_analysis_messages(
                     "section_code": "one documented section code",
                     "paragraphs": {
                         "minItems": 1,
-                        "maxItems": 3,
+                        "maxItems": 2,
                         "item": {
                             "analysis_kind": sorted(ANALYSIS_KINDS),
                             "basis_parameter_ids": (
@@ -1423,16 +1423,16 @@ def build_parameter_analysis_messages(
                                 "guidance; 0-8 for a limitation"
                             ),
                             "analysis_zh": (
-                                "one professional Chinese paragraph, 40-800 "
+                                "one professional Chinese paragraph, 40-500 "
                                 "characters; every numeric token must occur in a "
                                 "referenced parameter name or value; use exact "
                                 "source numbers and units without conversion"
                             ),
                             "conditions_zh": (
-                                "0-3 explicit conditions, each professional Chinese"
+                                "0-2 explicit conditions, each professional Chinese"
                             ),
                             "limitations_zh": (
-                                "0-3 explicit evidence limitations, each "
+                                "0-2 explicit evidence limitations, each "
                                 "professional Chinese"
                             ),
                         },
@@ -1461,6 +1461,10 @@ def build_parameter_analysis_messages(
             "Never claim suitability for a residence, commercial site, climate, "
             "grid code, string design, component, or project without the missing "
             "site-specific inputs. State the limitation instead.",
+            "Keep the JSON compact: normally write one 60-240 character Chinese "
+            "paragraph per included section and use a second paragraph only when "
+            "essential. Use conditions_zh and limitations_zh only for distinct "
+            "information, never to repeat the paragraph.",
             "Return every translation, even when a parameter is not discussed in "
             "the narrative analysis.",
         ],
@@ -2696,7 +2700,10 @@ class OpenAICompatibleClient:
                         "term; reference only supplied parameter IDs; use only "
                         "source numeric tokens without conversion; include "
                         "professional multi-section Chinese analysis and at least "
-                        "one overall limitation. No prose or Markdown outside JSON."
+                        "one overall limitation. Keep it compact: normally one "
+                        "60-240 character paragraph per section, a second only if "
+                        "essential, and no repeated conditions or limitations. "
+                        "No prose or Markdown outside JSON."
                     ),
                 },
             ]

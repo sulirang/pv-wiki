@@ -715,6 +715,16 @@ class PromptTests(unittest.TestCase):
             "Return every translation",
             " ".join(prompt["analysis_policy"]),
         )
+        self.assertIn(
+            "one 60-240 character",
+            " ".join(prompt["analysis_policy"]),
+        )
+        self.assertEqual(
+            2,
+            prompt["output_contract"]["sections"]["item"]["paragraphs"][
+                "maxItems"
+            ],
+        )
         self.assertEqual(
             "直流输入（DC）",
             prompt["controlled_section_translations"]["input (dc)"],

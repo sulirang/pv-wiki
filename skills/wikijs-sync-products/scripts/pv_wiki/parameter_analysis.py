@@ -12,7 +12,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 1
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v1"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v2"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v1"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -459,9 +459,9 @@ def validate_parameter_enrichment(
         paragraphs_raw = section_raw.get("paragraphs")
         if not isinstance(paragraphs_raw, list) or not 1 <= len(
             paragraphs_raw
-        ) <= 3:
+        ) <= 2:
             raise ParameterAnalysisError(
-                f"{prefix}.paragraphs must contain 1-3 entries"
+                f"{prefix}.paragraphs must contain 1-2 entries"
             )
         paragraphs: list[dict[str, Any]] = []
         for paragraph_index, paragraph_raw in enumerate(paragraphs_raw):
@@ -503,7 +503,7 @@ def validate_parameter_enrichment(
                 paragraph_raw.get("analysis_zh"),
                 f"{paragraph_prefix}.analysis_zh",
                 required=True,
-                limit=800,
+                limit=500,
                 require_han=True,
             )
             if len(analysis_zh) < 40:
@@ -513,13 +513,13 @@ def validate_parameter_enrichment(
             conditions = _string_list(
                 paragraph_raw.get("conditions_zh", []),
                 f"{paragraph_prefix}.conditions_zh",
-                limit=3,
+                limit=2,
                 item_limit=300,
             )
             limitations = _string_list(
                 paragraph_raw.get("limitations_zh", []),
                 f"{paragraph_prefix}.limitations_zh",
-                limit=3,
+                limit=2,
                 item_limit=300,
             )
             basis_rows = [source_by_id[item] for item in basis_ids]
