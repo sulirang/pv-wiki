@@ -689,7 +689,7 @@ class PromptTests(unittest.TestCase):
             "translate_and_analyze_complete_verified_parameter_set",
             prompt["task"],
         )
-        self.assertEqual("pv-parameter-analysis-v18", prompt["prompt_version"])
+        self.assertEqual("pv-parameter-analysis-v19", prompt["prompt_version"])
         self.assertEqual("pv-zh-technical-v6", prompt["glossary_version"])
         self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
         self.assertTrue(
@@ -803,7 +803,14 @@ class PromptTests(unittest.TestCase):
             prompt["numeric_narrative_mode_rules"],
         )
         self.assertIn(
-            "end at ；, ;, 。, ., !, ！, or paragraph end",
+            "analysis_zh must start exactly",
+            prompt["numeric_narrative_mode_rules"][
+                "grounded_three_phase_topology"
+            ],
+        )
+        self.assertIn(
+            "Never put 三相 in conditions_zh or limitations_zh or "
+            "overall_limitations_zh",
             prompt["numeric_narrative_mode_rules"][
                 "grounded_three_phase_topology"
             ],
@@ -1395,21 +1402,13 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             repair_content,
         )
         self.assertIn(
-            "independent affirmative clause exactly "
-            "<complete name_zh narrative label core>为三相",
+            "analysis_zh must start exactly <complete name_zh narrative "
+            "label core>为三相；",
             repair_content,
         )
         self.assertIn(
-            "No prefix, negation, question, later contradiction, "
-            "topology continuation",
-            repair_content,
-        )
-        self.assertIn(
-            "phase clause required exactly:",
-            repair_content,
-        )
-        self.assertIn(
-            "phase clause unavailable in cited basis",
+            "Never put 三相 in conditions_zh, limitations_zh, or "
+            "overall_limitations_zh",
             repair_content,
         )
         self.assertIn(
@@ -1580,11 +1579,16 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             "该并网接线方式为三相；带有前置指代的句式不符合精确独立"
             "分句模板，工程应用仍需核对现场电网与接地要求。"
         )
+        phase_omitted = copy.deepcopy(valid)
+        phase_omitted["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "并网接线方式采用制造商数据表列示的配置；该参数用于说明交流"
+            "侧连接信息，项目应用仍需核对现场电网与接地要求。"
+        )
         responses = [
             {"translations": [], "sections": [], "overall_limitations_zh": []},
             scalar_list,
             invalid_phase,
-            valid,
+            phase_omitted,
         ]
 
         def fake_open(request: object, *, timeout: float) -> FakeResponse:
@@ -1614,10 +1618,29 @@ class OpenAICompatibleClientTests(unittest.TestCase):
 
         self.assertTrue(result["input_complete"])
         self.assertEqual(4, client.last_parameter_analysis_provider_requests)
+        self.assertNotIn(
+            "三相",
+            result["sections"][0]["paragraphs"][0]["analysis_zh"],
+        )
         final_repair = calls[3]["messages"][-1]["content"]
+        self.assertNotIn("phase clause required exactly:", final_repair)
         self.assertIn(
-            "phase clause required exactly: 并网接线方式为三相 "
-            "as a whole independent clause",
+            "Mandatory phase repair for this retry overrides every earlier "
+            "phase template",
+            final_repair,
+        )
+        self.assertIn(
+            "remove every occurrence of 三相 from analysis_zh, conditions_zh, "
+            "limitations_zh, and overall_limitations_zh",
+            final_repair,
+        )
+        self.assertIn(
+            "phase narrative must be omitted from every narrative field",
+            final_repair,
+        )
+        self.assertNotIn(
+            "analysis_zh must start exactly <complete name_zh narrative "
+            "label core>为三相；",
             final_repair,
         )
         self.assertIn(
@@ -1628,6 +1651,59 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             "translations must contain exactly one item",
             final_repair,
         )
+
+    def test_parameter_analysis_final_request_omits_phase_proactively(
+        self,
+    ) -> None:
+        calls: list[dict] = []
+        invalid = {
+            "translations": [],
+            "sections": [],
+            "overall_limitations_zh": [],
+        }
+        responses = [invalid, invalid, invalid, valid_parameter_enrichment()]
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": json.dumps(
+                                    responses[len(calls) - 1]
+                                )
+                            },
+                        }
+                    ]
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(max_response_bytes=20_000, max_evidence_chars=12_000),
+            opener=fake_open,
+        )
+        result = client.analyze_parameters(
+            product={"name": "R5-10K-T2-15"},
+            parameters=analysis_parameters(),
+        )
+
+        self.assertTrue(result["input_complete"])
+        self.assertEqual(4, client.last_parameter_analysis_provider_requests)
+        final_repair = calls[3]["messages"][-1]["content"]
+        self.assertIn(
+            "Mandatory phase repair for this retry overrides every earlier "
+            "phase template",
+            final_repair,
+        )
+        self.assertIn(
+            "phase narrative must be omitted from every narrative field",
+            final_repair,
+        )
+        self.assertNotIn("phase clause required exactly:", final_repair)
+        self.assertNotIn("phase clause unavailable in cited basis", final_repair)
 
     def test_parameter_analysis_stops_after_four_invalid_outputs(self) -> None:
         calls: list[dict] = []
