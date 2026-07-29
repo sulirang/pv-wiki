@@ -112,6 +112,16 @@ def translation_enrichment() -> dict[str, object]:
     return item
 
 
+def distinguish_third_ac_power_parameter(
+    source: list[dict[str, object]],
+    item: dict[str, object],
+) -> None:
+    """Keep focused p001 tests free of an accidental duplicate p003 label."""
+
+    source[2]["name"] = "Max. AC Power [W]"
+    item["translations"][2]["name_zh"] = "最大交流功率 [W]"
+
+
 class ParameterAnalysisTests(unittest.TestCase):
     def test_validates_complete_translations_and_grounded_analysis(self) -> None:
         result = validate_parameter_enrichment(enrichment(), parameters())
@@ -473,8 +483,10 @@ class ParameterAnalysisTests(unittest.TestCase):
         ac_source[0]["name"] = "Rated AC Power [W]"
         ac_source[0]["value"] = "10000"
         ac_source[0]["unit"] = "W"
+        ac_source[2]["name"] = "Max. AC Power [W]"
         ac_item = copy.deepcopy(enrichment())
         ac_item["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        ac_item["translations"][2]["name_zh"] = "最大交流功率 [W]"
         ac_item["sections"][0]["paragraphs"][0][
             "basis_parameter_ids"
         ] = ["p001"]
@@ -507,8 +519,20 @@ class ParameterAnalysisTests(unittest.TestCase):
         missing_basis["sections"][0]["paragraphs"][0][
             "basis_parameter_ids"
         ] = ["p002"]
-        with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
-            validate_parameter_enrichment(missing_basis, parameters())
+        repaired_basis = validate_parameter_enrichment(
+            missing_basis,
+            parameters(),
+        )
+        self.assertEqual(
+            ["p002", "p001"],
+            repaired_basis["sections"][0]["paragraphs"][0][
+                "basis_parameter_ids"
+            ],
+        )
+        self.assertEqual(
+            repaired_basis,
+            validate_parameter_enrichment(repaired_basis, parameters()),
+        )
 
         voltage_conversion = copy.deepcopy(item)
         voltage_conversion["sections"][0]["paragraphs"][0][
@@ -637,6 +661,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         source[0]["unit"] = "W"
         item = copy.deepcopy(enrichment())
         item["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(source, item)
         paragraph = item["sections"][0]["paragraphs"][0]
         paragraph["basis_parameter_ids"] = ["p001"]
         paragraph["analysis_zh"] = (
@@ -654,6 +679,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         source[0]["unit"] = "W"
         item = copy.deepcopy(enrichment())
         item["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(source, item)
         paragraph = item["sections"][0]["paragraphs"][0]
         paragraph["basis_parameter_ids"] = ["p001"]
         paragraph["analysis_zh"] = (
@@ -727,6 +753,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         source[0]["unit"] = "W"
         item = copy.deepcopy(enrichment())
         item["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(source, item)
         paragraph = item["sections"][0]["paragraphs"][0]
         paragraph["basis_parameter_ids"] = ["p001"]
         paragraph["analysis_zh"] = (
@@ -898,6 +925,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         power_source[0]["unit"] = "w"
         power_item = copy.deepcopy(enrichment())
         power_item["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(power_source, power_item)
         power_paragraph = power_item["sections"][0]["paragraphs"][0]
         power_paragraph["basis_parameter_ids"] = ["p001"]
         power_paragraph["analysis_zh"] = (
@@ -913,6 +941,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         source[0]["unit"] = "W"
         item = copy.deepcopy(enrichment())
         item["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(source, item)
         paragraph = item["sections"][0]["paragraphs"][0]
         paragraph["basis_parameter_ids"] = ["p001"]
         paragraph["analysis_zh"] = (
@@ -1102,6 +1131,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         )
         valid = copy.deepcopy(enrichment())
         valid["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(source, valid)
         paragraph = valid["sections"][0]["paragraphs"][0]
         paragraph["basis_parameter_ids"] = ["p001"]
         paragraph["analysis_zh"] = (
@@ -1162,6 +1192,10 @@ class ParameterAnalysisTests(unittest.TestCase):
                 collision_source[0].update(name=name, value=value, unit=unit)
                 collision_item = copy.deepcopy(enrichment())
                 collision_item["translations"][0]["name_zh"] = name_zh
+                distinguish_third_ac_power_parameter(
+                    collision_source,
+                    collision_item,
+                )
                 collision_paragraph = collision_item["sections"][0]["paragraphs"][0]
                 collision_paragraph["basis_parameter_ids"] = ["p001"]
                 collision_paragraph["analysis_zh"] = (
@@ -1437,6 +1471,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         )
         valid = copy.deepcopy(enrichment())
         valid["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(source, valid)
         paragraph = valid["sections"][0]["paragraphs"][0]
         paragraph["basis_parameter_ids"] = ["p001"]
         invalid_claims = (
@@ -1673,18 +1708,221 @@ class ParameterAnalysisTests(unittest.TestCase):
                 safe["sections"][0]["paragraphs"][0]["analysis_zh"] = safe_analysis
                 validate_parameter_enrichment(safe, source)
 
-        unreferenced = copy.deepcopy(item)
-        unreferenced_paragraph = unreferenced["sections"][0]["paragraphs"][0]
-        unreferenced_paragraph["basis_parameter_ids"] = ["p003"]
-        unreferenced_paragraph["analysis_zh"] = (
+        auto_cited = copy.deepcopy(item)
+        auto_cited_paragraph = auto_cited["sections"][0]["paragraphs"][0]
+        auto_cited_paragraph["basis_parameter_ids"] = ["p003"]
+        auto_cited_paragraph["analysis_zh"] = (
+            "最大交流功率用于说明交流侧容量边界，额定交流功率与备用"
+            "交流功率均需依照各自定义和制造商给出的适用条件分别核对。"
+        )
+        normalized = validate_parameter_enrichment(auto_cited, source)
+        self.assertEqual(
+            ["p003", "p001", "p002"],
+            normalized["sections"][0]["paragraphs"][0][
+                "basis_parameter_ids"
+            ],
+        )
+        self.assertEqual(
+            normalized,
+            validate_parameter_enrichment(normalized, source),
+        )
+
+        auto_cited_arithmetic = copy.deepcopy(item)
+        arithmetic_paragraph = auto_cited_arithmetic["sections"][0][
+            "paragraphs"
+        ][0]
+        arithmetic_paragraph["basis_parameter_ids"] = ["p003"]
+        arithmetic_paragraph["analysis_zh"] = (
             "最大交流功率为 15 kW；该来源值恰好等于额定交流功率与"
             "备用交流功率之和，但后两项未列入本段依据。"
         )
         with self.assertRaisesRegex(
             ParameterAnalysisError,
-            "unreferenced parameter label",
+            "cross-row arithmetic",
         ):
-            validate_parameter_enrichment(unreferenced, source)
+            validate_parameter_enrichment(auto_cited_arithmetic, source)
+
+    def test_auto_cites_only_unique_maximal_parameter_labels(self) -> None:
+        source = parameters()
+        source[0].update(name="DC Voltage", value="1000", unit="V")
+        source[1].update(name="Max. DC Voltage", value="1100", unit="V")
+        item = copy.deepcopy(enrichment())
+        item["translations"][0]["name_zh"] = "直流电压"
+        item["translations"][1]["name_zh"] = "最大直流电压"
+        paragraph = item["sections"][0]["paragraphs"][0]
+        paragraph["basis_parameter_ids"] = ["p003"]
+        paragraph["analysis_zh"] = (
+            "最大直流电压用于界定设备直流侧的电气边界，具体应用仍需"
+            "结合制造商条件、组件特性与项目设计独立核对。"
+        )
+
+        normalized = validate_parameter_enrichment(item, source)
+
+        self.assertEqual(
+            ["p003", "p002"],
+            normalized["sections"][0]["paragraphs"][0][
+                "basis_parameter_ids"
+            ],
+        )
+
+        ambiguous = copy.deepcopy(item)
+        ambiguous["translations"][1]["name_zh"] = "直流电压"
+        ambiguous["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "直流电压用于界定设备直流侧的电气边界，具体应用仍需结合"
+            "制造商条件、组件特性与项目设计独立核对。"
+        )
+        ambiguous_source = copy.deepcopy(source)
+        ambiguous_source[1]["name"] = "DC Voltage"
+        for basis_ids in (["p003"], ["p001"]):
+            with self.subTest(basis_ids=basis_ids):
+                ambiguous["sections"][0]["paragraphs"][0][
+                    "basis_parameter_ids"
+                ] = basis_ids
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    r"ambiguous IDs: p001, p002",
+                ):
+                    validate_parameter_enrichment(
+                        ambiguous,
+                        ambiguous_source,
+                    )
+
+        overlapping = copy.deepcopy(item)
+        overlapping["translations"][0]["name_zh"] = "输入输出"
+        overlapping["translations"][1]["name_zh"] = "输出功率"
+        overlapping["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "输入输出功率边界无法通过交叉重叠的参数标签唯一定位，具体"
+            "应用仍需结合制造商定义和项目条件分别核对。"
+        )
+        overlapping_source = copy.deepcopy(source)
+        overlapping_source[0]["name"] = "Feature Alpha"
+        overlapping_source[1]["name"] = "Feature Beta"
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            r"mapped unambiguously to IDs: p001, p002",
+        ):
+            validate_parameter_enrichment(
+                overlapping,
+                overlapping_source,
+            )
+
+    def test_auto_cited_numeric_claim_still_requires_local_label(self) -> None:
+        item = copy.deepcopy(enrichment())
+        paragraph = item["sections"][0]["paragraphs"][0]
+        paragraph["basis_parameter_ids"] = ["p001"]
+        paragraph["analysis_zh"] = (
+            "160–950 V 不能在缺少完整参数标签局部绑定时作为参数结论"
+            "发布；MPPT 电压范围仍须按制造商数据表定义核对。"
+        )
+
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            'must be immediately preceded by exact label "MPPT 电压范围"',
+        ):
+            validate_parameter_enrichment(item, parameters())
+
+    def test_auto_cites_across_fields_after_nfkc_normalization(self) -> None:
+        item = copy.deepcopy(enrichment())
+        paragraph = item["sections"][0]["paragraphs"][0]
+        paragraph["basis_parameter_ids"] = ["p003"]
+        paragraph["analysis_zh"] = (
+            "额定交流功率用于说明交流侧的制造商额定边界，具体应用仍需"
+            "结合运行条件、电网要求与项目设计分别核对。"
+        )
+        paragraph["conditions_zh"] = [
+            "最大光伏阵列功率需按制造商定义和组件条件核对。"
+        ]
+        paragraph["limitations_zh"] = [
+            "ＭＰＰＴ 电压范围不能替代具体的组串设计。"
+        ]
+
+        normalized = validate_parameter_enrichment(item, parameters())
+
+        self.assertEqual(
+            ["p003", "p001", "p002"],
+            normalized["sections"][0]["paragraphs"][0][
+                "basis_parameter_ids"
+            ],
+        )
+        self.assertEqual(
+            normalized,
+            validate_parameter_enrichment(normalized, parameters()),
+        )
+
+    def test_does_not_auto_cite_more_than_eight_parameter_ids(self) -> None:
+        labels = (
+            "输入能力",
+            "输出能力",
+            "直流特性",
+            "交流特性",
+            "运行环境",
+            "保护机制",
+            "通信方式",
+            "安装方式",
+            "维护要求",
+        )
+        source = [
+            {
+                "name": f"Feature {letter}",
+                "section": "General Data",
+                "value": "Optional",
+                "unit": "",
+                "confidence": 1.0,
+            }
+            for letter in "ABCDEFGHI"
+        ]
+        item = {
+            "translations": [
+                {
+                    "parameter_id": f"p{index:03d}",
+                    "name_zh": label,
+                    "section_zh": "常规参数",
+                    "subsection_zh": "",
+                    "value_zh": "可选",
+                }
+                for index, label in enumerate(labels, start=1)
+            ],
+            "sections": [
+                {
+                    "section_code": "installation",
+                    "paragraphs": [
+                        {
+                            "analysis_kind": "engineering_interpretation",
+                            "basis_parameter_ids": ["p001"],
+                            "analysis_zh": (
+                                "输入能力、输出能力、直流特性、交流特性、"
+                                "运行环境、保护机制、通信方式、安装方式与"
+                                "维护要求均需依据制造商定义分别核对。"
+                            ),
+                            "conditions_zh": [],
+                            "limitations_zh": [],
+                        }
+                    ],
+                }
+            ],
+            "overall_limitations_zh": [
+                "本分析仅解释制造商数据表参数，不构成项目设计结论。"
+            ],
+        }
+
+        exactly_eight = copy.deepcopy(item)
+        exactly_eight["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "输入能力、输出能力、直流特性、交流特性、运行环境、保护"
+            "机制、通信方式与安装方式均需依据制造商定义分别核对。"
+        )
+        normalized = validate_parameter_enrichment(exactly_eight, source)
+        self.assertEqual(
+            [f"p{index:03d}" for index in range(1, 9)],
+            normalized["sections"][0]["paragraphs"][0][
+                "basis_parameter_ids"
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            "would exceed the 8-ID basis_parameter_ids limit",
+        ):
+            validate_parameter_enrichment(item, source)
 
     def test_accepts_single_row_native_arithmetic_metrics(self) -> None:
         cases = (
@@ -1970,6 +2208,7 @@ class ParameterAnalysisTests(unittest.TestCase):
         )
         power = copy.deepcopy(enrichment())
         power["translations"][0]["name_zh"] = "额定交流功率 [W]"
+        distinguish_third_ac_power_parameter(power_source, power)
         paragraph = power["sections"][0]["paragraphs"][0]
         paragraph["basis_parameter_ids"] = ["p001"]
         paragraph["analysis_zh"] = (

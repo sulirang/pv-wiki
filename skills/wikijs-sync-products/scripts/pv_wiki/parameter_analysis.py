@@ -1688,44 +1688,74 @@ def _measurement_spans(
     return verified, invalid
 
 
-def _reject_unreferenced_parameter_labels(
+def _unreferenced_parameter_label_ids(
     text_values: Sequence[str],
     referenced_ids: Sequence[str],
     labels_by_id: Mapping[str, str],
     field: str,
-) -> None:
-    """Require every mentioned complete parameter label to be cited."""
+) -> list[str]:
+    """Return safely resolvable IDs for uncited complete label mentions."""
+
+    ids_by_label: dict[str, list[str]] = {}
+    for parameter_id, label in labels_by_id.items():
+        if label:
+            ids_by_label.setdefault(label, []).append(parameter_id)
 
     referenced = set(referenced_ids)
-    referenced_labels = [
-        label for parameter_id, label in labels_by_id.items()
-        if parameter_id in referenced and label
-    ]
-    unreferenced = [
-        (parameter_id, label)
-        for parameter_id, label in labels_by_id.items()
-        if parameter_id not in referenced and label
-    ]
-    offending_ids: list[str] = []
+    additional_ids: list[str] = []
     for raw_text in text_values:
         text = unicodedata.normalize("NFKC", raw_text)
-        referenced_spans = [
-            match.span()
-            for label in referenced_labels
+        matches = [
+            (match.start(), match.end(), label)
+            for label in ids_by_label
             for match in re.finditer(re.escape(label), text)
         ]
-        for parameter_id, label in unreferenced:
-            for match in re.finditer(re.escape(label), text):
-                if _span_is_covered(match.span(), referenced_spans):
+        maximal_matches = [
+            candidate
+            for candidate in matches
+            if not any(
+                (other[1] - other[0]) > (candidate[1] - candidate[0])
+                and _span_is_covered(
+                    (candidate[0], candidate[1]),
+                    [(other[0], other[1])],
+                )
+                for other in matches
+            )
+        ]
+        overlapping_ids: list[str] = []
+        for index, candidate in enumerate(maximal_matches):
+            candidate_span = (candidate[0], candidate[1])
+            for other in maximal_matches[index + 1:]:
+                if not _spans_overlap(
+                    candidate_span,
+                    (other[0], other[1]),
+                ):
                     continue
-                offending_ids.append(parameter_id)
-                break
-    if offending_ids:
-        raise ParameterAnalysisError(
-            f"{field} contains numeric text or an unreferenced parameter label; "
-            f"add these IDs to basis_parameter_ids: "
-            f"{', '.join(list(dict.fromkeys(offending_ids))[:8])}"
-        )
+                overlapping_ids.extend(ids_by_label[candidate[2]])
+                overlapping_ids.extend(ids_by_label[other[2]])
+        if overlapping_ids:
+            raise ParameterAnalysisError(
+                f"{field} contains overlapping complete parameter labels "
+                "that cannot be mapped unambiguously to IDs: "
+                f"{', '.join(list(dict.fromkeys(overlapping_ids))[:8])}"
+            )
+
+        for _start, _end, label in sorted(maximal_matches):
+            parameter_ids = ids_by_label[label]
+            if len(parameter_ids) != 1:
+                if set(parameter_ids).issubset(referenced):
+                    continue
+                raise ParameterAnalysisError(
+                    f"{field} contains a complete parameter label that maps "
+                    "to ambiguous IDs: "
+                    f"{', '.join(parameter_ids[:8])}"
+                )
+            if referenced.intersection(parameter_ids):
+                continue
+            parameter_id = parameter_ids[0]
+            referenced.add(parameter_id)
+            additional_ids.append(parameter_id)
+    return additional_ids
 
 
 def _ground_numbers(
@@ -2098,15 +2128,26 @@ def validate_parameter_enrichment(
                 limit=2,
                 item_limit=300,
             )
-            basis_rows = [source_by_id[item] for item in basis_ids]
-            basis_labels = [translation_by_id[item]["name_zh"] for item in basis_ids]
             paragraph_text_values = [analysis_zh, *conditions, *limitations]
-            _reject_unreferenced_parameter_labels(
+            additional_basis_ids = _unreferenced_parameter_label_ids(
                 paragraph_text_values,
                 basis_ids,
                 narrative_label_by_id,
                 paragraph_prefix,
             )
+            if additional_basis_ids:
+                if len(basis_ids) + len(additional_basis_ids) > 8:
+                    raise ParameterAnalysisError(
+                        f"{paragraph_prefix} contains uncited complete parameter "
+                        "labels, but adding their IDs would exceed the 8-ID "
+                        "basis_parameter_ids limit: "
+                        f"{', '.join(additional_basis_ids[:8])}"
+                    )
+                basis_ids = [*basis_ids, *additional_basis_ids]
+            basis_rows = [source_by_id[item] for item in basis_ids]
+            basis_labels = [
+                translation_by_id[item]["name_zh"] for item in basis_ids
+            ]
             _ground_numbers(
                 paragraph_text_values,
                 basis_rows,
