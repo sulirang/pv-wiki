@@ -729,6 +729,14 @@ class PromptTests(unittest.TestCase):
             "直流输入（DC）",
             prompt["controlled_section_translations"]["input (dc)"],
         )
+        self.assertEqual(
+            ["过流保护", "过电流保护"],
+            prompt["controlled_compound_terms"]["Over Current Protection"],
+        )
+        self.assertIn(
+            "compound term",
+            prompt["controlled_term_rule"],
+        )
 
     def test_parameter_analysis_prompt_refuses_truncated_input(self) -> None:
         with self.assertRaisesRegex(

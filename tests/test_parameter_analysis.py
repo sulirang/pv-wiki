@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -203,6 +204,24 @@ class ParameterAnalysisTests(unittest.TestCase):
             restored["translations"][0]["name_zh"],
         )
 
+        for source_name, name_zh, expected in (
+            ("Power Factor [cos φ]", "功率因数", "功率因数 [cos φ]"),
+            (
+                "Total Harmonic Distortion [THDi]",
+                "总谐波畸变率",
+                "总谐波畸变率 [THDi]",
+            ),
+            ("Dimensions [H*W*D][mm]", "尺寸", "尺寸 [H*W*D] [mm]"),
+            ("Standard Warranty [Year]", "标准质保", "标准质保 [Year]"),
+        ):
+            with self.subTest(source_name=source_name):
+                bracket_source = parameters()
+                bracket_source[0]["name"] = source_name
+                bracket_item = copy.deepcopy(enrichment())
+                bracket_item["translations"][0]["name_zh"] = name_zh
+                restored = validate_parameter_enrichment(bracket_item, bracket_source)
+                self.assertEqual(expected, restored["translations"][0]["name_zh"])
+
         for source_name, name_zh in (
             ("Input index [2]", "输入索引"),
             ("Input option [Optional]", "输入选项"),
@@ -235,6 +254,44 @@ class ParameterAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ParameterAnalysisError, "protected token 2"):
             validate_parameter_enrichment(numeric_item, numeric_source)
 
+        attached_source = parameters()
+        attached_source[0]["name"] = "Rated AC Current [A]@230Vac"
+        attached_item = copy.deepcopy(enrichment())
+        attached_item["translations"][0]["name_zh"] = "额定交流电流 [A]"
+        with self.assertRaisesRegex(ParameterAnalysisError, "230Vac"):
+            validate_parameter_enrichment(attached_item, attached_source)
+        attached_item["translations"][0]["name_zh"] = (
+            "额定交流电流 [A]@230Vac"
+        )
+        validate_parameter_enrichment(attached_item, attached_source)
+
+        uppercase_source = parameters()
+        uppercase_source[0]["name"] = "Rated AC Current [A]@230VAC"
+        uppercase_item = copy.deepcopy(enrichment())
+        uppercase_item["translations"][0]["name_zh"] = "额定交流电流 [A]"
+        with self.assertRaisesRegex(ParameterAnalysisError, "230VAC"):
+            validate_parameter_enrichment(uppercase_item, uppercase_source)
+
+        for source_name, name_zh, token in (
+            ("Range 160-950V", "范围 160", "950V"),
+            ("Power 10kW", "功率", "10kW"),
+            ("Current 20A", "电流", "20A"),
+            ("Efficiency 98.6%", "效率", "98.6%"),
+            ("Temperature 50°C", "温度", "50°C"),
+        ):
+            with self.subTest(source_name=source_name):
+                unit_source = parameters()
+                unit_source[0]["name"] = source_name
+                unit_item = copy.deepcopy(enrichment())
+                unit_item["translations"][0]["name_zh"] = name_zh
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    re.escape(token),
+                ):
+                    validate_parameter_enrichment(unit_item, unit_source)
+                unit_item["translations"][0]["name_zh"] += f" {token}"
+                validate_parameter_enrichment(unit_item, unit_source)
+
         numeric_item["translations"][0]["name_zh"] = "输入 12 功率 [Wp]"
         with self.assertRaisesRegex(ParameterAnalysisError, "protected token 2"):
             validate_parameter_enrichment(numeric_item, numeric_source)
@@ -251,6 +308,64 @@ class ParameterAnalysisTests(unittest.TestCase):
             "最大 2 电压（MPPT） [V]",
             restored["translations"][0]["name_zh"],
         )
+
+    def test_accepts_professional_compound_controlled_terms(self) -> None:
+        for source_name, name_zh in (
+            (
+                "Max. AC Over Current Protection [A]",
+                "最大交流过流保护 [A]",
+            ),
+            ("Overcurrent Protection", "过流保护"),
+            ("Overvoltage Protection", "过压保护"),
+            ("Internal Over-voltage Protection", "内部过压保护"),
+            ("Cooling Method", "散热方式"),
+            ("Ingress Protection", "防护等级"),
+        ):
+            with self.subTest(source_name=source_name):
+                source = parameters()
+                source[0]["name"] = source_name
+                item = copy.deepcopy(enrichment())
+                item["translations"][0]["name_zh"] = name_zh
+                validate_parameter_enrichment(item, source)
+
+        for source_name, name_zh in (
+            ("Rated Current [A]", "额定参数 [A]"),
+            ("DC Voltage [V]", "直流参数 [V]"),
+            ("Circuit Protection", "电路功能"),
+            ("Cooling Method", "运行方式"),
+            ("Overcurrent Protection", "保护"),
+            ("Overvoltage Protection Voltage Range", "过压保护范围"),
+        ):
+            with self.subTest(source_name=source_name):
+                source = parameters()
+                source[0]["name"] = source_name
+                item = copy.deepcopy(enrichment())
+                item["translations"][0]["name_zh"] = name_zh
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    r"controlled (?:compound )?term",
+                ):
+                    validate_parameter_enrichment(item, source)
+
+    def test_attached_numeric_tokens_are_grounded_in_analysis(self) -> None:
+        source = parameters()
+        source[0]["name"] = "Rated AC Current [A]@230Vac"
+        item = copy.deepcopy(enrichment())
+        item["translations"][0]["name_zh"] = "额定交流电流 [A]@230Vac"
+        item["sections"][0]["paragraphs"][0]["analysis_zh"] += (
+            " 该交流电流参数以 230 Vac 为参考条件。"
+        )
+        validate_parameter_enrichment(item, source)
+
+        unsupported = copy.deepcopy(item)
+        unsupported["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            unsupported["sections"][0]["paragraphs"][0]["analysis_zh"].replace(
+                "230 Vac",
+                "231 Vac",
+            )
+        )
+        with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
+            validate_parameter_enrichment(unsupported, source)
 
     def test_rejects_numeric_claim_not_present_in_basis(self) -> None:
         item = copy.deepcopy(enrichment())

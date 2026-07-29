@@ -1380,6 +1380,15 @@ def build_parameter_analysis_messages(
             "Weight": "重量",
             "Warranty": "质保",
         },
+        "controlled_compound_terms": {
+            "Over Current Protection": ["过流保护", "过电流保护"],
+            "Over-voltage Protection": ["过压保护", "过电压保护"],
+            "Cooling Method": ["散热方式", "冷却方式"],
+            "Ingress Protection": ["防护等级"],
+        },
+        "controlled_term_rule": (
+            "Prefer a matching controlled compound term over word-by-word terms."
+        ),
         "output_contract": {
             "translations": {
                 "count": len(rows),

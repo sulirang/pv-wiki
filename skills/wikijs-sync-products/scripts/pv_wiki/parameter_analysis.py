@@ -12,8 +12,8 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v4"
-PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v1"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v5"
+PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v2"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
 
@@ -69,8 +69,34 @@ _REQUIRED_TERMS = (
     (re.compile(r"\bWeight\b", re.IGNORECASE), "重量"),
     (re.compile(r"\bWarranty\b", re.IGNORECASE), "质保"),
 )
+_COMPOUND_REQUIRED_TERMS = (
+    (
+        re.compile(r"\bOver(?:[ -]?Current)\b", re.IGNORECASE),
+        ("过流", "过电流"),
+    ),
+    (
+        re.compile(r"\bOver(?:[ -]?voltage)\b", re.IGNORECASE),
+        ("过压", "过电压"),
+    ),
+    (
+        re.compile(r"\bCooling\s+Method\b", re.IGNORECASE),
+        ("散热方式", "冷却方式"),
+    ),
+    (
+        re.compile(r"\bIngress\s+Protection\b", re.IGNORECASE),
+        ("防护等级",),
+    ),
+)
+_UNIT_ATOM_PATTERN = (
+    r"(?:%|°[CF]|K|(?:p|n|u|µ|m|c|d|k|M|G)?(?:"
+    r"A(?:h|ac|dc)?|V(?:A|Ar|ac|dc)?|W(?:p|h)?|Hz|"
+    r"Ω|ohm|g|m(?:2|3)?|s(?:2)?|h|Pa|bar|dB(?:A)?|rpm|years?"
+    r"))"
+)
 _PROTECTED_TOKEN_RE = re.compile(
     r"\[[^\[\]\r\n]{1,24}\]"
+    rf"|(?<![A-Za-z0-9])\d+(?:\.\d+)?(?i:{_UNIT_ATOM_PATTERN})"
+    r"(?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])(?:"
     r"MPPT|THD[iI]?|DCI|GFCI|AFCI|STC|NMOT|"
     r"RS\d+|Wi-Fi|GPRS|[345]G|IP\d+"
@@ -81,17 +107,14 @@ _RESTORABLE_ABBREVIATION_RE = re.compile(
     r"(?:MPPT|THD[iI]?|DCI|GFCI|AFCI|STC|NMOT|RS\d+|"
     r"Wi-Fi|GPRS|[345]G|IP\d+)"
 )
-_UNIT_ATOM_PATTERN = (
-    r"(?:%|°[CF]|K|(?:p|n|u|µ|m|c|d|k|M|G)?(?:"
-    r"A(?:h|ac|dc)?|V(?:A|Ar|ac|dc)?|W(?:p|h)?|Hz|"
-    r"Ω|ohm|g|m(?:2|3)?|s(?:2)?|h|Pa|bar|dB(?:A)?|rpm"
-    r"))"
-)
 _BRACKETED_UNIT_CONTENT_RE = re.compile(
     rf"{_UNIT_ATOM_PATTERN}(?:\s*[·*/]\s*{_UNIT_ATOM_PATTERN})*",
     re.IGNORECASE,
 )
-_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?![A-Za-z0-9])")
+_BRACKETED_TECHNICAL_CONTENT_RE = re.compile(
+    r"(?:THD[iI]?|cos\s*[φΦ]|[HWD](?:\*[HWD]){1,2})"
+)
+_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?")
 _HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _MARKDOWN_OR_HTML_RE = re.compile(
     r"(?:^|\n)\s{0,3}(?:#{1,6}|[-*+]\s|>\s|```)|<[^>\r\n]+>",
@@ -198,7 +221,10 @@ def _restore_name_tokens(
         if not token.startswith("[") or not token.endswith("]"):
             return False
         content = unicodedata.normalize("NFKC", token[1:-1]).strip()
-        return _BRACKETED_UNIT_CONTENT_RE.fullmatch(content) is not None
+        return (
+            _BRACKETED_UNIT_CONTENT_RE.fullmatch(content) is not None
+            or _BRACKETED_TECHNICAL_CONTENT_RE.fullmatch(content) is not None
+        )
 
     restored = name_zh
     for token in dict.fromkeys(_PROTECTED_TOKEN_RE.findall(source_name)):
@@ -336,8 +362,20 @@ def _validate_translation(
         require_han=True,
     )
     source_name = str(source["name"])
+    generic_source_name = source_name
+    for compound_pattern, accepted_terms in _COMPOUND_REQUIRED_TERMS:
+        if not compound_pattern.search(generic_source_name):
+            continue
+        if not any(term in name_zh for term in accepted_terms):
+            raise ParameterAnalysisError(
+                f"{prefix}.name_zh must preserve the controlled compound term "
+                f"{' or '.join(accepted_terms)}"
+            )
+        generic_source_name = compound_pattern.sub(" ", generic_source_name)
     for pattern, required_term in _REQUIRED_TERMS:
-        if pattern.search(source_name) and required_term not in name_zh:
+        if not pattern.search(generic_source_name):
+            continue
+        if required_term not in name_zh:
             raise ParameterAnalysisError(
                 f"{prefix}.name_zh must preserve the controlled term "
                 f"{required_term}"
