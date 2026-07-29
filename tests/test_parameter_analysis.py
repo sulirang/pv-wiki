@@ -373,8 +373,13 @@ class ParameterAnalysisTests(unittest.TestCase):
             " 建议采用 1200 V 设备。"
         )
 
-        with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            "numeric text",
+        ) as raised:
             validate_parameter_enrichment(item, parameters())
+        self.assertIn("unsupported: 1200", str(raised.exception))
+        self.assertIn("basis permits: 15000", str(raised.exception))
 
     def test_rejects_unit_conversion_even_when_arithmetic_is_plausible(self) -> None:
         item = copy.deepcopy(enrichment())

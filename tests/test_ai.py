@@ -719,6 +719,10 @@ class PromptTests(unittest.TestCase):
             "one 60-240 character",
             " ".join(prompt["analysis_policy"]),
         )
+        self.assertIn(
+            "Do not repeat the product name or model",
+            " ".join(prompt["analysis_policy"]),
+        )
         self.assertEqual(
             2,
             prompt["output_contract"]["sections"]["item"]["paragraphs"][

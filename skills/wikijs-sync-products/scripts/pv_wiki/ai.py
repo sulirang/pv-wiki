@@ -1459,6 +1459,9 @@ def build_parameter_analysis_messages(
         "analysis_policy": [
             "Use all relevant verified parameters across multiple sections; do "
             "not merely rewrite a generic product introduction.",
+            "Do not repeat the product name or model inside analysis paragraphs; "
+            "the page heading already presents identity, and digits embedded in "
+            "identity are not parameter evidence.",
             "Separate source facts from engineering interpretation. Phrase "
             "interpretations conditionally and identify missing design inputs.",
             "For inverters, cover product positioning, DC input and MPPT, AC "

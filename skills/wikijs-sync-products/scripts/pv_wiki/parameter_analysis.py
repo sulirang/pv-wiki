@@ -12,7 +12,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v5"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v6"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v2"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -470,11 +470,15 @@ def _ground_numbers(
     source_text = " ".join(
         f"{item['name']} {item['value']} {item['unit']}" for item in basis_rows
     )
-    supported = set(_NUMBER_RE.findall(source_text))
+    supported_in_order = list(dict.fromkeys(_NUMBER_RE.findall(source_text)))
+    supported = set(supported_in_order)
     unsupported = [number for number in used if number not in supported]
     if unsupported:
+        unsupported_text = ", ".join(list(dict.fromkeys(unsupported))[:8])
+        supported_text = ", ".join(supported_in_order[:16]) or "none"
         raise ParameterAnalysisError(
-            f"{field} contains numeric text not present in its basis parameters"
+            f"{field} contains numeric text not present in its basis parameters; "
+            f"unsupported: {unsupported_text}; basis permits: {supported_text}"
         )
 
 
