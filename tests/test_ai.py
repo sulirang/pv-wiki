@@ -688,6 +688,16 @@ class PromptTests(unittest.TestCase):
         self.assertTrue(
             prompt["input_guarantees"]["complete_within_runtime_budget"]
         )
+        self.assertTrue(
+            prompt["input_guarantees"]["numeric_narrative_is_runtime_derived"]
+        )
+        self.assertEqual(
+            {"complete_unitless_expression"},
+            {
+                item["numeric_narrative"]["mode"]
+                for item in prompt["verified_parameters"]
+            },
+        )
         self.assertEqual(
             ["p001", "p002", "p003"],
             [
@@ -708,8 +718,41 @@ class PromptTests(unittest.TestCase):
         self.assertNotIn("product_id", prompt["product"])
         self.assertNotIn("family_code", prompt["product"])
         self.assertIn(
-            "Never alter, convert, infer, or manufacture",
+            "only permitted conversion is exact W/kW or Wp/kWp",
             messages[0]["content"],
+        )
+        self.assertIn(
+            "Never convert temperatures",
+            " ".join(prompt["analysis_policy"]),
+        )
+        policy_text = " ".join(prompt["analysis_policy"])
+        self.assertIn(
+            "narrative label core immediately before",
+            policy_text,
+        )
+        self.assertIn("comparison operator, explicit sign", policy_text)
+        self.assertIn("no_numeric_restatement", policy_text)
+        self.assertEqual(
+            {"AC": "交流", "DC": "直流", "PV": "光伏"},
+            {
+                key: prompt["controlled_terms"][key]
+                for key in ("AC", "DC", "PV")
+            },
+        )
+        analysis_contract = prompt["output_contract"]["sections"]["item"][
+            "paragraphs"
+        ]["item"]["analysis_zh"]
+        self.assertIn("narrative label core immediately before", analysis_contract)
+        self.assertIn("only an exact technical-token list", analysis_contract)
+        self.assertIn("完整语义 name_zh 核心", analysis_contract)
+        self.assertIn("token order and multiplicity", analysis_contract)
+        self.assertIn("Never use 台", policy_text)
+        self.assertIn("source order and without repetition", policy_text)
+        self.assertEqual("最大", prompt["controlled_terms"]["Maximum"])
+        self.assertEqual("最小", prompt["controlled_terms"]["Minimum"])
+        self.assertIn(
+            "do not repeat numeric standard identifiers",
+            policy_text,
         )
         self.assertIn(
             "Return every translation",
@@ -1235,6 +1278,13 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         repair_content = calls[1]["messages"][-1]["content"]
         self.assertIn("Retry once", repair_content)
         self.assertIn("every input parameter", repair_content)
+        self.assertIn("numeric_narrative mode", repair_content)
+        self.assertIn("exact W/kW or Wp/kWp conversions", repair_content)
+        self.assertIn("matching narrative label core", repair_content)
+        self.assertIn("do not repeat numeric standard identifiers", repair_content)
+        self.assertIn("technical-token source order and multiplicity", repair_content)
+        self.assertIn("professional Arabic count expressions", repair_content)
+        self.assertNotIn("without conversion", repair_content)
         self.assertIn(
             "translations must contain exactly one item",
             repair_content,

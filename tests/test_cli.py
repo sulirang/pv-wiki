@@ -722,7 +722,7 @@ class CLITests(unittest.TestCase):
                             "analysis_kind": "engineering_interpretation",
                             "basis_parameter_ids": ["p001"],
                             "analysis_zh": (
-                                "额定功率参数为42，这是该产品功率配置的直接依据；"
+                                "额定功率为42 W，这是该产品功率配置的直接依据；"
                                 "项目应用仍需结合并网条件、负载边界和现场约束进行核对。"
                             ),
                             "conditions_zh": ["应先核对项目侧的实际设计输入。"],
@@ -804,7 +804,7 @@ class CLITests(unittest.TestCase):
         self.assertIn("| 英文原文参数 | 专业中文参数 | 值 |", managed)
         self.assertIn("| Rated Power \\[W\\] | 额定功率 \\[W\\] | 42 W |", managed)
         self.assertIn("### 产品定位与功率配置", managed)
-        self.assertIn("额定功率参数为42", managed)
+        self.assertIn("额定功率为42 W", managed)
         with state.StateStore(self.state_path) as store:
             sets = store.verified_parameter_set_history("P-42")
             runs = store.parameter_analysis_run_history(sets[0].parameter_set_id)

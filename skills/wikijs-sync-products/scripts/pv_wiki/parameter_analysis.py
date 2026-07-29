@@ -8,12 +8,14 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v7"
-PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v2"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v10"
+PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v4"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
 
@@ -49,8 +51,8 @@ SECTION_TRANSLATIONS = {
 }
 
 _REQUIRED_TERMS = (
-    (re.compile(r"\bMax\.?\b", re.IGNORECASE), "最大"),
-    (re.compile(r"\bMin\.?\b", re.IGNORECASE), "最小"),
+    (re.compile(r"\bMax(?:imum)?\.?\b", re.IGNORECASE), "最大"),
+    (re.compile(r"\bMin(?:imum)?\.?\b", re.IGNORECASE), "最小"),
     (re.compile(r"\bRated\b", re.IGNORECASE), "额定"),
     (re.compile(r"\bNominal\b", re.IGNORECASE), "标称"),
     (re.compile(r"\bVoltage\b", re.IGNORECASE), "电压"),
@@ -68,6 +70,9 @@ _REQUIRED_TERMS = (
     (re.compile(r"\bDimensions?\b", re.IGNORECASE), "尺寸"),
     (re.compile(r"\bWeight\b", re.IGNORECASE), "重量"),
     (re.compile(r"\bWarranty\b", re.IGNORECASE), "质保"),
+    (re.compile(r"\bAC\b", re.IGNORECASE), "交流"),
+    (re.compile(r"\bDC\b", re.IGNORECASE), "直流"),
+    (re.compile(r"\bPV\b", re.IGNORECASE), "光伏"),
 )
 _COMPOUND_REQUIRED_TERMS = (
     (
@@ -88,11 +93,12 @@ _COMPOUND_REQUIRED_TERMS = (
     ),
 )
 _UNIT_ATOM_PATTERN = (
-    r"(?:%|°[CF]|K|(?:p|n|u|µ|m|c|d|k|M|G)?(?:"
-    r"A(?:h|ac|dc)?|V(?:A|Ar|ac|dc)?|W(?:p|h)?|Hz|"
-    r"Ω|ohm|g|m(?:2|3)?|s(?:2)?|h|Pa|bar|dB(?:A)?|rpm|years?"
-    r"))"
+    r"(?:%|°[CF]|(?:p|n|u|µ|μ|m|c|d|k|M|G)?(?:"
+    r"A(?:h|ac|dc)?|V(?:Ar|ac|dc|A)?|W(?:p|h)?|Hz|"
+    r"Ω|ohm|g|m(?:2|3)?|s(?:2)?|h|Pa|bar|dB(?:A)?|rpm|[Yy]ears?"
+    r")|K)"
 )
+_UNIT_ATOM_RE = re.compile(_UNIT_ATOM_PATTERN)
 _PROTECTED_TOKEN_RE = re.compile(
     r"\[[^\[\]\r\n]{1,24}\]"
     rf"|(?<![A-Za-z0-9])\d+(?:\.\d+)?(?i:{_UNIT_ATOM_PATTERN})"
@@ -115,6 +121,240 @@ _BRACKETED_TECHNICAL_CONTENT_RE = re.compile(
     r"(?:THD[iI]?|cos\s*[φΦ]|[HWD](?:\*[HWD]){1,2})"
 )
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?")
+_MAX_EXACT_DECIMAL_DIGITS = 256
+_NUMERIC_TOKEN_PATTERN = (
+    r"[+\-−–—＋－]?(?:"
+    r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:[.,]\d+)?"
+    r")"
+)
+_COMPARISON_PATTERN = (
+    r"(?:不超过|不高于|不大于|不低于|不小于|至少|至多|"
+    r"小于|低于|大于|高于|等于|<=|>=|≤|≥|<|>|±)"
+)
+_VALUE_SEPARATOR_PATTERN = r"(?:-|−|–|—|~|～|/|\*|×|x|X|至|到)"
+_NUMERIC_TAIL_PATTERN = (
+    rf"(?:\s*(?P<separator>{_VALUE_SEPARATOR_PATTERN})\s*"
+    rf"(?P<second>{_NUMERIC_TOKEN_PATTERN})"
+    rf"(?:\s*(?P<separator_3>{_VALUE_SEPARATOR_PATTERN})\s*"
+    rf"(?P<third>{_NUMERIC_TOKEN_PATTERN}))?"
+    rf"(?:\s*(?P<separator_4>{_VALUE_SEPARATOR_PATTERN})\s*"
+    rf"(?P<fourth>{_NUMERIC_TOKEN_PATTERN}))?"
+    r")?"
+)
+_EXPRESSION_START_GUARD = r"(?<![A-Za-z0-9.<>≤≥≦≧≠≈∓~∼+\-−–—＋－±/·⋅∙*×÷∕⁄])"
+_UNIT_COMPONENT_PATTERN = (
+    r"(?:%|Ω|°[A-Za-z]|"
+    r"[A-Za-zμµ][A-Za-z0-9μµ]*(?:\([A-Za-z0-9]+\))?)"
+)
+_SYMBOL_UNIT_PATTERN = (
+    rf"{_UNIT_COMPONENT_PATTERN}(?:\s*[·*/×]\s*"
+    rf"{_UNIT_COMPONENT_PATTERN})*"
+)
+_CHINESE_UNIT_PATTERN = (
+    r"(?:安培小时|瓦特小时|千瓦峰|兆瓦峰|千峰瓦|峰值瓦|兆瓦时|"
+    r"千瓦时|毫安时|安时|瓦时|千伏安|兆伏安|伏安|兆瓦|千瓦|"
+    r"瓦特|峰瓦|千伏|伏特|毫安|安培|赫兹|焦耳|摄氏度|华氏度|"
+    r"立方米|平方米|毫米|厘米|千克|公斤|百分比|瓦|伏|安|米|年)"
+)
+_UNIT_TOKEN_PATTERN = rf"(?:{_SYMBOL_UNIT_PATTERN}|{_CHINESE_UNIT_PATTERN})"
+_NUMERIC_EXPRESSION_RE = re.compile(
+    rf"^\s*(?P<operator>{_COMPARISON_PATTERN})?\s*"
+    rf"(?P<first>{_NUMERIC_TOKEN_PATTERN}){_NUMERIC_TAIL_PATTERN}\s*$"
+)
+_NUMERIC_EXPRESSION_SCAN_RE = re.compile(
+    rf"{_EXPRESSION_START_GUARD}"
+    rf"(?P<operator>{_COMPARISON_PATTERN})?\s*"
+    rf"(?P<first>{_NUMERIC_TOKEN_PATTERN}){_NUMERIC_TAIL_PATTERN}"
+)
+_MEASUREMENT_CLAIM_RE = re.compile(
+    rf"{_EXPRESSION_START_GUARD}"
+    rf"(?P<operator>{_COMPARISON_PATTERN})?\s*"
+    rf"(?P<first>{_NUMERIC_TOKEN_PATTERN}){_NUMERIC_TAIL_PATTERN}\s*"
+    rf"(?P<unit>{_UNIT_TOKEN_PATTERN})(?=$|[为是]|[^A-Za-z0-9μµ\u3400-\u9fff])"
+)
+_EXPLICIT_UNIT_CLAIM_RE = re.compile(
+    rf"{_EXPRESSION_START_GUARD}"
+    rf"(?P<operator>{_COMPARISON_PATTERN})?\s*"
+    rf"(?P<first>{_NUMERIC_TOKEN_PATTERN}){_NUMERIC_TAIL_PATTERN}"
+    r"\s*(?:，|,)?\s*(?:(?:其|所用|使用的?|采用的?|计量)?单位)"
+    r"(?:是|为|：|:)\s*"
+    rf"(?P<declared_unit>{_UNIT_TOKEN_PATTERN}|[\u3400-\u9fff]{{1,12}})"
+)
+_FALLBACK_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|"
+    r"\d+(?:[.,]\d+)?)"
+)
+_SEMANTIC_POSTFIX_BASE = (
+    r"(?:左右|上下|以上|以下|以内|以外|附近|更高|更低|更多|更少)"
+)
+_PUNCTUATED_SEMANTIC_POSTFIX_BASE = (
+    r"(?:左右|以上|以下|以内|以外|附近|更高|更低|更多|更少)"
+)
+_SEMANTIC_POSTFIX_PATTERN = (
+    rf"(?:级\s*)?(?:(?:及|且|或)\s*)?{_SEMANTIC_POSTFIX_BASE}"
+)
+_PUNCTUATED_SEMANTIC_POSTFIX_PATTERN = (
+    rf"(?:级\s*)?(?:(?:及|且|或)\s*)?"
+    rf"{_PUNCTUATED_SEMANTIC_POSTFIX_BASE}"
+)
+_CLAIM_SUFFIX_BLOCK_RE = re.compile(
+    rf"^\s*(?:{_SEMANTIC_POSTFIX_PATTERN}|"
+    rf"[，,、；;。.!！？?]\s*{_PUNCTUATED_SEMANTIC_POSTFIX_PATTERN}|每|"
+    r"[+\-−–—＋－±∓<>≤≥≦≧≠≈~∼/·⋅∙*×÷∕⁄]|[²³]|[A-Za-zμµΩ°]|"
+    r"\((?!(?:STC|NMOT)\s*\))|[（\[【\)）\]】])",
+    re.IGNORECASE,
+)
+_CLAIM_PREFIX_BLOCK_RE = re.compile(
+    r"(?:[+\-−–—＋－±∓<>≤≥≦≧≠≈~∼/·⋅∙*×÷∕⁄()\[\]（）【】]|"
+    r"负|正|约|大约|接近|近似|估计|预计)\s*$"
+)
+_RAW_CLAIM_SUFFIX_BLOCK_RE = re.compile(
+    r"^\s*(?:[\[(]|[/·⋅∙*×÷∕⁄]|[²³]|[A-Za-zμµΩ°%]|"
+    r"[\u3400-\u9fff])"
+)
+_HAN_NUMBER_PATTERN = (
+    r"[零〇一二两三四五六七八九十百千万亿"
+    r"壹贰叁肆伍陆柒捌玖拾佰仟萬单双俩半]+"
+)
+_HAN_NUMERIC_UNIT_RE = re.compile(
+    rf"{_HAN_NUMBER_PATTERN}\s*(?:{_UNIT_TOKEN_PATTERN})"
+)
+_HAN_COUNT_CLAIM_RE = re.compile(
+    rf"(?:{_HAN_NUMBER_PATTERN}\s*(?:(?:个|路|组|项|套|台)\s*)?MPPT|"
+    rf"(?:MPPT\s*)?(?:数量|数目|个数|路数)\s*(?:为|是|：|:)\s*"
+    rf"{_HAN_NUMBER_PATTERN})",
+    re.IGNORECASE,
+)
+_HAN_CLASSIFIED_COUNT_RE = re.compile(
+    rf"(?:{_HAN_NUMBER_PATTERN}\s*(?:路|组|套|台|相)|"
+    rf"{_HAN_NUMBER_PATTERN}\s*(?:个|项)\s*(?:MPPT|直流|交流|光伏|"
+    r"电池|组件|组串|输入|输出|接口|端口|回路|支路|通道|模块|"
+    r"设备|逆变器|保护))",
+    re.IGNORECASE,
+)
+_HAN_BRACKETED_UNIT_RE = re.compile(
+    rf"{_HAN_NUMBER_PATTERN}\s*[\[(（]\s*(?:{_UNIT_TOKEN_PATTERN})"
+)
+_COUNT_SOURCE_NAME_RE = re.compile(r"\b(?:Number|Count|Quantity)\b", re.IGNORECASE)
+_COUNT_CLASSIFIER_RE = re.compile(
+    r"^\s*(?P<classifier>个|路|组|项|套)(?![\u3400-\u9fff])"
+)
+_NUMERIC_TECHNICAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:IP\d+|RS\d+|RJ\d+|MC\d+|[345]G|\d+L)"
+    r"(?![A-Za-z0-9])"
+)
+_TECHNICAL_TOKEN_SHARE_GAP_RE = re.compile(
+    r"^\s*(?:(?:[，,、/+]|和|及|与|以及)\s*)$"
+)
+_ANY_DIGIT_RE = re.compile(r"\d+(?:[.,]\d+)?")
+_UNSUPPORTED_TRANSLATED_HAN_NUMBER_RE = re.compile(
+    r"[壹贰叁肆伍陆柒捌玖拾佰仟萬]+|"
+    r"(?<![\u3400-\u9fff])半(?![\u3400-\u9fff])"
+)
+_HAN_NUMBER_TOKEN_RE = re.compile(_HAN_NUMBER_PATTERN)
+_SIMPLE_HAN_NUMBER_VALUES = {
+    "零": Fraction(0),
+    "〇": Fraction(0),
+    "一": Fraction(1),
+    "单": Fraction(1),
+    "二": Fraction(2),
+    "两": Fraction(2),
+    "俩": Fraction(2),
+    "双": Fraction(2),
+    "三": Fraction(3),
+    "四": Fraction(4),
+    "五": Fraction(5),
+    "六": Fraction(6),
+    "七": Fraction(7),
+    "八": Fraction(8),
+    "九": Fraction(9),
+    "十": Fraction(10),
+    "半": Fraction(1, 2),
+}
+_ENGLISH_NUMBER_VALUES = {
+    "zero": Fraction(0),
+    "one": Fraction(1),
+    "single": Fraction(1),
+    "two": Fraction(2),
+    "double": Fraction(2),
+    "dual": Fraction(2),
+    "three": Fraction(3),
+    "four": Fraction(4),
+    "five": Fraction(5),
+    "six": Fraction(6),
+    "seven": Fraction(7),
+    "eight": Fraction(8),
+    "nine": Fraction(9),
+    "ten": Fraction(10),
+    "half": Fraction(1, 2),
+}
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x034F, 0x034F),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFFA0, 0xFFA0),
+    (0xE0100, 0xE01EF),
+)
+_LABEL_ANNOTATION_CANDIDATE_RE = re.compile(
+    r"\s*(?:\[[^\[\]\r\n]{1,24}\]|\([^()\r\n]{1,24}\)|"
+    rf"@\s*(?:STC|NMOT|\d+(?:\.\d+)?{_UNIT_ATOM_PATTERN}))",
+    re.IGNORECASE,
+)
+_POWER_UNIT_CANONICAL = {
+    "w": "W",
+    "kw": "kW",
+    "wp": "Wp",
+    "kwp": "kWp",
+}
+_POWER_UNIT_FACTORS = {
+    "W": ("W", 1),
+    "kW": ("W", 1000),
+    "Wp": ("Wp", 1),
+    "kWp": ("Wp", 1000),
+}
+_CHINESE_UNIT_ALIASES = {
+    "千瓦": "kW",
+    "瓦特": "W",
+    "千瓦峰": "kWp",
+    "千峰瓦": "kWp",
+    "峰值瓦": "Wp",
+    "峰瓦": "Wp",
+    "兆瓦峰": "MWp",
+    "兆瓦": "MW",
+    "瓦": "W",
+    "伏": "V",
+    "伏特": "V",
+    "千伏": "kV",
+    "安": "A",
+    "安培": "A",
+    "安培小时": "Ah",
+    "安时": "Ah",
+    "毫安": "mA",
+    "毫安时": "mAh",
+    "伏安": "VA",
+    "千伏安": "kVA",
+    "兆伏安": "MVA",
+    "赫兹": "Hz",
+    "焦耳": "J",
+    "摄氏度": "°C",
+    "华氏度": "°F",
+    "米": "m",
+    "毫米": "mm",
+    "厘米": "cm",
+    "平方米": "m2",
+    "立方米": "m3",
+    "千克": "kg",
+    "公斤": "kg",
+    "年": "year",
+    "百分比": "%",
+    "瓦时": "Wh",
+    "瓦特小时": "Wh",
+    "千瓦时": "kWh",
+    "兆瓦时": "MWh",
+}
 _HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _MARKDOWN_OR_HTML_RE = re.compile(
     r"(?:^|\n)\s{0,3}(?:#{1,6}|[-*+]\s|>\s|```)|<[^>\r\n]+>",
@@ -126,12 +366,30 @@ class ParameterAnalysisError(ValueError):
     """Raised when translations or analysis cannot be safely published."""
 
 
+@dataclass(frozen=True, slots=True)
+class _NumericExpression:
+    """Canonical numeric meaning independent of locale punctuation."""
+
+    comparator: str
+    relation: str
+    values: tuple[Fraction, ...]
+    signs: tuple[str, ...] = ()
+
+
 def parameter_id(index: int) -> str:
     """Return the stable positional ID used only within one parameter set."""
 
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise ValueError("parameter index must be a non-negative integer")
     return f"p{index + 1:03d}"
+
+def _is_default_ignorable(character: str) -> bool:
+    codepoint = ord(character)
+    category = unicodedata.category(character)
+    return category == "Cf" or category.startswith("M") or any(
+        start <= codepoint <= end
+        for start, end in _DEFAULT_IGNORABLE_RANGES
+    )
 
 
 def _clean_text(
@@ -144,7 +402,14 @@ def _clean_text(
 ) -> str:
     if not isinstance(value, str):
         raise ParameterAnalysisError(f"{field} must be a string")
-    cleaned = " ".join(value.replace("\x00", "").split())
+    cleaned = unicodedata.normalize(
+        "NFC",
+        " ".join(value.replace("\x00", "").split()),
+    )
+    if any(_is_default_ignorable(character) for character in cleaned):
+        raise ParameterAnalysisError(
+            f"{field} cannot contain invisible Unicode format characters"
+        )
     if required and not cleaned:
         raise ParameterAnalysisError(f"{field} is required")
     if len(cleaned) > limit:
@@ -334,6 +599,117 @@ def parameter_set_sha256(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _source_simple_numeric_values(source: str) -> set[Fraction]:
+    values: set[Fraction] = set()
+    normalized = unicodedata.normalize("NFKC", source)
+    for match in _FALLBACK_NUMBER_RE.finditer(normalized):
+        try:
+            values.add(Fraction(match.group().replace(",", "")))
+        except (ValueError, ZeroDivisionError):
+            continue
+    for word in re.findall(r"[A-Za-z]+", normalized.casefold()):
+        value = _ENGLISH_NUMBER_VALUES.get(word)
+        if value is not None:
+            values.add(value)
+    for match in _HAN_NUMBER_TOKEN_RE.finditer(normalized):
+        value = _SIMPLE_HAN_NUMBER_VALUES.get(match.group())
+        if value is not None:
+            values.add(value)
+    return values
+
+
+def _reject_added_han_numeric_claims(
+    translated: str,
+    source: str,
+    field: str,
+) -> None:
+    source_values = _source_simple_numeric_values(source)
+    for pattern in (
+        _HAN_NUMERIC_UNIT_RE,
+        _HAN_BRACKETED_UNIT_RE,
+        _HAN_CLASSIFIED_COUNT_RE,
+        _HAN_COUNT_CLAIM_RE,
+    ):
+        for match in pattern.finditer(translated):
+            number_match = _HAN_NUMBER_TOKEN_RE.search(match.group())
+            value = (
+                _SIMPLE_HAN_NUMBER_VALUES.get(number_match.group())
+                if number_match is not None
+                else None
+            )
+            if value is None or value not in source_values:
+                raise ParameterAnalysisError(
+                    f"{field} introduces unsupported Chinese numeric text"
+                )
+
+
+def _reject_added_numeric_tokens(
+    translated: str,
+    source: str,
+    field: str,
+) -> None:
+    """Preserve numeric and technical tokens in source order and multiplicity."""
+
+    normalized_source = unicodedata.normalize("NFKC", source)
+    normalized_translated = unicodedata.normalize("NFKC", translated)
+    source_tokens = _ANY_DIGIT_RE.findall(normalized_source)
+    _reject_added_han_numeric_claims(
+        normalized_translated,
+        normalized_source,
+        field,
+    )
+    translated_tokens = _ANY_DIGIT_RE.findall(normalized_translated)
+    added = [
+        token
+        for token in translated_tokens
+        if token not in set(source_tokens)
+    ]
+    if added:
+        raise ParameterAnalysisError(
+            f"{field} introduces numeric tokens absent from its source: "
+            f"{', '.join(list(dict.fromkeys(added))[:8])}"
+        )
+    if translated and translated_tokens != source_tokens:
+        raise ParameterAnalysisError(
+            f"{field} must preserve numeric tokens in source order and multiplicity"
+        )
+
+    source_technical_tokens = _NUMERIC_TECHNICAL_TOKEN_RE.findall(
+        normalized_source
+    )
+    translated_technical_tokens = _NUMERIC_TECHNICAL_TOKEN_RE.findall(
+        normalized_translated
+    )
+    added_technical_tokens = [
+        token
+        for token in translated_technical_tokens
+        if token not in set(source_technical_tokens)
+    ]
+    if added_technical_tokens:
+        raise ParameterAnalysisError(
+            f"{field} introduces numeric technical tokens absent from its source: "
+            f"{', '.join(list(dict.fromkeys(added_technical_tokens))[:8])}"
+        )
+    if translated and translated_technical_tokens != source_technical_tokens:
+        raise ParameterAnalysisError(
+            f"{field} must preserve numeric technical tokens in source order"
+        )
+
+    source_han_numbers = _UNSUPPORTED_TRANSLATED_HAN_NUMBER_RE.findall(
+        normalized_source
+    )
+    translated_han_numbers = _UNSUPPORTED_TRANSLATED_HAN_NUMBER_RE.findall(
+        normalized_translated
+    )
+    added_han_numbers = [
+        token for token in translated_han_numbers if token not in source_han_numbers
+    ]
+    if added_han_numbers:
+        raise ParameterAnalysisError(
+            f"{field} introduces unsupported Chinese numeric text"
+        )
+
+
 def _validate_translation(
     raw: Mapping[str, Any],
     source: Mapping[str, Any],
@@ -381,10 +757,16 @@ def _validate_translation(
                 f"{required_term}"
             )
     name_zh = _restore_name_tokens(name_zh, source_name, prefix)
+    _reject_added_numeric_tokens(name_zh, source_name, f"{prefix}.name_zh")
 
     source_section = str(source["section"])
     section_zh = _heading_translation(
         raw.get("section_zh", ""),
+        source_section,
+        f"{prefix}.section_zh",
+    )
+    _reject_added_numeric_tokens(
+        section_zh,
         source_section,
         f"{prefix}.section_zh",
     )
@@ -402,6 +784,11 @@ def _validate_translation(
     source_subsection = str(source["subsection"])
     subsection_zh = _heading_translation(
         raw.get("subsection_zh", ""),
+        source_subsection,
+        f"{prefix}.subsection_zh",
+    )
+    _reject_added_numeric_tokens(
+        subsection_zh,
         source_subsection,
         f"{prefix}.subsection_zh",
     )
@@ -424,6 +811,7 @@ def _validate_translation(
         require_han=bool(raw.get("value_zh")),
     )
     source_value = str(source["value"])
+    _reject_added_numeric_tokens(value_zh, source_value, f"{prefix}.value_zh")
     for token in _PROTECTED_TOKEN_RE.findall(source_value):
         if token not in value_zh and value_zh:
             raise ParameterAnalysisError(
@@ -459,26 +847,738 @@ def _string_list(
     ]
 
 
+def _canonical_comparator(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    return {
+        "小于": "<",
+        "低于": "<",
+        "<": "<",
+        "不超过": "≤",
+        "不高于": "≤",
+        "不大于": "≤",
+        "至多": "≤",
+        "<=": "≤",
+        "≤": "≤",
+        "大于": ">",
+        "高于": ">",
+        ">": ">",
+        "不低于": "≥",
+        "不小于": "≥",
+        "至少": "≥",
+        ">=": "≥",
+        "≥": "≥",
+        "等于": "",
+        "±": "±",
+        "": "",
+    }.get(normalized, normalized)
+
+
+def _exact_decimal_fraction(value: str) -> Fraction | None:
+    """Convert one unsigned decimal without context rounding or huge ints."""
+
+    whole, separator, fractional = value.partition(".")
+    digits = f"{whole}{fractional}" if separator else whole
+    if not digits or len(digits) > _MAX_EXACT_DECIMAL_DIGITS:
+        return None
+    return Fraction(int(digits), 10 ** len(fractional))
+
+
+def _parse_number_token(value: str) -> tuple[Fraction, str] | None:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    sign_multiplier = 1
+    sign_marker = ""
+    if normalized[:1] in {"-", "−", "–", "—"}:
+        sign_multiplier = -1
+        sign_marker = "-"
+        normalized = normalized[1:]
+    elif normalized[:1] == "+":
+        sign_marker = "+"
+        normalized = normalized[1:]
+    if not normalized:
+        return None
+
+    if "," in normalized and "." in normalized:
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?", normalized) is None:
+            return None
+        normalized = normalized.replace(",", "")
+    elif "," in normalized:
+        groups = normalized.split(",")
+        grouped = (
+            groups[0] != "0"
+            and 1 <= len(groups[0]) <= 3
+            and len(groups) > 1
+            and all(len(group) == 3 for group in groups[1:])
+        )
+        if grouped:
+            normalized = "".join(groups)
+        elif len(groups) == 2 and all(groups):
+            normalized = ".".join(groups)
+        else:
+            return None
+    number = _exact_decimal_fraction(normalized)
+    if number is None:
+        return None
+    return sign_multiplier * number, sign_marker
+
+
+def _numeric_expression(match: re.Match[str]) -> _NumericExpression | None:
+    group_values = match.groupdict()
+    raw_numbers = [
+        group_values.get(name)
+        for name in ("first", "second", "third", "fourth")
+    ]
+    parsed_numbers = [
+        _parse_number_token(value)
+        for value in raw_numbers
+        if value is not None
+    ]
+    if not parsed_numbers or any(item is None for item in parsed_numbers):
+        return None
+    values = tuple(item[0] for item in parsed_numbers if item is not None)
+    signs = tuple(item[1] for item in parsed_numbers if item is not None)
+
+    raw_separators = [
+        group_values.get(name)
+        for name in ("separator", "separator_3", "separator_4")
+        if group_values.get(name) is not None
+    ]
+    relations: set[str] = set()
+    for raw_separator in raw_separators:
+        separator = unicodedata.normalize("NFKC", raw_separator).strip()
+        if separator == "/":
+            relations.add("choice")
+        elif separator in {"*", "×", "x", "X"}:
+            relations.add("product")
+        else:
+            relations.add("range")
+    if len(relations) > 1:
+        return None
+    relation = next(iter(relations), "")
+    if relation == "range" and len(values) != 2:
+        return None
+    return _NumericExpression(
+        comparator=_canonical_comparator(match.group("operator") or ""),
+        relation=relation,
+        values=values,
+        signs=signs,
+    )
+
+
+
+def parameter_numeric_guidance(parameter: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe which numeric forms one row may safely contribute to analysis."""
+
+    source_name = unicodedata.normalize(
+        "NFKC",
+        str(parameter.get("name", "")),
+    )
+    source_value = unicodedata.normalize(
+        "NFKC",
+        str(parameter.get("value", "")),
+    ).strip()
+    source_unit = str(parameter.get("unit", "")).strip()
+    value_match = _NUMERIC_EXPRESSION_RE.fullmatch(source_value)
+    expression = _numeric_expression(value_match) if value_match else None
+    technical_tokens = list(
+        dict.fromkeys(
+            match.group()
+            for match in _NUMERIC_TECHNICAL_TOKEN_RE.finditer(
+                f"{source_name} {source_value}"
+            )
+        )
+    )
+    if expression is not None and source_unit:
+        mode = "complete_measurement"
+    elif expression is not None and _COUNT_SOURCE_NAME_RE.search(source_name):
+        mode = "complete_count_expression"
+    elif expression is not None:
+        mode = "complete_unitless_expression"
+    elif technical_tokens:
+        mode = "exact_technical_tokens_only"
+    else:
+        mode = "no_numeric_restatement"
+    return {
+        "mode": mode,
+        "allowed_numeric_technical_tokens": technical_tokens,
+    }
+
+
+def _source_expression_variants(
+    expression: _NumericExpression,
+    source_name: str,
+) -> set[_NumericExpression]:
+    variants = {expression}
+    if expression.comparator or expression.relation or len(expression.values) != 1:
+        return variants
+    if re.search(r"\bMax(?:imum)?\.?\b", source_name, re.IGNORECASE):
+        variants.add(
+            _NumericExpression("≤", "", expression.values, expression.signs)
+        )
+    if re.search(r"\bMin(?:imum)?\.?\b", source_name, re.IGNORECASE):
+        variants.add(
+            _NumericExpression("≥", "", expression.values, expression.signs)
+        )
+    return variants
+
+
+def _canonical_unit(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).strip().replace("µ", "μ")
+    normalized = re.sub(r"\s*([·*/×])\s*", r"\1", normalized)
+    normalized = re.sub(
+        r"\((?:STC|NMOT)\)$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    ).strip()
+    alias = _CHINESE_UNIT_ALIASES.get(normalized)
+    if alias is not None:
+        return alias
+    power_unit = _POWER_UNIT_CANONICAL.get(normalized.casefold())
+    if power_unit is not None:
+        return power_unit
+    if normalized.casefold() in {"year", "years"}:
+        return "year"
+    return normalized
+
+
+def _normalized_analysis_label(value: str) -> str:
+    """Strip only recognized unit/condition annotations from a Chinese label."""
+
+    normalized = unicodedata.normalize("NFKC", value)
+
+    def safe_annotation(match: re.Match[str]) -> str:
+        token = match.group().strip()
+        if token.casefold().startswith("@"):
+            return ""
+        if token.startswith("[") and token.endswith("]"):
+            content = token[1:-1].strip()
+            if (
+                _BRACKETED_UNIT_CONTENT_RE.fullmatch(content)
+                or _BRACKETED_TECHNICAL_CONTENT_RE.fullmatch(content)
+            ):
+                return ""
+        if token.startswith("(") and token.endswith(")"):
+            if token[1:-1].strip().casefold() in {"stc", "nmot"}:
+                return ""
+        return match.group()
+
+    without_safe_annotations = _LABEL_ANNOTATION_CANDIDATE_RE.sub(
+        safe_annotation,
+        normalized,
+    )
+    return " ".join(without_safe_annotations.split())
+
+
+def _label_is_locally_bound(
+    text: str,
+    allowed_labels: Sequence[str],
+    claim_start: int,
+    *,
+    all_labels: Sequence[str],
+) -> bool:
+    """Bind a claim to the nearest complete semantic parameter label."""
+
+    prefix = _normalized_analysis_label(text[:claim_start])
+    blocked_gap = re.compile(
+        r"[，,。；;！？!?]|\d|但|然而|不|非|无|未|约|接近|近似|"
+        r"大概|估计|预计|可能|或许|左右|以上|以下|最多|超过|不到|"
+        r"不少于|不多于|每|单位面积|最大|最小|额定|标称|直流|交流|"
+        r"光伏|功率|电压|电流|范围"
+    )
+    blocked_label_prefix = re.compile(
+        r"(?:非|无|未|不是|并非|并不|最大|最小|额定|标称|直流|交流|"
+        r"光伏|单位面积|备用|合计|峰值|总(?:计|体)?|"
+        r"(?:(?:每|各)(?:一)?(?:个|路|相|组|台|套|项|机)?|"
+        r"单(?:台|机|路|相|组)))(?:的)?$"
+    )
+    candidates: list[tuple[int, int, str]] = []
+    for label in dict.fromkeys(all_labels):
+        if not label:
+            continue
+        position = prefix.rfind(label)
+        if position < 0:
+            continue
+        gap = prefix[position + len(label):]
+        if len(gap) > 48 or blocked_gap.search(gap):
+            continue
+        if blocked_label_prefix.search(prefix[:position]):
+            continue
+        candidates.append((position + len(label), len(label), label))
+    if not candidates:
+        return False
+    bound_label = max(candidates)[2]
+    return bound_label in set(allowed_labels)
+
+
+def _basis_measurement_evidence(
+    basis_rows: Sequence[Mapping[str, Any]],
+    basis_labels: Sequence[str],
+) -> tuple[
+    dict[tuple[_NumericExpression, str], set[str]],
+    dict[tuple[str, Fraction, str, tuple[str, ...]], set[tuple[str, str]]],
+    dict[tuple[_NumericExpression, str], set[str]],
+    dict[_NumericExpression, set[str]],
+    dict[_NumericExpression, set[str]],
+    dict[str, set[tuple[int, str]]],
+    dict[int, tuple[str, ...]],
+]:
+    """Collect expression-, unit-, label-, and technical-token evidence."""
+
+    exact_measurements: dict[
+        tuple[_NumericExpression, str],
+        set[str],
+    ] = {}
+    power_conversions: dict[
+        tuple[str, Fraction, str, tuple[str, ...]],
+        set[tuple[str, str]],
+    ] = {}
+    technical_measurements: dict[
+        tuple[_NumericExpression, str],
+        set[str],
+    ] = {}
+    raw_expressions: dict[_NumericExpression, set[str]] = {}
+    count_expressions: dict[_NumericExpression, set[str]] = {}
+    technical_tokens: dict[str, set[tuple[int, str]]] = {}
+    technical_token_sequences: dict[int, tuple[str, ...]] = {}
+
+    for row_index, (item, raw_label) in enumerate(
+        zip(basis_rows, basis_labels, strict=True)
+    ):
+        source_name = unicodedata.normalize("NFKC", str(item["name"]))
+        source_value = unicodedata.normalize(
+            "NFKC",
+            str(item["value"]),
+        ).strip()
+        source_unit = _canonical_unit(str(item["unit"]))
+        label = _normalized_analysis_label(raw_label)
+        value_match = _NUMERIC_EXPRESSION_RE.fullmatch(source_value)
+        value_expression = _numeric_expression(value_match) if value_match else None
+
+        if value_expression is not None:
+            variants = _source_expression_variants(value_expression, source_name)
+            for variant in variants:
+                if source_unit:
+                    exact_measurements.setdefault(
+                        (variant, source_unit),
+                        set(),
+                    ).add(label)
+                else:
+                    raw_expressions.setdefault(variant, set()).add(label)
+                    if _COUNT_SOURCE_NAME_RE.search(source_name):
+                        count_expressions.setdefault(variant, set()).add(label)
+                source_spec = _POWER_UNIT_FACTORS.get(source_unit)
+                if source_spec is not None and not variant.relation:
+                    dimension, factor = source_spec
+                    base_value = variant.values[0] * factor
+                    power_conversions.setdefault(
+                        (dimension, base_value, variant.comparator, variant.signs),
+                        set(),
+                    ).add((source_unit, label))
+
+            for token in set(_RESTORABLE_ABBREVIATION_RE.findall(source_name)):
+                if token in {"MPPT", "DCI", "GFCI", "AFCI", "STC", "NMOT"}:
+                    technical_measurements.setdefault(
+                        (value_expression, token),
+                        set(),
+                    ).add(label)
+
+        for embedded in _MEASUREMENT_CLAIM_RE.finditer(source_name):
+            embedded_expression = _numeric_expression(embedded)
+            embedded_unit = _canonical_unit(embedded.group("unit"))
+            if (
+                embedded_expression is not None
+                and (
+                    _UNIT_ATOM_RE.fullmatch(embedded_unit)
+                    or embedded_unit in _POWER_UNIT_FACTORS
+                )
+            ):
+                exact_measurements.setdefault(
+                    (embedded_expression, embedded_unit),
+                    set(),
+                ).add(label)
+
+        combined_source = f"{source_name} {source_value}"
+        source_technical_tokens = tuple(
+            match.group()
+            for match in _NUMERIC_TECHNICAL_TOKEN_RE.finditer(combined_source)
+        )
+        technical_token_sequences[row_index] = source_technical_tokens
+        for token in source_technical_tokens:
+            technical_tokens.setdefault(token, set()).add((row_index, label))
+
+    return (
+        exact_measurements,
+        power_conversions,
+        technical_measurements,
+        raw_expressions,
+        count_expressions,
+        technical_tokens,
+        technical_token_sequences,
+    )
+
+
+def _spans_overlap(
+    left: tuple[int, int],
+    right: tuple[int, int],
+) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
+def _span_is_covered(
+    span: tuple[int, int],
+    regions: Sequence[tuple[int, int]],
+) -> bool:
+    return any(start <= span[0] and span[1] <= end for start, end in regions)
+
+
+def _bounded_descriptor(value: str, limit: int = 100) -> str:
+    cleaned = " ".join(value.split())
+    return cleaned if len(cleaned) <= limit else f"{cleaned[:limit - 3]}..."
+
+
+def _claim_prefix_is_blocked(text: str, start: int) -> bool:
+    prefix = text[:start]
+    if _CLAIM_PREFIX_BLOCK_RE.search(prefix):
+        return True
+    stripped = prefix.rstrip()
+    return bool(stripped and unicodedata.category(stripped[-1]) == "Sm")
+
+
+def _claim_suffix_is_blocked(text: str, end: int) -> bool:
+    suffix = text[end:]
+    if _CLAIM_SUFFIX_BLOCK_RE.match(suffix):
+        return True
+    stripped = suffix.lstrip()
+    return bool(stripped and unicodedata.category(stripped[0]) == "Sm")
+
+
+def _count_classifier_is_professional(label: str, classifier: str) -> bool:
+    if "MPPT" in label.upper():
+        return classifier in {"个", "路", "组"}
+    return classifier in {"个", "路", "组", "项", "套"}
+
+
+def _measurement_spans(
+    text: str,
+    exact_measurements: Mapping[
+        tuple[_NumericExpression, str],
+        set[str],
+    ],
+    power_conversions: Mapping[
+        tuple[str, Fraction, str, tuple[str, ...]],
+        set[tuple[str, str]],
+    ],
+    technical_measurements: Mapping[
+        tuple[_NumericExpression, str],
+        set[str],
+    ],
+    technical_tokens: Mapping[str, set[tuple[int, str]]],
+    technical_token_sequences: Mapping[int, tuple[str, ...]],
+    all_labels: Sequence[str],
+) -> tuple[
+    list[tuple[int, int]],
+    dict[tuple[int, int], str],
+]:
+    """Classify complete, locally labelled numeric expressions."""
+
+    verified: list[tuple[int, int]] = []
+    invalid: dict[tuple[int, int], str] = {}
+    protected_regions: list[tuple[int, int]] = []
+    verified_token_rows: list[tuple[int, set[int]]] = []
+    token_cursors: dict[int, int] = {}
+    token_matches = list(_NUMERIC_TECHNICAL_TOKEN_RE.finditer(text))
+
+    for token_index, token_match in enumerate(token_matches):
+        token = token_match.group()
+        region = token_match.span()
+        protected_regions.append(region)
+        evidence = technical_tokens.get(token, set())
+        direct_rows = {
+            row_index
+            for row_index, label in evidence
+            if _label_is_locally_bound(
+                text,
+                (label,),
+                token_match.start(),
+                all_labels=all_labels,
+            )
+        }
+        shared_rows: set[int] = set()
+        if not direct_rows and verified_token_rows:
+            previous_end, previous_rows = verified_token_rows[-1]
+            gap = text[previous_end:token_match.start()]
+            current_rows = {row_index for row_index, _label in evidence}
+            if _TECHNICAL_TOKEN_SHARE_GAP_RE.fullmatch(gap):
+                shared_rows = previous_rows & current_rows
+        accepted_rows = direct_rows or shared_rows
+
+        next_positions: dict[int, int] = {}
+        for row_index in accepted_rows:
+            sequence = technical_token_sequences.get(row_index, ())
+            cursor = token_cursors.get(row_index, 0)
+            for source_index in range(cursor, len(sequence)):
+                if sequence[source_index] == token:
+                    next_positions[row_index] = source_index + 1
+                    break
+        accepted_rows = set(next_positions)
+
+        links_forward = False
+        if accepted_rows and token_index + 1 < len(token_matches):
+            next_match = token_matches[token_index + 1]
+            gap = text[token_match.end():next_match.start()]
+            next_rows = {
+                row_index
+                for row_index, _label in technical_tokens.get(
+                    next_match.group(),
+                    set(),
+                )
+            }
+            links_forward = bool(
+                accepted_rows & next_rows
+                and _TECHNICAL_TOKEN_SHARE_GAP_RE.fullmatch(gap)
+            )
+
+        if (
+            accepted_rows
+            and (shared_rows or not _claim_prefix_is_blocked(text, token_match.start()))
+            and (
+                links_forward
+                or not _claim_suffix_is_blocked(text, token_match.end())
+            )
+        ):
+            verified.append(region)
+            verified_token_rows.append((token_match.end(), accepted_rows))
+            for row_index in accepted_rows:
+                token_cursors[row_index] = next_positions[row_index]
+        else:
+            invalid[region] = _bounded_descriptor(token)
+
+    for explicit in _EXPLICIT_UNIT_CLAIM_RE.finditer(text):
+        region = explicit.span()
+        protected_regions.append(region)
+        invalid[region] = _bounded_descriptor(explicit.group())
+
+    for claim in _MEASUREMENT_CLAIM_RE.finditer(text):
+        region = claim.span()
+        if any(_spans_overlap(region, item) for item in protected_regions):
+            continue
+        expression = _numeric_expression(claim)
+        raw_unit = unicodedata.normalize("NFKC", claim.group("unit")).strip()
+        unit = _canonical_unit(raw_unit)
+        descriptor = _bounded_descriptor(claim.group())
+        nonprofessional_power_case = (
+            raw_unit.casefold() in _POWER_UNIT_CANONICAL
+            and raw_unit not in _POWER_UNIT_FACTORS
+        )
+        if (
+            expression is None
+            or nonprofessional_power_case
+            or _claim_prefix_is_blocked(text, claim.start())
+            or _claim_suffix_is_blocked(text, claim.end())
+        ):
+            invalid[region] = descriptor
+            continue
+
+        technical_labels = technical_measurements.get((expression, unit), set())
+        if technical_labels:
+            if _label_is_locally_bound(
+                text,
+                tuple(technical_labels),
+                claim.start(),
+                all_labels=all_labels,
+            ):
+                verified.append(region)
+                continue
+            invalid[region] = descriptor
+            continue
+
+        labels = exact_measurements.get((expression, unit), set())
+        if labels:
+            if _label_is_locally_bound(
+                text,
+                tuple(labels),
+                claim.start(),
+                all_labels=all_labels,
+            ):
+                verified.append(region)
+                continue
+            invalid[region] = descriptor
+            continue
+
+        output_spec = _POWER_UNIT_FACTORS.get(unit)
+        if output_spec is not None and not expression.relation:
+            dimension, factor = output_spec
+            base_value = expression.values[0] * factor
+            evidence = power_conversions.get(
+                (dimension, base_value, expression.comparator, expression.signs),
+                set(),
+            )
+            labels = tuple(
+                label
+                for source_unit, label in evidence
+                if source_unit != unit and label
+            )
+            if labels and _label_is_locally_bound(
+                text,
+                labels,
+                claim.start(),
+                all_labels=all_labels,
+            ):
+                verified.append(region)
+                continue
+        invalid[region] = descriptor
+
+    occupied = [*protected_regions, *verified, *invalid]
+    for pattern in (
+        _HAN_NUMERIC_UNIT_RE,
+        _HAN_BRACKETED_UNIT_RE,
+        _HAN_CLASSIFIED_COUNT_RE,
+        _HAN_COUNT_CLAIM_RE,
+    ):
+        for han_claim in pattern.finditer(text):
+            region = han_claim.span()
+            if any(_spans_overlap(region, item) for item in occupied):
+                continue
+            invalid[region] = _bounded_descriptor(han_claim.group())
+            occupied.append(region)
+    return verified, invalid
+
+
 def _ground_numbers(
     text_values: Sequence[str],
     basis_rows: Sequence[Mapping[str, Any]],
     field: str,
+    *,
+    basis_labels: Sequence[str] | None = None,
 ) -> None:
-    used = _NUMBER_RE.findall(" ".join(text_values))
-    if not used:
-        return
-    source_text = " ".join(
-        f"{item['name']} {item['value']} {item['unit']}" for item in basis_rows
+    if basis_labels is None:
+        labels = [""] * len(basis_rows)
+    else:
+        labels = list(basis_labels)
+        if len(labels) != len(basis_rows):
+            raise ValueError("basis labels must align with basis rows")
+    normalized_labels = [
+        _normalized_analysis_label(label)
+        for label in labels
+    ]
+    duplicate_labels = {
+        label
+        for label in normalized_labels
+        if label and normalized_labels.count(label) > 1
+    }
+    if duplicate_labels:
+        raise ParameterAnalysisError(
+            f"{field} basis labels are ambiguous within one paragraph: "
+            f"{', '.join(sorted(duplicate_labels)[:8])}"
+        )
+
+    source_text = unicodedata.normalize(
+        "NFKC",
+        " ".join(
+            f"{item['name']} {item['value']} {item['unit']}"
+            for item in basis_rows
+        ),
     )
-    supported_in_order = list(dict.fromkeys(_NUMBER_RE.findall(source_text)))
-    supported = set(supported_in_order)
-    unsupported = [number for number in used if number not in supported]
-    if unsupported:
-        unsupported_text = ", ".join(list(dict.fromkeys(unsupported))[:8])
-        supported_text = ", ".join(supported_in_order[:16]) or "none"
+    supported_in_order = list(
+        dict.fromkeys(_FALLBACK_NUMBER_RE.findall(source_text))
+    )
+    (
+        exact_measurements,
+        power_conversions,
+        technical_measurements,
+        raw_expressions,
+        count_expressions,
+        technical_tokens,
+        technical_token_sequences,
+    ) = _basis_measurement_evidence(basis_rows, normalized_labels)
+
+    unsupported: list[str] = []
+    invalid_measurements: list[str] = []
+    for raw_text in text_values:
+        text = unicodedata.normalize("NFKC", raw_text)
+        verified_regions, invalid_regions = _measurement_spans(
+            text,
+            exact_measurements,
+            power_conversions,
+            technical_measurements,
+            technical_tokens,
+            technical_token_sequences,
+            normalized_labels,
+        )
+        invalid_measurements.extend(invalid_regions.values())
+        occupied_regions = [*verified_regions, *invalid_regions]
+        for descriptor in invalid_regions.values():
+            unsupported.extend(_ANY_DIGIT_RE.findall(descriptor))
+
+        raw_regions: list[tuple[int, int]] = []
+        for match in _NUMERIC_EXPRESSION_SCAN_RE.finditer(text):
+            initial_region = match.span()
+            if _span_is_covered(initial_region, occupied_regions) or any(
+                _spans_overlap(initial_region, occupied)
+                for occupied in occupied_regions
+            ):
+                continue
+            expression = _numeric_expression(match)
+            classifier_match = _COUNT_CLASSIFIER_RE.match(text[match.end():])
+            if classifier_match is not None:
+                region = (
+                    match.start(),
+                    match.end() + classifier_match.end(),
+                )
+                classifier = classifier_match.group("classifier")
+                allowed_labels = {
+                    label
+                    for label in count_expressions.get(expression, set())
+                    if _count_classifier_is_professional(label, classifier)
+                }
+            else:
+                region = initial_region
+                allowed_labels = raw_expressions.get(expression, set())
+            raw_regions.append(region)
+            suffix = text[region[1]:]
+            valid_raw = (
+                expression is not None
+                and bool(allowed_labels)
+                and not _claim_prefix_is_blocked(text, match.start())
+                and not _claim_suffix_is_blocked(text, region[1])
+                and _RAW_CLAIM_SUFFIX_BLOCK_RE.match(suffix) is None
+                and _label_is_locally_bound(
+                    text,
+                    tuple(allowed_labels),
+                    match.start(),
+                    all_labels=normalized_labels,
+                )
+            )
+            if not valid_raw:
+                descriptor = _bounded_descriptor(text[region[0]:region[1]])
+                invalid_measurements.append(descriptor)
+                unsupported.extend(_ANY_DIGIT_RE.findall(descriptor))
+
+        all_regions = [*occupied_regions, *raw_regions]
+        for match in _ANY_DIGIT_RE.finditer(text):
+            if not _span_is_covered(match.span(), all_regions):
+                unsupported.append(match.group())
+                invalid_measurements.append(_bounded_descriptor(match.group()))
+
+    if unsupported or invalid_measurements:
+        unsupported_text = ", ".join(
+            _bounded_descriptor(item, 32)
+            for item in list(dict.fromkeys(unsupported))[:8]
+        )
+        supported_text = ", ".join(
+            _bounded_descriptor(item, 32)
+            for item in supported_in_order[:16]
+        ) or "none"
+        invalid_text = ", ".join(
+            list(dict.fromkeys(invalid_measurements))[:8]
+        )
+        invalid_suffix = (
+            f"; invalid measurements: {invalid_text}" if invalid_text else ""
+        )
         raise ParameterAnalysisError(
             f"{field} contains numeric text not present in its basis parameters; "
-            f"unsupported: {unsupported_text}; basis permits: {supported_text}"
+            f"unsupported: {unsupported_text or 'none'}; "
+            f"basis permits: {supported_text}{invalid_suffix}"
         )
 
 
@@ -557,9 +1657,14 @@ def validate_parameter_enrichment(
                     f"{translated_key} must be consistent for repeated headings"
                 )
         translations.append(translation)
+    translation_by_id = {
+        item["parameter_id"]: item for item in translations
+    }
 
     sections_raw = raw.get("sections")
-    minimum_sections = 3 if len(source_rows) >= 10 else 1
+    minimum_sections = 5 if len(source_rows) >= 30 else (
+        3 if len(source_rows) >= 10 else 1
+    )
     if (
         not isinstance(sections_raw, list)
         or not minimum_sections <= len(sections_raw) <= len(
@@ -697,11 +1802,25 @@ def validate_parameter_enrichment(
                 item_limit=300,
             )
             basis_rows = [source_by_id[item] for item in basis_ids]
+            basis_labels = [translation_by_id[item]["name_zh"] for item in basis_ids]
             _ground_numbers(
                 [analysis_zh, *conditions, *limitations],
                 basis_rows,
                 paragraph_prefix,
+                basis_labels=basis_labels,
             )
+            narrative_labels = [
+                _normalized_analysis_label(label)
+                for label in basis_labels
+            ]
+            if analysis_kind != "limitation" and not any(
+                label and label in unicodedata.normalize("NFKC", analysis_zh)
+                for label in narrative_labels
+            ):
+                raise ParameterAnalysisError(
+                    f"{paragraph_prefix}.analysis_zh must name at least one "
+                    "referenced parameter label"
+                )
             paragraphs.append(
                 {
                     "analysis_kind": analysis_kind,
@@ -793,6 +1912,7 @@ __all__ = [
     "SECTION_TRANSLATIONS",
     "apply_parameter_translations",
     "parameter_analysis_input",
+    "parameter_numeric_guidance",
     "parameter_id",
     "parameter_set_sha256",
     "professional_analysis",
