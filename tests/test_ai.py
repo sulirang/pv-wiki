@@ -763,9 +763,25 @@ class PromptTests(unittest.TestCase):
             " ".join(prompt["analysis_policy"]),
         )
         self.assertIn(
-            "Do not repeat the product name or model",
+            "Never copy the product name, ID, model, series",
             " ".join(prompt["analysis_policy"]),
         )
+        self.assertIn(
+            "3L+N+PE",
+            " ".join(prompt["paragraph_construction_rules"]),
+        )
+        self.assertIn(
+            "Start every non-limitation paragraph directly",
+            " ".join(prompt["paragraph_construction_rules"]),
+        )
+        self.assertIn(
+            "no_numeric_restatement",
+            prompt["numeric_narrative_mode_rules"],
+        )
+        value_contract = prompt["output_contract"]["translations"]["item"][
+            "value_zh"
+        ]
+        self.assertIn("composite topology codes", value_contract)
         self.assertIn(
             "never use ranges, labels, or objects",
             prompt["output_contract"]["sections"]["item"]["paragraphs"][
@@ -785,6 +801,14 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(
             ["过流保护", "过电流保护"],
             prompt["controlled_compound_terms"]["Over Current Protection"],
+        )
+        self.assertEqual(
+            ["并网接线方式", "并网接线制式", "馈电方式"],
+            prompt["controlled_compound_terms"]["Feed-in"],
+        )
+        self.assertEqual(
+            ["拓扑结构", "拓扑"],
+            prompt["controlled_compound_terms"]["Topology"],
         )
         self.assertIn(
             "compound term",
@@ -1284,6 +1308,10 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertIn("do not repeat numeric standard identifiers", repair_content)
         self.assertIn("technical-token source order and multiplicity", repair_content)
         self.assertIn("professional Arabic count expressions", repair_content)
+        self.assertIn("product name, ID, model, or series", repair_content)
+        self.assertIn("Feed-in=3L+N+PE", repair_content)
+        self.assertIn("keep value_zh empty", repair_content)
+        self.assertIn("三相", repair_content)
         self.assertNotIn("without conversion", repair_content)
         self.assertIn(
             "translations must contain exactly one item",

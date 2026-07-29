@@ -1369,6 +1369,51 @@ def build_parameter_analysis_messages(
             "values_and_units_are_source_preserving": True,
             "numeric_narrative_is_runtime_derived": True,
         },
+        "numeric_narrative_mode_rules": {
+            "complete_measurement": (
+                "If narrated, put the complete name_zh narrative label core "
+                "immediately before the complete source expression and adjacent "
+                "source unit. Only an exact W/kW or Wp/kWp conversion may replace "
+                "the source power expression."
+            ),
+            "complete_unitless_expression": (
+                "If narrated, put the complete name_zh narrative label core "
+                "immediately before the unchanged complete source expression; "
+                "do not add a unit or classifier."
+            ),
+            "complete_count_expression": (
+                "If narrated, put the complete name_zh narrative label core "
+                "immediately before the unchanged complete Arabic expression and "
+                "one compatible approved classifier."
+            ),
+            "exact_technical_tokens_only": (
+                "Either omit the row or use only listed allowed numeric technical "
+                "tokens, in source order and immediately after that row's complete "
+                "name_zh narrative label core. Never copy unlisted neighboring "
+                "source characters, translate a token into a Chinese-number phrase, "
+                "or put a token in parentheses."
+            ),
+            "no_numeric_restatement": (
+                "Discuss the row only qualitatively or omit it. Do not write digits, "
+                "Chinese-number measurements or counts, standards, topology codes, "
+                "or numeric fragments from the source value."
+            ),
+        },
+        "paragraph_construction_rules": [
+            "Choose basis_parameter_ids before writing. Start every non-limitation "
+            "paragraph directly with the complete name_zh narrative label core of "
+            "a referenced row; never start with a product introduction.",
+            "Never copy the product name, ID, model, series, or any fragment of them "
+            "into analysis_zh. Never derive a power, phase, MPPT, or other fact from "
+            "identity text.",
+            "Never use a number plus a power unit as a product class, level, model, "
+            "product, or inverter phrase. A backed power value may appear only as "
+            "<完整语义 name_zh 核心>为<完整表达式+单位>.",
+            "Never write Chinese-number topology or count phrases such as 三相 or "
+            "双路. For a no_numeric_restatement row such as Feed-in=3L+N+PE, never "
+            "write 3L, 3L+N+PE, or a numeric translation; discuss it qualitatively "
+            "without numeric text or omit it.",
+        ],
         "controlled_section_translations": SECTION_TRANSLATIONS,
         "controlled_terms": {
             "Max.": "最大",
@@ -1400,6 +1445,8 @@ def build_parameter_analysis_messages(
             "Over Current Protection": ["过流保护", "过电流保护"],
             "Over-voltage Protection": ["过压保护", "过电压保护"],
             "Cooling Method": ["散热方式", "冷却方式"],
+            "Feed-in": ["并网接线方式", "并网接线制式", "馈电方式"],
+            "Topology": ["拓扑结构", "拓扑"],
             "Ingress Protection": ["防护等级"],
         },
         "controlled_term_rule": (
@@ -1431,7 +1478,8 @@ def build_parameter_analysis_messages(
                     "value_zh": (
                         "optional professional translation only for a textual "
                         "source value; use empty string for numeric values, ranges, "
-                        "standards, symbols, and units; never replace source value"
+                        "standards, symbols, units, and composite topology codes "
+                        "such as 3L+N+PE; never replace source value"
                     ),
                 },
             },
@@ -1489,9 +1537,9 @@ def build_parameter_analysis_messages(
         "analysis_policy": [
             "Use all relevant verified parameters across multiple sections; do "
             "not merely rewrite a generic product introduction.",
-            "Do not repeat the product name or model inside analysis paragraphs; "
-            "the page heading already presents identity, and digits embedded in "
-            "identity are not parameter evidence.",
+            "Never copy the product name, ID, model, series, or any fragment of "
+            "them into analysis paragraphs. The page heading already presents "
+            "identity, and digits embedded in identity are not parameter evidence.",
             "Separate source facts from engineering interpretation. Phrase "
             "interpretations conditionally and identify missing design inputs.",
             "For inverters, cover product positioning, DC input and MPPT, AC "
@@ -1508,8 +1556,10 @@ def build_parameter_analysis_messages(
             "个/路/组/项/套 classifier compatible with name_zh, and an MPPT count may "
             "use only 个/路/组. Never use 台 for a parameter count. For "
             "exact_technical_tokens_only, use only listed exact tokens in their source "
-            "order and without repetition; for no_numeric_restatement, discuss the row "
-            "qualitatively without digits.",
+            "order and without repetition; never copy unlisted neighboring source "
+            "characters or translate a token into a Chinese-number phrase; for "
+            "no_numeric_restatement, discuss the row qualitatively without digits, "
+            "topology codes, or Chinese-number equivalents.",
             "Preserve each complete numeric expression: comparison operator, explicit "
             "sign, range endpoints and order, decimal or thousands meaning, and unit. "
             "Write the expression directly with its unit; never separate them with a "
@@ -2768,12 +2818,22 @@ class OpenAICompatibleClient:
                         "Retry once. Return one complete JSON object matching the "
                         "parameter-analysis output contract. Include exactly one "
                         "translation for every input parameter in the original "
-                        "order; preserve every protected token and controlled "
+                        "order; keep value_zh empty for composite topology codes "
+                        "such as 3L+N+PE; preserve every protected token and controlled "
                         "term; reference only supplied parameter IDs; follow every "
                         "row's numeric_narrative mode and use only "
                         "exact source numeric expressions whenever possible; only "
                         "use exact W/kW or Wp/kWp conversions with the matching "
                         "narrative label core immediately before the value; every "
+                        "non-limitation paragraph must start directly with a "
+                        "referenced complete name_zh narrative label core; delete "
+                        "every clause that copies the product name, ID, model, or "
+                        "series, or uses a number plus power unit as a product class, "
+                        "level, model, product, or inverter phrase; never write "
+                        "Chinese-number topology or count phrases such as 三相 or "
+                        "双路; for a no_numeric_restatement row such as "
+                        "Feed-in=3L+N+PE, never write 3L, 3L+N+PE, or a numeric "
+                        "translation; discuss it qualitatively or omit it; every "
                         "non-limitation paragraph must name a referenced label core; "
                         "preserve technical-token source order and multiplicity; use "
                         "only professional Arabic count expressions; do not repeat "

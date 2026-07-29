@@ -390,6 +390,9 @@ class ParameterAnalysisTests(unittest.TestCase):
             ("Internal Over-voltage Protection", "内部过压保护"),
             ("Cooling Method", "散热方式"),
             ("Ingress Protection", "防护等级"),
+            ("Feed-in", "并网接线方式"),
+            ("Feed-in Current [A]", "并网电流 [A]"),
+            ("Topology", "拓扑结构"),
         ):
             with self.subTest(source_name=source_name):
                 source = parameters()
@@ -403,6 +406,8 @@ class ParameterAnalysisTests(unittest.TestCase):
             ("DC Voltage [V]", "直流参数 [V]"),
             ("Circuit Protection", "电路功能"),
             ("Cooling Method", "运行方式"),
+            ("Feed-in", "三电平拓扑"),
+            ("Topology", "馈电方式"),
             ("Overcurrent Protection", "保护"),
             ("Overvoltage Protection Voltage Range", "过压保护范围"),
             ("Rated AC Power [W]", "额定功率 [W]"),
@@ -1252,6 +1257,15 @@ class ParameterAnalysisTests(unittest.TestCase):
             ),
             (
                 {
+                    "name": "Feed-in",
+                    "value": "3L+N+PE",
+                    "unit": "",
+                },
+                "no_numeric_restatement",
+                [],
+            ),
+            (
+                {
                     "name": "Applicable Standard",
                     "value": "IEC 62116, IEC 61727",
                     "unit": "",
@@ -1269,6 +1283,59 @@ class ParameterAnalysisTests(unittest.TestCase):
                     },
                     parameter_numeric_guidance(row),
                 )
+
+    def test_compound_feed_in_is_translation_only_in_narrative(self) -> None:
+        source = parameters()
+        source[0].update(
+            name="Feed-in",
+            value="3L+N+PE",
+            unit="",
+        )
+        valid = copy.deepcopy(enrichment())
+        valid["translations"][0]["name_zh"] = "并网接线方式"
+        paragraph = valid["sections"][0]["paragraphs"][0]
+        paragraph["basis_parameter_ids"] = ["p001"]
+        paragraph["analysis_zh"] = (
+            "并网接线方式采用制造商数据表列示的交流侧连接配置；工程设计"
+            "仍应结合现场电网制式与接地要求逐项核对。"
+        )
+        validate_parameter_enrichment(valid, source)
+
+        for forbidden in (
+            "并网接线方式为 3L；",
+            "并网接线方式为 3L+N+PE；",
+            "并网接线方式为三相；",
+            "并网接线方式采用三线制；",
+            "并网接线方式包含三根相线；",
+            "并网接线方式采用三电平拓扑；",
+            "R5-10K-T2-15 是该并网接线方式对应的产品型号；",
+        ):
+            with self.subTest(forbidden=forbidden):
+                invalid = copy.deepcopy(valid)
+                invalid["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+                    forbidden
+                    + "该表述违反该行的正文数值叙述约束，因此不能据此形成"
+                    "工程结论或产品定位。"
+                )
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "numeric text",
+                ):
+                    validate_parameter_enrichment(invalid, source)
+
+        for value_zh in (
+            "3L（三相）",
+            "3L+N+PE（三相）",
+            "三相",
+        ):
+            with self.subTest(value_zh=value_zh):
+                invalid_value = copy.deepcopy(valid)
+                invalid_value["translations"][0]["value_zh"] = value_zh
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "must be empty for a composite topology code",
+                ):
+                    validate_parameter_enrichment(invalid_value, source)
 
     def test_rejects_unicode_operator_scope_and_dimension_bypasses(self) -> None:
         source = parameters()
@@ -1307,6 +1374,26 @@ class ParameterAnalysisTests(unittest.TestCase):
             "单位面积额定交流功率为 10 kW",
             "备用额定交流功率为 10 kW",
             "总额定交流功率为 10 kW",
+            "额定交流功率为 10 kW级",
+            "额定交流功率为 10 kW机型",
+            "额定交流功率为 10 kW的逆变器",
+            "额定交流功率为 10 kW 等级",
+            "额定交流功率为 10 kW 规格产品",
+            "额定交流功率为 10 kW 系列",
+            "额定交流功率为 10 kW 款逆变器",
+            "额定交流功率为 10 kW 版本",
+            "额定交流功率为 10 kW 对应机型",
+            "额定交流功率为 10 kW 容量等级",
+            "额定交流功率为 10 kW 类产品",
+            "额定交流功率为 10 kW 近似值",
+            "额定交流功率为 10 kW 估计值",
+            "额定交流功率为 10 kW 估算值",
+            "额定交流功率为 10 kW 量级",
+            "额定交流功率为 10 kW 上限",
+            "额定交流功率为 10 kW 下限",
+            "额定交流功率为 10 kW的近似值",
+            "额定交流功率为 10 kW 的估计值",
+            "额定交流功率为 10 kW的量级",
         )
         for claim in invalid_claims:
             with self.subTest(claim=claim):
@@ -1317,6 +1404,17 @@ class ParameterAnalysisTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ParameterAnalysisError, "numeric text"):
                     validate_parameter_enrichment(item, source)
+
+        for claim in (
+            "额定交流功率为 10 kW 的条件下",
+            "额定交流功率为 10 kW的输出边界内",
+        ):
+            with self.subTest(valid_relative_claim=claim):
+                item = copy.deepcopy(valid)
+                item["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+                    claim + "，仍应结合制造商数据表所列其他条件完成工程核对。"
+                )
+                validate_parameter_enrichment(item, source)
 
         original = enrichment()["sections"][0]["paragraphs"][0]["analysis_zh"]
         for replacement in (

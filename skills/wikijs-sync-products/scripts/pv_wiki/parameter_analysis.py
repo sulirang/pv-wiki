@@ -14,8 +14,8 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v10"
-PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v4"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v11"
+PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v5"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
 
@@ -86,6 +86,14 @@ _COMPOUND_REQUIRED_TERMS = (
     (
         re.compile(r"\bCooling\s+Method\b", re.IGNORECASE),
         ("散热方式", "冷却方式"),
+    ),
+    (
+        re.compile(r"^\s*Feed[- ]?in\s*$", re.IGNORECASE),
+        ("并网接线方式", "并网接线制式", "馈电方式"),
+    ),
+    (
+        re.compile(r"\bTopology\b", re.IGNORECASE),
+        ("拓扑结构", "拓扑"),
     ),
     (
         re.compile(r"\bIngress\s+Protection\b", re.IGNORECASE),
@@ -170,7 +178,7 @@ _MEASUREMENT_CLAIM_RE = re.compile(
     rf"{_EXPRESSION_START_GUARD}"
     rf"(?P<operator>{_COMPARISON_PATTERN})?\s*"
     rf"(?P<first>{_NUMERIC_TOKEN_PATTERN}){_NUMERIC_TAIL_PATTERN}\s*"
-    rf"(?P<unit>{_UNIT_TOKEN_PATTERN})(?=$|[为是]|[^A-Za-z0-9μµ\u3400-\u9fff])"
+    rf"(?P<unit>{_UNIT_TOKEN_PATTERN})(?=$|[为是的]|[^A-Za-z0-9μµ\u3400-\u9fff])"
 )
 _EXPLICIT_UNIT_CLAIM_RE = re.compile(
     rf"{_EXPRESSION_START_GUARD}"
@@ -197,9 +205,17 @@ _PUNCTUATED_SEMANTIC_POSTFIX_PATTERN = (
     rf"(?:级\s*)?(?:(?:及|且|或)\s*)?"
     rf"{_PUNCTUATED_SEMANTIC_POSTFIX_BASE}"
 )
+_CLAIM_HAN_POSTFIX_PATTERN = (
+    r"(?:(?:的\s*)?(?:(?:功率|容量)?(?:等级|级别)|级|档|规格(?:产品|机型|型号|设备)?|"
+    r"系列|款(?:逆变器|机型|型号|产品|设备)?|版本|类别|类型|类(?:产品|机型|型号|设备|逆变器)|"
+    r"对应(?:机型|型号|产品|设备|逆变器)|机型|型号|产品|设备|逆变器)|"
+    r"(?:的\s*)?(?:近似值|估计值|估算值|量级|范围|上限|下限|左右|上下|"
+    r"以上|以下|以内|以外|附近))"
+)
 _CLAIM_SUFFIX_BLOCK_RE = re.compile(
     rf"^\s*(?:{_SEMANTIC_POSTFIX_PATTERN}|"
-    rf"[，,、；;。.!！？?]\s*{_PUNCTUATED_SEMANTIC_POSTFIX_PATTERN}|每|"
+    rf"[，,、；;。.!！？?]\s*{_PUNCTUATED_SEMANTIC_POSTFIX_PATTERN}|"
+    rf"{_CLAIM_HAN_POSTFIX_PATTERN}|每|"
     r"[+\-−–—＋－±∓<>≤≥≦≧≠≈~∼/·⋅∙*×÷∕⁄]|[²³]|[A-Za-zμµΩ°]|"
     r"\((?!(?:STC|NMOT)\s*\))|[（\[【\)）\]】])",
     re.IGNORECASE,
@@ -232,6 +248,11 @@ _HAN_CLASSIFIED_COUNT_RE = re.compile(
     r"设备|逆变器|保护))",
     re.IGNORECASE,
 )
+_HAN_ENGINEERING_TOPOLOGY_RE = re.compile(
+    rf"{_HAN_NUMBER_PATTERN}\s*(?:根\s*(?:相线|导线|线)|"
+    r"(?:相)?线制|电平(?:拓扑|结构)?|相制)",
+    re.IGNORECASE,
+)
 _HAN_BRACKETED_UNIT_RE = re.compile(
     rf"{_HAN_NUMBER_PATTERN}\s*[\[(（]\s*(?:{_UNIT_TOKEN_PATTERN})"
 )
@@ -242,6 +263,10 @@ _COUNT_CLASSIFIER_RE = re.compile(
 _NUMERIC_TECHNICAL_TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9])(?:IP\d+|RS\d+|RJ\d+|MC\d+|[345]G|\d+L)"
     r"(?![A-Za-z0-9])"
+)
+_COMPOSITE_TOPOLOGY_VALUE_RE = re.compile(
+    r"^\s*\d+L(?:\s*[+/]\s*(?:N|PE))+\s*$",
+    re.IGNORECASE,
 )
 _TECHNICAL_TOKEN_SHARE_GAP_RE = re.compile(
     r"^\s*(?:(?:[，,、/+]|和|及|与|以及)\s*)$"
@@ -626,6 +651,7 @@ def _reject_added_han_numeric_claims(
         _HAN_NUMERIC_UNIT_RE,
         _HAN_BRACKETED_UNIT_RE,
         _HAN_CLASSIFIED_COUNT_RE,
+        _HAN_ENGINEERING_TOPOLOGY_RE,
         _HAN_COUNT_CLAIM_RE,
     ):
         for match in pattern.finditer(translated):
@@ -809,6 +835,10 @@ def _validate_translation(
         require_han=bool(raw.get("value_zh")),
     )
     source_value = str(source["value"])
+    if value_zh and _COMPOSITE_TOPOLOGY_VALUE_RE.fullmatch(source_value):
+        raise ParameterAnalysisError(
+            f"{prefix}.value_zh must be empty for a composite topology code"
+        )
     _reject_added_numeric_tokens(value_zh, source_value, f"{prefix}.value_zh")
     for token in _PROTECTED_TOKEN_RE.findall(source_value):
         if token not in value_zh and value_zh:
@@ -991,6 +1021,9 @@ def parameter_numeric_guidance(parameter: Mapping[str, Any]) -> dict[str, Any]:
         mode = "complete_count_expression"
     elif expression is not None:
         mode = "complete_unitless_expression"
+    elif _COMPOSITE_TOPOLOGY_VALUE_RE.fullmatch(source_value):
+        mode = "no_numeric_restatement"
+        technical_tokens = []
     elif technical_tokens:
         mode = "exact_technical_tokens_only"
     else:
@@ -1195,11 +1228,14 @@ def _basis_measurement_evidence(
                     set(),
                 ).add(label)
 
-        combined_source = f"{source_name} {source_value}"
-        source_technical_tokens = tuple(
-            match.group()
-            for match in _NUMERIC_TECHNICAL_TOKEN_RE.finditer(combined_source)
-        )
+        if _COMPOSITE_TOPOLOGY_VALUE_RE.fullmatch(source_value):
+            source_technical_tokens: tuple[str, ...] = ()
+        else:
+            combined_source = f"{source_name} {source_value}"
+            source_technical_tokens = tuple(
+                match.group()
+                for match in _NUMERIC_TECHNICAL_TOKEN_RE.finditer(combined_source)
+            )
         technical_token_sequences[row_index] = source_technical_tokens
         for token in source_technical_tokens:
             technical_tokens.setdefault(token, set()).add((row_index, label))
@@ -1431,6 +1467,7 @@ def _measurement_spans(
         _HAN_NUMERIC_UNIT_RE,
         _HAN_BRACKETED_UNIT_RE,
         _HAN_CLASSIFIED_COUNT_RE,
+        _HAN_ENGINEERING_TOPOLOGY_RE,
         _HAN_COUNT_CLAIM_RE,
     ):
         for han_claim in pattern.finditer(text):
