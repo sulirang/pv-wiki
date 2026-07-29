@@ -689,7 +689,7 @@ class PromptTests(unittest.TestCase):
             "translate_and_analyze_complete_verified_parameter_set",
             prompt["task"],
         )
-        self.assertEqual("pv-parameter-analysis-v19", prompt["prompt_version"])
+        self.assertEqual("pv-parameter-analysis-v20", prompt["prompt_version"])
         self.assertEqual("pv-zh-technical-v6", prompt["glossary_version"])
         self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
         self.assertTrue(
@@ -1635,7 +1635,12 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             final_repair,
         )
         self.assertIn(
-            "phase narrative must be omitted from every narrative field",
+            "all narrative fields must omit numeric and phase wording",
+            final_repair,
+        )
+        self.assertIn(
+            "Mandatory final-request narrative fallback overrides every earlier "
+            "numeric and phase template",
             final_repair,
         )
         self.assertNotIn(
@@ -1644,15 +1649,17 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             final_repair,
         )
         self.assertIn(
-            "conditions_zh must be a JSON array of 0-2 strings",
+            "conditions_zh and limitations_zh must each be a JSON array "
+            "of 0-2 strings",
             final_repair,
         )
         self.assertIn(
-            "translations must contain exactly one item",
+            "exactly one translation for every input parameter",
             final_repair,
         )
+        self.assertNotIn("received string", final_repair)
 
-    def test_parameter_analysis_final_request_omits_phase_proactively(
+    def test_parameter_analysis_final_request_uses_qualitative_fallback(
         self,
     ) -> None:
         calls: list[dict] = []
@@ -1661,7 +1668,23 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             "sections": [],
             "overall_limitations_zh": [],
         }
-        responses = [invalid, invalid, invalid, valid_parameter_enrichment()]
+        scalar_list = valid_parameter_enrichment()
+        scalar_list["sections"][0]["paragraphs"][0]["conditions_zh"] = (
+            "应核对现场条件。"
+        )
+        numeric_invalid = valid_parameter_enrichment()
+        numeric_invalid["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "额定功率参数为10 kW；该数值改写未满足严格的参数标签和值绑定"
+            "规则，工程应用仍需核对并网条件、负载边界和项目约束。"
+        )
+        qualitative = valid_parameter_enrichment()
+        qualitative["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "额定功率参数用于说明交流侧的功率配置边界；工程设计仍需结合"
+            "并网条件、负载边界、保护协调和项目约束进行核对。"
+        )
+        qualitative["sections"][0]["paragraphs"][0]["conditions_zh"] = []
+        qualitative["sections"][0]["paragraphs"][0]["limitations_zh"] = []
+        responses = [invalid, scalar_list, numeric_invalid, qualitative]
 
         def fake_open(request: object, *, timeout: float) -> FakeResponse:
             del timeout
@@ -1692,6 +1715,20 @@ class OpenAICompatibleClientTests(unittest.TestCase):
 
         self.assertTrue(result["input_complete"])
         self.assertEqual(4, client.last_parameter_analysis_provider_requests)
+        self.assertEqual(
+            qualitative["translations"],
+            result["translations"],
+        )
+        result_paragraph = result["sections"][0]["paragraphs"][0]
+        self.assertEqual([], result_paragraph["conditions_zh"])
+        self.assertEqual([], result_paragraph["limitations_zh"])
+        for narrative_text in (
+            result_paragraph["analysis_zh"],
+            *result_paragraph["conditions_zh"],
+            *result_paragraph["limitations_zh"],
+            *result["overall_limitations_zh"],
+        ):
+            self.assertNotRegex(narrative_text, r"[0-9０-９]")
         final_repair = calls[3]["messages"][-1]["content"]
         self.assertIn(
             "Mandatory phase repair for this retry overrides every earlier "
@@ -1699,11 +1736,27 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             final_repair,
         )
         self.assertIn(
-            "phase narrative must be omitted from every narrative field",
+            "all narrative fields must omit numeric and phase wording",
+            final_repair,
+        )
+        self.assertIn(
+            "Mandatory final-request narrative fallback overrides every earlier "
+            "numeric and phase template",
+            final_repair,
+        )
+        self.assertIn(
+            "without Arabic or fullwidth digits, Chinese or English number words",
+            final_repair,
+        )
+        self.assertIn(
+            "fallback changes narrative fields only, never translations",
             final_repair,
         )
         self.assertNotIn("phase clause required exactly:", final_repair)
         self.assertNotIn("phase clause unavailable in cited basis", final_repair)
+        self.assertNotIn("unsupported: 10", final_repair)
+        self.assertNotIn("basis permits: 10000", final_repair)
+        self.assertNotIn("invalid measurements: 10", final_repair)
 
     def test_parameter_analysis_stops_after_four_invalid_outputs(self) -> None:
         calls: list[dict] = []

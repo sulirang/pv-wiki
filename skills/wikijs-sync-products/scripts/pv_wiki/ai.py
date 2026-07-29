@@ -2900,18 +2900,24 @@ class OpenAICompatibleClient:
                 phase_claim_repair_required = (
                     phase_error_reported or next_request_is_final
                 )
-                retry_requirements = [
-                    requirement
-                    for requirement in validation_requirements
-                    if not any(
-                        marker in requirement
-                        for marker in phase_error_markers
-                    )
-                ]
-                if phase_claim_repair_required:
-                    retry_requirements.append(
-                        "phase narrative must be omitted from every narrative field"
-                    )
+                if next_request_is_final:
+                    retry_requirements = [
+                        "output must satisfy the documented structure",
+                        "all narrative fields must omit numeric and phase wording",
+                    ]
+                else:
+                    retry_requirements = [
+                        requirement
+                        for requirement in validation_requirements
+                        if not any(
+                            marker in requirement
+                            for marker in phase_error_markers
+                        )
+                    ]
+                    if phase_claim_repair_required:
+                        retry_requirements.append(
+                            "phase narrative must be omitted from every narrative field"
+                        )
                 accumulated_requirements = " | ".join(retry_requirements)
                 phase_repair_rule = (
                     "Mandatory phase repair for this retry overrides every earlier "
@@ -2930,6 +2936,22 @@ class OpenAICompatibleClient:
                         "No prefix, negation, question, later contradiction, topology "
                         "continuation, source code, or expanded topology phrase. "
                     )
+                )
+                final_narrative_fallback_rule = (
+                    "Mandatory final-request narrative fallback overrides every "
+                    "earlier numeric and phase template: keep every required "
+                    "translation, but write analysis_zh, conditions_zh, "
+                    "limitations_zh, and overall_limitations_zh without Arabic or "
+                    "fullwidth digits, Chinese or English number words, measurement "
+                    "values, unit symbols, percentages, ranges, comparison signs, "
+                    "ratios, multiples, standards, topology/model/technical codes, "
+                    "or 三相. Do not convert, spell, or transliterate an omitted value. "
+                    "Choose referenced parameters whose narrative label cores contain "
+                    "none of those tokens. Use [] for conditions_zh and limitations_zh "
+                    "unless a distinct qualitative sentence is essential. This "
+                    "fallback changes narrative fields only, never translations. "
+                    if next_request_is_final
+                    else ""
                 )
                 request_messages = [
                     *messages,
@@ -2998,9 +3020,11 @@ class OpenAICompatibleClient:
                             "rules apply equally to analysis_zh, conditions_zh, "
                             "limitations_zh, and overall_limitations_zh; never move an "
                             "offending result to another field. Omit an optional offending "
-                            "claim instead of inventing a replacement. No prose or Markdown "
-                            "outside JSON. Local validation requirements accumulated "
-                            f"across prior attempts: {accumulated_requirements}."
+                            "claim instead of inventing a replacement. Local validation "
+                            "requirements accumulated across prior attempts: "
+                            f"{accumulated_requirements}. "
+                            f"{final_narrative_fallback_rule}"
+                            "No prose or Markdown outside JSON."
                         ),
                     },
                 ]
