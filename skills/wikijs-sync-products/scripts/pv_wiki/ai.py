@@ -26,6 +26,7 @@ from enum import Enum
 from typing import Any, Literal, TypeAlias
 
 from .config import is_placeholder_value
+from .decision import PRODUCT_CATEGORY_LABELS
 
 
 DEFAULT_TIMEOUT = 60.0
@@ -1183,11 +1184,62 @@ def _normalized_extract(
     extract: Mapping[str, Any], evidence_budget: _TextBudget
 ) -> dict[str, Any]:
     normalized_results: list[dict[str, Any]] = []
+    remaining_parameter_rows = 30
     results = extract.get("results")
     if isinstance(results, list):
         for item in results[:5]:
             if not isinstance(item, Mapping):
                 continue
+            parameter_rows: list[dict[str, Any]] = []
+            raw_parameter_rows = item.get("pdf_parameter_rows")
+            if (
+                item.get("pdf_direct_status") == "used"
+                and isinstance(raw_parameter_rows, list)
+                and remaining_parameter_rows > 0
+            ):
+                for row in raw_parameter_rows[:remaining_parameter_rows]:
+                    if not isinstance(row, Mapping):
+                        continue
+                    page = row.get("page")
+                    order = row.get("order")
+                    parameter_rows.append(
+                        {
+                            "model": evidence_budget.take(
+                                row.get("model"), per_value_limit=200
+                            ),
+                            "source_label": evidence_budget.take(
+                                row.get("source_label"), per_value_limit=200
+                            ),
+                            "value": evidence_budget.take(
+                                row.get("value"), per_value_limit=200
+                            ),
+                            "unit": evidence_budget.take(
+                                row.get("unit"), per_value_limit=80
+                            ),
+                            "section": evidence_budget.take(
+                                row.get("section"), per_value_limit=100
+                            ),
+                            "page": (
+                                page
+                                if isinstance(page, int)
+                                and not isinstance(page, bool)
+                                else None
+                            ),
+                            "order": (
+                                order
+                                if isinstance(order, int)
+                                and not isinstance(order, bool)
+                                else None
+                            ),
+                            "model_quote": evidence_budget.take(
+                                row.get("model_quote"), per_value_limit=500
+                            ),
+                            "quote": evidence_budget.take(
+                                row.get("quote"), per_value_limit=500
+                            ),
+                        }
+                    )
+                    remaining_parameter_rows -= 1
             original = item.get("raw_content")
             original_text = original if isinstance(original, str) else ""
             content = evidence_budget.take(original_text)
@@ -1208,13 +1260,19 @@ def _normalized_extract(
                         and not isinstance(item.get("pdf_page_count"), bool)
                         else None
                     ),
+                    "locally_verified_primary_pdf": (
+                        item.get("pdf_direct_status") == "used"
+                    ),
+                    "locally_bound_parameter_rows": parameter_rows,
                 }
             )
     return {
         "query": _bounded_string(extract.get("query"), 400),
         "results": normalized_results,
         "note": (
-            "Only successful results[].url values may be cited in the decision."
+            "Only successful results[].url values may be cited in the decision. "
+            "locally_bound_parameter_rows are deterministic target-column "
+            "projections from a directly parsed PDF and retain auditable TSV rows."
         ),
     }
 
@@ -1282,8 +1340,10 @@ def build_decision_messages(
                 "manufacturer",
                 "manufacturer_zh",
                 "model",
-                "display_title_zh",
+                "product_description_zh",
+                "product_category_code",
                 "product_category",
+                "product_type",
                 "summary",
                 "review_summary",
                 "review_evidence_urls",
@@ -1292,7 +1352,9 @@ def build_decision_messages(
                 "decision_notes",
                 "datasheets",
                 "sources",
+                "datasheet_parameters",
                 "facts",
+                "derived_insights",
                 "conflicts",
             ],
             "outcomes": [
@@ -1309,14 +1371,26 @@ def build_decision_messages(
                 "mirror",
                 "community",
             ],
-            "display_title_zh": (
-                "concise Simplified Chinese product descriptor, at most 200 "
-                "characters; the runtime adds the canonical model when needed"
+            "product_description_zh": (
+                "concise Simplified Chinese product description, at most 200 "
+                "characters; do not repeat the product ID or model"
             ),
             "manufacturer_zh": (
                 "Simplified Chinese reader label for the manufacturer, at most "
                 "200 characters; the runtime adds the canonical manufacturer "
                 "when needed; do not invent a Chinese legal entity name"
+            ),
+            "product_categories": PRODUCT_CATEGORY_LABELS,
+            "product_category_code": (
+                "one exact key from product_categories"
+            ),
+            "product_category": (
+                "the exact Simplified Chinese product_categories value matching "
+                "product_category_code"
+            ),
+            "product_type": (
+                "concise, more specific Simplified Chinese technical type; phase, "
+                "grid mode, topology, and similar detail belong here or in parameters"
             ),
             "datasheet_item": {
                 "url": "string",
@@ -1360,6 +1434,34 @@ def build_decision_messages(
                     ],
                 },
             },
+            "datasheet_parameter_item": {
+                "name": "exact source field label; do not translate",
+                "section": (
+                    "exact source section label when available; preserve source order"
+                ),
+                "value": "string or number",
+                "unit": "string",
+                "confidence": "number from 0 to 1",
+                "evidence_urls": ["successful extracted URL"],
+                "evidence_quotes": (
+                    "same exact grounded quote shapes as fact_item.evidence_quotes"
+                ),
+            },
+            "derived_insight_item": {
+                "name": "concise Simplified Chinese name",
+                "value": "finite numeric result",
+                "unit": "string",
+                "formula": (
+                    "exactly: numeric literal, one binary operator from "
+                    "+ - * / × ÷, numeric literal; no units, variables, "
+                    "parentheses, equals sign, or unit conversion"
+                ),
+                "basis": [
+                    "exactly 2 distinct unambiguous names from "
+                    "datasheet_parameters or facts, in operand order"
+                ],
+                "explanation": "optional concise Simplified Chinese explanation",
+            },
             "conflict_item": {
                 "field": "string",
                 "values": ["two or more conflicting scalar values"],
@@ -1391,8 +1493,9 @@ def build_decision_messages(
             "specification that can be attributed safely, but the trusted PDF "
             "remains sufficient when no individual fact can be grounded without "
             "guessing.",
-            "Infer the public manufacturer, model, and product category from "
-            "the extracted public content; catalogue brand metadata may be absent.",
+            "Infer the public manufacturer, model, broad product category, and "
+            "specific product type from extracted public content; catalogue brand "
+            "metadata may be absent.",
             "product.model is the runtime's strongest public model hint. "
             "product.model_candidates contains operator-derived exact alternate "
             "model tokens from the catalogue number and description; use an "
@@ -1413,17 +1516,35 @@ def build_decision_messages(
             "A durable out_of_scope decision requires identity_verified=true "
             "extract evidence and high confidence. If no extract verifies the "
             "catalogue identity, use insufficient_identity instead.",
-            "For publish, display_title_zh, manufacturer_zh, product_category, "
+            "For publish, product_description_zh, manufacturer_zh, product_type, "
             "and summary are reader-facing Simplified Chinese copy. The runtime "
-            "will retain the canonical model and manufacturer alongside these "
-            "labels. Do not invent a Chinese legal entity name; when no official "
-            "Chinese brand is supported, use a faithful Chinese reader label.",
-            "product_category must be a concise Simplified Chinese reader-facing "
-            "category, never an internal code.",
+            "will retain the PostgreSQL English product_name, canonical model, and "
+            "manufacturer alongside these labels. Do not repeat the ID/model in "
+            "product_description_zh. Do not invent a Chinese legal entity name; "
+            "when no official Chinese brand is supported, use a faithful label.",
+            "product_category_code and product_category must be one exact matching "
+            "pair from output_contract.product_categories; this is the broad "
+            "reader-facing category. Never put phase count, grid mode, MPPT count, "
+            "wattage, chemistry, or dimensions there; use product_type or parameters.",
             "summary must be fluent Simplified Chinese prose. Preserve model "
             "numbers, measurements, standards, trademarks, and technical "
             "abbreviations exactly rather than translating those tokens.",
             "Keep conflicting claims out of facts and list them in conflicts.",
+            "Populate datasheet_parameters with at most 30 safely grounded "
+            "target-model rows from the primary datasheet, preserving their "
+            "source order and section labels. Use facts for at most 12 especially "
+            "valuable verified key parameters; zero parameters remain acceptable "
+            "when no row can be attributed safely.",
+            "Return at most 5 derived_insights. Each must use exactly two distinct "
+            "unambiguous numeric verified parameters. Put their exact names in "
+            "basis in operand order, use their source numeric values (without "
+            "units or grouping separators) as the two formula operands, and use "
+            "exactly one binary operator from "
+            "+, -, *, /, ×, or ÷. The runtime recomputes only that arithmetic and "
+            "the operand-to-source-value correspondence; it does not validate "
+            "engineering meaning, dimensional compatibility, or unit conversion. "
+            "Do not perform or imply a unit conversion, unsupported judgement, "
+            "guessed input, or source claim.",
             "A primary datasheet may cover multiple sibling models. Treat the "
             "target as one member of that series and do not require it to be "
             "the only model in the document. Sibling columns are not an "
@@ -1727,6 +1848,21 @@ def _normalize_model_decision_probabilities(
                 )
             facts.append(fact)
         decision["facts"] = facts
+    raw_parameters = decision.get("datasheet_parameters")
+    if isinstance(raw_parameters, list):
+        parameters: list[Any] = []
+        for index, raw_parameter in enumerate(raw_parameters):
+            if not isinstance(raw_parameter, Mapping):
+                parameters.append(raw_parameter)
+                continue
+            parameter = dict(raw_parameter)
+            if "confidence" in parameter:
+                parameter["confidence"] = _model_probability(
+                    parameter["confidence"],
+                    f"datasheet_parameters[{index}].confidence",
+                )
+            parameters.append(parameter)
+        decision["datasheet_parameters"] = parameters
     return decision
 
 

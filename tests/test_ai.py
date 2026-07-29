@@ -247,8 +247,26 @@ class PromptTests(unittest.TestCase):
             " ".join(prompt["source_policy"]),
         )
         self.assertIn(
+            "product_description_zh",
+            prompt["output_contract"]["required_top_level_fields"],
+        )
+        self.assertNotIn(
             "display_title_zh",
             prompt["output_contract"]["required_top_level_fields"],
+        )
+        for field in (
+            "product_category_code",
+            "product_type",
+            "datasheet_parameters",
+            "derived_insights",
+        ):
+            self.assertIn(
+                field,
+                prompt["output_contract"]["required_top_level_fields"],
+            )
+        self.assertEqual(
+            "逆变器",
+            prompt["output_contract"]["product_categories"]["inverter"],
         )
         self.assertIn(
             "manufacturer_zh",
@@ -256,7 +274,14 @@ class PromptTests(unittest.TestCase):
         )
         display_policy = " ".join(prompt["source_policy"])
         self.assertIn("Simplified Chinese", display_policy)
-        self.assertIn("canonical model and manufacturer", display_policy)
+        self.assertIn("PostgreSQL English product_name", display_policy)
+        self.assertIn("exactly two distinct", display_policy)
+        self.assertIn("operand order", display_policy)
+        self.assertIn("does not validate engineering meaning", display_policy)
+        insight_contract = prompt["output_contract"]["derived_insight_item"]
+        self.assertEqual("finite numeric result", insight_contract["value"])
+        self.assertIn("no units", insight_contract["formula"])
+        self.assertIn("exactly 2 distinct", insight_contract["basis"][0])
         self.assertIn("fluent Simplified Chinese prose", display_policy)
         self.assertIn(
             "multiple sibling models",
@@ -316,6 +341,63 @@ class PromptTests(unittest.TestCase):
             "never include a page marker",
             " ".join(prompt["source_policy"]).casefold(),
         )
+
+    def test_prompt_exposes_only_locally_verified_parameter_rows(self) -> None:
+        url = "https://maker.example/pv-42.pdf"
+        model_quote = "Type\tPV-40\tPV-42"
+        quote = "Rated power\t40 W\t42 W"
+        messages = ai.build_decision_messages(
+            product={"model": "PV-42"},
+            extract={
+                "results": [
+                    {
+                        "url": url,
+                        "raw_content": f"PV-42\n{model_quote}\n{quote}",
+                        "pdf_direct_status": "used",
+                        "pdf_parameter_rows": [
+                            {
+                                "model": "PV-42",
+                                "source_label": "Rated power",
+                                "value": "42",
+                                "unit": "W",
+                                "section": "Output",
+                                "page": 3,
+                                "order": 1,
+                                "model_quote": model_quote,
+                                "quote": quote,
+                            }
+                        ],
+                    },
+                    {
+                        "url": "https://mirror.example/pv-42.pdf",
+                        "raw_content": "PV-42 forged provider text",
+                        "pdf_direct_status": "identity_mismatch",
+                        "pdf_parameter_rows": [{"value": "forged"}],
+                    },
+                ]
+            },
+            max_evidence_chars=5000,
+        )
+
+        prompt = json.loads(messages[1]["content"])
+        used, mismatch = prompt["retrieval"]["extract"]["results"]
+        self.assertTrue(used["locally_verified_primary_pdf"])
+        self.assertEqual(
+            {
+                "model": "PV-42",
+                "source_label": "Rated power",
+                "value": "42",
+                "unit": "W",
+                "section": "Output",
+                "page": 3,
+                "order": 1,
+                "model_quote": model_quote,
+                "quote": quote,
+            },
+            used["locally_bound_parameter_rows"][0],
+        )
+        self.assertFalse(mismatch["locally_verified_primary_pdf"])
+        self.assertEqual([], mismatch["locally_bound_parameter_rows"])
 
     def test_prompt_rejects_invalid_inputs(self) -> None:
         with self.assertRaises(TypeError):
@@ -865,6 +947,12 @@ class ParsingTests(unittest.TestCase):
                             "confidence": "1.0",
                         }
                     ],
+                    "datasheet_parameters": [
+                        {
+                            "name": "Rated power",
+                            "confidence": "0.99",
+                        }
+                    ],
                 },
             },
             product={"model": "PV-42"},
@@ -872,6 +960,10 @@ class ParsingTests(unittest.TestCase):
 
         self.assertEqual(0.95, action.decision["confidence"])
         self.assertEqual(1.0, action.decision["facts"][0]["confidence"])
+        self.assertEqual(
+            0.99,
+            action.decision["datasheet_parameters"][0]["confidence"],
+        )
 
         for invalid in ("95%", "nan", "1.1", True):
             with self.subTest(invalid=invalid), self.assertRaises(

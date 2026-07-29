@@ -234,7 +234,20 @@ become due, claims have finite leases, and expired claims are audited. A local
 SQLite path remains a compatibility option for tests and legacy recovery, not
 the production deployment.
 
-Each attempt has a schema-v9 `research_actions` ledger. Before every Search,
+State schema v10 adds managed-content versioning and an append-only,
+count-only content-refresh ledger. `pv-wiki refresh-content` previews pages
+whose last successful validated decision predates the current renderer.
+`--apply` reuses that attempt's own product snapshot, decision, citations, and
+recorded Wiki path; by default it performs no Search, Extract, or AI call and
+refuses to create a missing page. The explicit `--hydrate-parameters` option
+performs only a bounded direct re-read of that stored primary manufacturer PDF,
+then binds and revalidates at most 30 exact target-column rows; it does not call
+the search provider or AI. Existing visibility and human text outside the
+managed block are preserved. Fact diagnostics retain only
+proposed/accepted/rejected counts and fixed rejection reason codes, never
+quotes or source bodies.
+
+Each attempt has a schema-v10 `research_actions` ledger. Before every Search,
 Extract, or AI action, the worker stores its round, action name, and request
 fingerprint as `started`. A completed action stores only bounded URLs, request
 IDs, outcome/gap metadata, physical AI request counts, and known credit
@@ -335,6 +348,12 @@ Homepage refresh reads already successful publications from PostgreSQL. It
 does no search-provider or catalogue work. A product remains in homepage counts
 after a later source change or temporary retry because the last successful Wiki
 page still exists.
+Preview legacy parameter hydration on one private page with
+`pv-wiki refresh-content --product-id <ID> --hydrate-parameters`, then add
+`--apply` only after checking its PDF hash and retained row count. After a
+renderer-only batch, run `pv-wiki refresh-content --apply --refresh-home` only
+when the product refreshes all succeeded; otherwise repair
+the failed pages first and run `pv-wiki publish-home` explicitly afterward.
 
 ## n8n monitoring
 

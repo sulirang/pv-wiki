@@ -87,7 +87,6 @@ from .decision import (
 )
 from .render import (
     manufacturer_display_name,
-    product_display_title,
     render_home_page,
     render_product_page,
     stable_path,
@@ -96,6 +95,7 @@ from .render import (
 from .server import WorkerConfigError, WorkerSettings, serve
 from .state import (
     AttemptBudgetError,
+    ContentRefreshCandidate,
     Lease,
     LeaseLostError,
     StateError,
@@ -136,6 +136,7 @@ INVALID_DECISION_CIRCUIT_THRESHOLD = 5
 INVALID_DECISION_CIRCUIT_WINDOW = timedelta(minutes=30)
 MAX_RESEARCH_EVIDENCE_URLS = 5
 MAX_RESEARCH_SEARCH_RESULTS = 15
+CONTENT_SCHEMA_VERSION = 1
 # One AI action may use an initial 300-second call plus one bounded repair.
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
@@ -206,7 +207,11 @@ _DIRECT_PDF_METADATA_FIELDS = (
     "pdf_extracted_pages",
     "pdf_final_url_changed",
     "pdf_final_hostname",
+    "pdf_parameter_rows",
 )
+_MAX_LOCAL_DATASHEET_PARAMETERS = 30
+_MAX_PDF_TARGET_MODELS = 16
+_MAX_PDF_TARGET_MODEL_CHARS = 200
 
 _RESEARCH_GAP_NOTES = {
     "manufacturer_identity": (
@@ -835,17 +840,75 @@ def _decision_product_category(decision: dict[str, Any]) -> str:
     return ""
 
 
+def _decision_for_render(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """Upgrade historical display fields without re-authorizing the decision."""
+
+    rendered = dict(decision)
+    raw_category = decision.get("product_category")
+    category = _decision_product_category(rendered)
+    if category:
+        rendered["product_category"] = category
+    if (
+        not str(rendered.get("product_type") or "").strip()
+        and isinstance(raw_category, str)
+        and raw_category.strip()
+        and raw_category.strip() != category
+    ):
+        rendered["product_type"] = raw_category.strip()
+    return rendered
+
+
 def _home_catalogue_product(item: Any, *, path_prefix: str) -> dict[str, Any]:
     payload = item.payload
     decision = item.decision
     return {
         "product_id": item.product_id,
         "product_name": payload.get("product_name"),
-        "model": product_display_title(payload, decision),
+        "model": item.product_id,
+        "display_title_zh": decision.get("display_title_zh"),
+        "product_description_zh": (
+            decision.get("product_description_zh")
+            or decision.get("display_title_zh")
+        ),
         "manufacturer": manufacturer_display_name(payload, decision),
         "product_category": _decision_product_category(decision),
         "wiki_path": item.wiki_path or stable_path(payload, prefix=path_prefix),
         "published_at": item.published_at,
+    }
+
+
+def _verified_wiki_page_fields(
+    product_id: str,
+    payload: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    *,
+    checked_at: datetime,
+) -> dict[str, Any]:
+    """Render Wiki fields from an already validated publish decision."""
+
+    clean_product_id = " ".join(str(product_id).split())
+    if not clean_product_id:
+        raise CLIError("verified product is missing its product ID")
+    render_decision = _decision_for_render(decision)
+    product = {
+        **dict(payload),
+        "manufacturer": manufacturer_display_name(payload, render_decision),
+        "model": render_decision.get("model") or payload.get("product_name"),
+    }
+    summary = " ".join(str(render_decision.get("summary") or "").split())
+    return {
+        # Wiki metadata and the catalogue's primary link label are stable IDs.
+        "title": clean_product_id,
+        "description": (
+            summary
+            or f"Datasheet and cited specifications for {clean_product_id}."
+        )[:255],
+        "managed_content": render_product_page(
+            product,
+            render_decision,
+            checked_at,
+        ),
+        "tags": _wiki_tags(dict(payload), render_decision),
     }
 
 
@@ -1280,6 +1343,24 @@ def _cmd_search(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bounded_pdf_target_models(
+    product_id: Any,
+    product_name: Any,
+) -> tuple[str, ...]:
+    """Fit catalogue hints to the direct PDF parser's public input contract."""
+
+    candidates = catalogue_model_candidates(
+        product_id,
+        product_name,
+        allow_product_id=True,
+    )
+    return tuple(
+        candidate
+        for candidate in candidates
+        if len(candidate) <= _MAX_PDF_TARGET_MODEL_CHARS
+    )[:_MAX_PDF_TARGET_MODELS]
+
+
 def _prepare_extract_results(
     lease: Lease,
     bundle: dict[str, Any],
@@ -1295,6 +1376,10 @@ def _prepare_extract_results(
 
     settings = PDFSettings.from_env()
     limit = max_extract_chars()
+    target_models = _bounded_pdf_target_models(
+        lease.product_id,
+        lease.payload.get("product_name"),
+    )
     direct_summary = {
         "attempted": 0,
         "used": 0,
@@ -1347,6 +1432,7 @@ def _prepare_extract_results(
                     max_chars=limit,
                     download_timeout=settings.download_timeout,
                     parse_timeout=settings.parse_timeout,
+                    target_models=target_models,
                 )
             except PDFDocumentError as exc:
                 direct_summary["failed"] += 1
@@ -1366,6 +1452,20 @@ def _prepare_extract_results(
             result["pdf_final_hostname"] = _url_hostname(
                 evidence.final_url
             )
+            result["pdf_parameter_rows"] = [
+                {
+                    "model": row.model,
+                    "source_label": row.source_label,
+                    "value": row.value,
+                    "unit": row.unit,
+                    "section": row.section,
+                    "page": row.page,
+                    "order": row.order,
+                    "model_quote": row.model_quote,
+                    "quote": row.quote,
+                }
+                for row in evidence.parameter_rows
+            ]
             existing = result.get("raw_content")
             existing_text = existing if isinstance(existing, str) else ""
             direct_identity = text_contains_catalogue_identity(
@@ -2317,6 +2417,7 @@ def _validate_decision_for_lease(
     allowed_classification_urls: set[str] | None = None,
     classification_text_by_url: dict[str, str] | None = None,
     verified_primary_document_urls: set[str] | None = None,
+    fact_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate a proposal without mutating the attempt's terminal outcome."""
 
@@ -2372,17 +2473,24 @@ def _validate_decision_for_lease(
             verified_primary_document_urls=verified_primary_document_urls,
         )
 
+    if fact_diagnostics is not None:
+        fact_diagnostics.clear()
     if raw.get("outcome") != "publish":
         return validate(raw)
 
     raw_facts = raw.get("facts")
     if not isinstance(raw_facts, list):
         return validate(raw)
+    raw_parameters = raw.get("datasheet_parameters", [])
+    raw_insights = raw.get("derived_insights", [])
+    if not isinstance(raw_parameters, list) or not isinstance(raw_insights, list):
+        return validate(raw)
 
-    # Facts are optional enrichment after the primary document passes. Before
-    # validating individual facts, discard every normalized-name group that
-    # appears more than once; choosing one duplicate would invent a conflict
-    # resolution that the evidence did not establish.
+    # Facts, source-table rows, and AI-derived insights are optional enrichment.
+    # Validate the publication authority and reader metadata first, then admit
+    # each enrichment item independently so one malformed row cannot poison an
+    # otherwise verified product. Duplicate normalized-name groups are dropped
+    # as a whole rather than resolving a conflict by choosing an arbitrary item.
     fact_name_counts: dict[str, int] = {}
     fact_name_keys: list[str | None] = []
     for item in raw_facts:
@@ -2399,21 +2507,123 @@ def _validate_decision_for_lease(
         for item, key in zip(raw_facts, fact_name_keys, strict=True)
         if key is not None and fact_name_counts[key] == 1
     ]
+    invalid_name_count = sum(key is None for key in fact_name_keys)
+    duplicate_name_count = sum(
+        key is not None and fact_name_counts[key] > 1
+        for key in fact_name_keys
+    )
+    limited_facts = unique_facts[:100]
+    limit_exceeded_count = len(unique_facts) - len(limited_facts)
 
-    base = {**raw, "facts": []}
+    base = {
+        **raw,
+        "facts": [],
+        "datasheet_parameters": [],
+        "derived_insights": [],
+    }
     validated = validate(base)
     retained_facts: list[Any] = []
-    for fact in unique_facts[:100]:
+    validation_failed_count = 0
+    for fact in limited_facts:
         candidate = {
-            **raw,
+            **base,
             "facts": [*retained_facts, fact],
         }
         try:
             candidate_validated = validate(candidate)
         except DecisionError:
+            validation_failed_count += 1
             continue
         retained_facts.append(fact)
         validated = candidate_validated
+
+    parameter_counts: dict[tuple[str, str], int] = {}
+    parameter_keys: list[tuple[str, str] | None] = []
+    for item in raw_parameters:
+        if not isinstance(item, Mapping):
+            parameter_keys.append(None)
+            continue
+        name = item.get("name")
+        section = item.get("section", "")
+        if not isinstance(name, str) or not isinstance(section, str):
+            parameter_keys.append(None)
+            continue
+        key = (identity_key(section), identity_key(name))
+        normalized_key = key if key[1] else None
+        parameter_keys.append(normalized_key)
+        if normalized_key is not None:
+            parameter_counts[normalized_key] = (
+                parameter_counts.get(normalized_key, 0) + 1
+            )
+    unique_parameters = [
+        item
+        for item, key in zip(raw_parameters, parameter_keys, strict=True)
+        if key is not None and parameter_counts[key] == 1
+    ][:_MAX_LOCAL_DATASHEET_PARAMETERS]
+    retained_parameters: list[Any] = []
+    for parameter in unique_parameters:
+        candidate = {
+            **base,
+            "facts": retained_facts,
+            "datasheet_parameters": [*retained_parameters, parameter],
+        }
+        try:
+            candidate_validated = validate(candidate)
+        except DecisionError:
+            continue
+        retained_parameters.append(parameter)
+        validated = candidate_validated
+
+    insight_counts: dict[str, int] = {}
+    insight_keys: list[str | None] = []
+    for item in raw_insights:
+        name = item.get("name") if isinstance(item, Mapping) else None
+        key = identity_key(name) if isinstance(name, str) else ""
+        normalized_key = key or None
+        insight_keys.append(normalized_key)
+        if normalized_key is not None:
+            insight_counts[normalized_key] = insight_counts.get(normalized_key, 0) + 1
+    unique_insights = [
+        item
+        for item, key in zip(raw_insights, insight_keys, strict=True)
+        if key is not None and insight_counts[key] == 1
+    ][:20]
+    retained_insights: list[Any] = []
+    for insight in unique_insights:
+        candidate = {
+            **base,
+            "facts": retained_facts,
+            "datasheet_parameters": retained_parameters,
+            "derived_insights": [*retained_insights, insight],
+        }
+        try:
+            candidate_validated = validate(candidate)
+        except DecisionError:
+            continue
+        retained_insights.append(insight)
+        validated = candidate_validated
+
+    if fact_diagnostics is not None:
+        rejection_reasons = {
+            reason: count
+            for reason, count in {
+                "duplicate_name": duplicate_name_count,
+                "invalid_name": invalid_name_count,
+                "limit_exceeded": limit_exceeded_count,
+                "validation_failed": validation_failed_count,
+            }.items()
+            if count
+        }
+        rejected = len(raw_facts) - len(retained_facts)
+        fact_diagnostics.update(
+            {
+                "complete": True,
+                "proposed": len(raw_facts),
+                "retained": len(retained_facts),
+                "rejected": rejected,
+                "rejection_reasons": rejection_reasons,
+            }
+        )
     return validated
 
 
@@ -2428,7 +2638,9 @@ def _apply_decision(
     classification_text_by_url: dict[str, str] | None = None,
     verified_primary_document_urls: set[str] | None = None,
     validated_decision: dict[str, Any] | None = None,
+    fact_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    diagnostics = fact_diagnostics if fact_diagnostics is not None else {}
     try:
         decision = (
             validated_decision
@@ -2443,6 +2655,7 @@ def _apply_decision(
                 verified_primary_document_urls=(
                     verified_primary_document_urls
                 ),
+                fact_diagnostics=diagnostics,
             )
         )
     except SourceVerificationError as exc:
@@ -2489,8 +2702,22 @@ def _apply_decision(
 
     audit_payload: dict[str, Any] = {
         "decision": decision,
+        "content_schema_version": CONTENT_SCHEMA_VERSION,
         "validation_policy_fingerprint": _validation_policy_fingerprint(),
     }
+    if decision["outcome"] == "publish":
+        if not diagnostics:
+            retained = len(decision.get("facts", []))
+            diagnostics.update(
+                {
+                    "complete": False,
+                    "proposed": retained,
+                    "retained": retained,
+                    "rejected": 0,
+                    "rejection_reasons": {},
+                }
+            )
+        audit_payload["fact_diagnostics"] = diagnostics
     if audit:
         audit_payload["automation"] = audit
 
@@ -2513,20 +2740,12 @@ def _apply_decision(
     try:
         settings = WikiSettings.from_env()
         path = stable_path(lease.payload, prefix=settings.path_prefix)
-        product = {
-            **lease.payload,
-            "manufacturer": manufacturer_display_name(lease.payload, decision),
-            "model": decision.get("model") or lease.payload.get("product_name"),
-        }
-        title = " ".join(product_display_title(lease.payload, decision).split())
-        summary = " ".join(str(decision.get("summary") or "").split())
-        description = (
-            summary or f"Datasheet and cited specifications for {title}."
-        )[:255]
-        managed = render_product_page(
-            product, decision, datetime.now(timezone.utc)
+        fields = _verified_wiki_page_fields(
+            lease.product_id,
+            lease.payload,
+            decision,
+            checked_at=datetime.now(timezone.utc),
         )
-        tags = _wiki_tags(lease.payload, decision)
 
         client = WikiJSClient(
             settings.base_url,
@@ -2568,7 +2787,7 @@ def _apply_decision(
     # the leased source between this final check and the externally visible
     # Wiki mutation. Keep the outcome write inside the same fence so a source
     # change is applied only before publication or after it is fully audited.
-    with _SOURCE_PUBLISH_FENCE:
+    with _SOURCE_PUBLISH_FENCE, store.publication_fence():
         try:
             check = store.precheck(lease)
             if not check.ready:
@@ -2578,10 +2797,10 @@ def _apply_decision(
             result = client.upsert_page(
                 path,
                 settings.locale,
-                title,
-                description,
-                managed,
-                tags,
+                fields["title"],
+                fields["description"],
+                fields["managed_content"],
+                fields["tags"],
             )
         except LeaseLostError:
             raise
@@ -2625,6 +2844,7 @@ def _apply_decision(
                 "wiki_action": result.get("action"),
             },
             wiki_path=path,
+            content_schema_version=CONTENT_SCHEMA_VERSION,
         )
     page = result.get("page") if isinstance(result.get("page"), dict) else {}
     return {
@@ -2872,6 +3092,317 @@ def _research_evidence_context(
         classification_text_by_url,
         verified_primary_document_urls,
     )
+
+
+def _with_locally_bound_datasheet_parameters(
+    raw: Mapping[str, Any],
+    extract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Replace model-authored table rows with locally bound primary-PDF rows.
+
+    The direct PDF runtime strips provider-supplied attestation fields before it
+    creates ``pdf_parameter_rows``.  This final binding also requires the AI's
+    selected primary URL, exact selected model, and both auditable TSV rows to
+    survive in the bounded evidence body used by the decision validator.
+    """
+
+    decision = dict(raw)
+    if decision.get("outcome") != "publish":
+        return decision
+    selected_model = decision.get("model")
+    selected_model_key = (
+        identity_key(selected_model)
+        if isinstance(selected_model, str)
+        else ""
+    )
+    datasheets = decision.get("datasheets")
+    if not selected_model_key or not isinstance(datasheets, list):
+        return decision
+    primary_urls = {
+        item.get("url")
+        for item in datasheets
+        if (
+            isinstance(item, Mapping)
+            and item.get("is_primary") is True
+            and isinstance(item.get("url"), str)
+        )
+    }
+    if not primary_urls:
+        return decision
+
+    results = extract.get("results")
+    if not isinstance(results, list):
+        return decision
+    parameters: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for result in results:
+        if (
+            not isinstance(result, Mapping)
+            or result.get("url") not in primary_urls
+            or result.get("pdf_direct_status") != "used"
+        ):
+            continue
+        body = result.get("raw_content")
+        rows = result.get("pdf_parameter_rows")
+        if not isinstance(body, str) or not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            model = row.get("model")
+            name = row.get("source_label")
+            value = row.get("value")
+            unit = row.get("unit")
+            section = row.get("section")
+            model_quote = row.get("model_quote")
+            quote = row.get("quote")
+            if (
+                not isinstance(model, str)
+                or identity_key(model) != selected_model_key
+                or not isinstance(name, str)
+                or not name.strip()
+                or len(name) > 200
+                or not isinstance(value, str)
+                or not value.strip()
+                or len(value) > 500
+                or not isinstance(unit, str)
+                or len(unit) > 80
+                or not isinstance(section, str)
+                or len(section) > 100
+                or not isinstance(model_quote, str)
+                or not model_quote.strip()
+                or len(model_quote) > 500
+                or model_quote not in body
+                or not isinstance(quote, str)
+                or not quote.strip()
+                or len(quote) > 500
+                or quote not in body
+            ):
+                continue
+            key = (identity_key(section), identity_key(name))
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            parameters.append(
+                {
+                    "name": name.strip(),
+                    "section": section.strip(),
+                    "value": value.strip(),
+                    "unit": unit.strip(),
+                    "confidence": 1.0,
+                    "evidence_urls": [result["url"]],
+                    "evidence_quotes": [
+                        {
+                            "url": result["url"],
+                            "model_quote": model_quote,
+                            "quote": quote,
+                        }
+                    ],
+                }
+            )
+            if len(parameters) >= _MAX_LOCAL_DATASHEET_PARAMETERS:
+                break
+        if len(parameters) >= _MAX_LOCAL_DATASHEET_PARAMETERS:
+            break
+    if parameters:
+        decision["datasheet_parameters"] = parameters
+    return decision
+
+
+def _refresh_decision_parameters_from_primary_pdf(
+    product_id: str,
+    payload: Mapping[str, Any],
+    decision: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Re-read one previously verified primary PDF for a content-only refresh."""
+
+    settings = PDFSettings.from_env()
+    if not settings.enabled:
+        raise CLIError(
+            "parameter hydration requires PV_WIKI_PDF_DIRECT_FETCH=true"
+        )
+    datasheets = decision.get("datasheets")
+    if not isinstance(datasheets, list):
+        raise CLIError("synced decision has no datasheet list")
+    primary_items = [
+        item
+        for item in datasheets
+        if (
+            isinstance(item, Mapping)
+            and item.get("is_primary") is True
+            and item.get("source_type") == "manufacturer"
+            and isinstance(item.get("url"), str)
+        )
+    ]
+    if len(primary_items) != 1:
+        raise CLIError(
+            "parameter hydration requires exactly one primary manufacturer PDF"
+        )
+    url = str(primary_items[0]["url"])
+    if not looks_like_pdf_url(url):
+        raise CLIError("primary manufacturer document is not a PDF URL")
+
+    targets = list(
+        _bounded_pdf_target_models(
+            product_id,
+            payload.get("product_name"),
+        )
+    )
+    selected_model = decision.get("model")
+    if (
+        isinstance(selected_model, str)
+        and selected_model.strip()
+        and len(selected_model.strip()) <= _MAX_PDF_TARGET_MODEL_CHARS
+        and all(
+            identity_key(selected_model) != identity_key(target)
+            for target in targets
+        )
+    ):
+        targets.insert(0, selected_model.strip())
+    target_models = tuple(targets[:_MAX_PDF_TARGET_MODELS])
+    evidence = extract_pdf_evidence(
+        url,
+        max_bytes=settings.max_bytes,
+        max_pages=settings.max_pages,
+        max_chars=max_extract_chars(),
+        download_timeout=settings.download_timeout,
+        parse_timeout=settings.parse_timeout,
+        target_models=target_models,
+    )
+    if not text_contains_catalogue_identity(
+        product_id,
+        payload.get("product_name"),
+        evidence.text,
+    ):
+        raise SourceVerificationError(
+            "primary PDF no longer contains the catalogue identity"
+        )
+    trusted_domains = trusted_source_domains_for_product(
+        str(payload.get("brand_code") or ""),
+        decision.get("manufacturer")
+        if isinstance(decision.get("manufacturer"), str)
+        else None,
+    )
+    final_hostname = _url_hostname(evidence.final_url)
+    if not _pdf_redirect_allows_publication(
+        url,
+        final_hostname,
+        trusted_domains=trusted_domains,
+    ):
+        raise SourceVerificationError(
+            "primary PDF redirect is outside the verified publication domain"
+        )
+
+    row_payloads = [
+        {
+            "model": row.model,
+            "source_label": row.source_label,
+            "value": row.value,
+            "unit": row.unit,
+            "section": row.section,
+            "page": row.page,
+            "order": row.order,
+            "model_quote": row.model_quote,
+            "quote": row.quote,
+        }
+        for row in evidence.parameter_rows
+    ]
+    bound = _with_locally_bound_datasheet_parameters(
+        decision,
+        {
+            "results": [
+                {
+                    "url": url,
+                    "raw_content": evidence.text,
+                    "pdf_direct_status": "used",
+                    "pdf_parameter_rows": row_payloads,
+                }
+            ]
+        },
+    )
+    bound_parameters = bound.get("datasheet_parameters")
+    if not isinstance(bound_parameters, list) or not bound_parameters:
+        raise CLIError(
+            "primary PDF contained no safely attributable target-model rows"
+        )
+
+    declared_urls = {
+        item.get("url")
+        for item in [
+            *datasheets,
+            *(
+                decision.get("sources")
+                if isinstance(decision.get("sources"), list)
+                else []
+            ),
+        ]
+        if isinstance(item, Mapping) and isinstance(item.get("url"), str)
+    }
+    operator_manufacturer = public_brand_alias(
+        str(payload.get("brand_code") or "")
+    )
+    if trusted_domains and not operator_manufacturer:
+        raise SourceVerificationError(
+            "trusted catalogue-brand hydration requires a public manufacturer alias"
+        )
+    validation_base = {
+        **dict(decision),
+        "schema_version": "1",
+        "product_id": product_id,
+        "facts": [],
+        "datasheet_parameters": [],
+        "derived_insights": [],
+        "classification_evidence_urls": [],
+        "classification_evidence_quotes": [],
+    }
+
+    def validate_parameters(candidate_parameters: list[Any]) -> dict[str, Any]:
+        return validate_decision(
+            {
+                **validation_base,
+                "datasheet_parameters": candidate_parameters,
+            },
+            expected_product_id=product_id,
+            expected_lease_token=str(decision.get("lease_token") or ""),
+            minimum_confidence=min_publish_confidence(),
+            minimum_fact_confidence=min_fact_confidence(),
+            mirrors_allowed=allow_mirrors(),
+            allowed_evidence_urls=set(declared_urls),
+            allowed_classification_urls=set(declared_urls),
+            trusted_source_domains=trusted_domains,
+            operator_manufacturer_identity=operator_manufacturer or None,
+            expected_product_name=str(payload.get("product_name") or ""),
+            evidence_text_by_url={url: evidence.text},
+            classification_text_by_url={url: evidence.text},
+            verified_primary_document_urls={url},
+        )
+
+    validate_parameters([])
+    retained_raw: list[Any] = []
+    retained_normalized: list[dict[str, Any]] = []
+    for parameter in bound_parameters[:_MAX_LOCAL_DATASHEET_PARAMETERS]:
+        try:
+            normalized = validate_parameters([*retained_raw, parameter])
+        except DecisionError:
+            continue
+        retained_raw.append(parameter)
+        retained_normalized = list(normalized["datasheet_parameters"])
+    if not retained_normalized:
+        raise CLIError(
+            "primary PDF rows did not pass the publication evidence gate"
+        )
+    refreshed = {
+        **dict(decision),
+        "datasheet_parameters": retained_normalized,
+    }
+    return refreshed, {
+        "url": url,
+        "pdf_sha256": evidence.sha256,
+        "page_count": evidence.page_count,
+        "extracted_pages": evidence.extracted_pages,
+        "parsed_parameter_count": len(row_payloads),
+        "retained_parameter_count": len(retained_normalized),
+    }
 
 
 def _research_audit(
@@ -3833,12 +4364,14 @@ def run_one(
                         "product_id": lease.product_id,
                         "lease_token": lease.token,
                     }
+                raw = _with_locally_bound_datasheet_parameters(raw, extract)
                 (
                     evidence_text_by_url,
                     allowed_classification_urls,
                     classification_text_by_url,
                     verified_primary_document_urls,
                 ) = _research_evidence_context(store, lease, extract)
+                fact_diagnostics: dict[str, Any] = {}
                 try:
                     validated = _validate_decision_for_lease(
                         store,
@@ -3850,6 +4383,7 @@ def run_one(
                         verified_primary_document_urls=(
                             verified_primary_document_urls
                         ),
+                        fact_diagnostics=fact_diagnostics,
                     )
                 except DecisionError as exc:
                     recoverable_gap = _validation_research_gap(exc)
@@ -3947,6 +4481,7 @@ def run_one(
                     ),
                     audit=audit,
                     validated_decision=validated,
+                    fact_diagnostics=fact_diagnostics,
                 )
 
             stop_reason = "research loop ended without a final decision"
@@ -4172,6 +4707,210 @@ def _cmd_publish_home(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_refresh_content(args: argparse.Namespace) -> int:
+    if args.refresh_home and not args.apply:
+        raise CLIError("--refresh-home requires --apply")
+
+    settings: WikiSettings | None = None
+    client: WikiJSClient | None = None
+    if args.apply:
+        settings = WikiSettings.from_env()
+        client = WikiJSClient(
+            settings.base_url,
+            settings.token,
+            timeout=settings.timeout,
+            new_page_private=settings.new_page_private,
+            new_page_published=settings.new_page_published,
+        )
+
+    refreshed: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    with _store() as store:
+        candidates = store.content_refresh_candidates(
+            CONTENT_SCHEMA_VERSION,
+            product_ids=args.product_id,
+            limit=args.limit,
+        )
+        preview = [
+            {
+                "product_id": candidate.product_id,
+                "path": candidate.wiki_path,
+                "source_attempt_id": candidate.source_attempt_id,
+                "previous_content_schema_version": (
+                    candidate.previous_content_schema_version
+                ),
+                "fact_diagnostics": candidate.fact_diagnostics,
+            }
+            for candidate in candidates
+        ]
+        if not args.apply:
+            if args.hydrate_parameters:
+                for candidate, item in zip(candidates, preview, strict=True):
+                    try:
+                        _, parameter_refresh = (
+                            _refresh_decision_parameters_from_primary_pdf(
+                                candidate.product_id,
+                                candidate.payload,
+                                candidate.decision,
+                            )
+                        )
+                        item["datasheet_parameter_refresh"] = parameter_refresh
+                    except (
+                        CLIError,
+                        ConfigError,
+                        DecisionError,
+                        PDFDocumentError,
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+                        failures.append(
+                            {
+                                "product_id": candidate.product_id,
+                                "path": candidate.wiki_path,
+                                "error": _safe_error(exc),
+                            }
+                        )
+            _emit(
+                {
+                    "ok": not failures,
+                    "apply": False,
+                    "hydrate_parameters": bool(args.hydrate_parameters),
+                    "content_schema_version": CONTENT_SCHEMA_VERSION,
+                    "candidate_count": len(candidates),
+                    "candidates": preview,
+                    "failed_count": len(failures),
+                    "failures": failures,
+                }
+            )
+            return 0 if not failures else 1
+
+        assert settings is not None
+        assert client is not None
+        for candidate in candidates:
+            try:
+                with _SOURCE_PUBLISH_FENCE, store.publication_fence():
+                    current = store.content_refresh_candidates(
+                        CONTENT_SCHEMA_VERSION,
+                        product_ids=[candidate.product_id],
+                        limit=1,
+                    )
+                    if not current:
+                        raise StateError(
+                            "content refresh candidate changed before Wiki update"
+                        )
+                    refreshed_candidate = current[0]
+                    if (
+                        refreshed_candidate.source_attempt_id
+                        != candidate.source_attempt_id
+                        or refreshed_candidate.previous_content_schema_version
+                        != candidate.previous_content_schema_version
+                        or refreshed_candidate.wiki_path != candidate.wiki_path
+                    ):
+                        raise StateError(
+                            "content refresh candidate changed before Wiki update"
+                        )
+                    candidate = refreshed_candidate
+                    render_decision = candidate.decision
+                    parameter_refresh: dict[str, Any] | None = None
+                    if args.hydrate_parameters:
+                        render_decision, parameter_refresh = (
+                            _refresh_decision_parameters_from_primary_pdf(
+                                candidate.product_id,
+                                candidate.payload,
+                                candidate.decision,
+                            )
+                        )
+                    fields = _verified_wiki_page_fields(
+                        candidate.product_id,
+                        candidate.payload,
+                        render_decision,
+                        checked_at=candidate.verified_at,
+                    )
+                    result = client.update_existing_page(
+                        candidate.wiki_path,
+                        settings.locale,
+                        fields["title"],
+                        fields["description"],
+                        fields["managed_content"],
+                        fields["tags"],
+                    )
+                    event = store.record_content_refresh(
+                        candidate,
+                        CONTENT_SCHEMA_VERSION,
+                        wiki_action=str(result.get("action") or ""),
+                        fact_diagnostics=candidate.fact_diagnostics,
+                    )
+                page = (
+                    result.get("page")
+                    if isinstance(result.get("page"), Mapping)
+                    else {}
+                )
+                refreshed.append(
+                    {
+                        "product_id": candidate.product_id,
+                        "path": candidate.wiki_path,
+                        "page_id": page.get("id"),
+                        "wiki_action": event.wiki_action,
+                        "source_attempt_id": event.source_attempt_id,
+                        "previous_content_schema_version": (
+                            event.previous_content_schema_version
+                        ),
+                        "content_schema_version": (
+                            event.content_schema_version
+                        ),
+                        "fact_diagnostics": event.fact_diagnostics,
+                        **(
+                            {"datasheet_parameter_refresh": parameter_refresh}
+                            if parameter_refresh is not None
+                            else {}
+                        ),
+                    }
+                )
+            except (
+                CLIError,
+                ConfigError,
+                DecisionError,
+                PDFDocumentError,
+                StateError,
+                WikiJSError,
+                ValueError,
+                TypeError,
+            ) as exc:
+                failures.append(
+                    {
+                        "product_id": candidate.product_id,
+                        "path": candidate.wiki_path,
+                        "error": _safe_error(exc),
+                    }
+                )
+
+    home: dict[str, Any] | None = None
+    home_skipped: str | None = None
+    if args.refresh_home:
+        if failures:
+            home_skipped = "content_refresh_failures"
+        else:
+            home = publish_home()
+
+    payload: dict[str, Any] = {
+        "ok": not failures,
+        "apply": True,
+        "hydrate_parameters": bool(args.hydrate_parameters),
+        "content_schema_version": CONTENT_SCHEMA_VERSION,
+        "candidate_count": len(candidates),
+        "refreshed_count": len(refreshed),
+        "failed_count": len(failures),
+        "refreshed": refreshed,
+        "failures": failures,
+    }
+    if home is not None:
+        payload["home"] = home["home"]
+    if home_skipped is not None:
+        payload["home_skipped"] = home_skipped
+    _emit(payload)
+    return 0 if not failures else 1
+
+
 def publish_home() -> dict[str, Any]:
     """Create or update the reader-facing catalogue landing page."""
 
@@ -4320,6 +5059,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="create or update the managed Wiki.js landing page",
     )
     publish_home.set_defaults(func=_cmd_publish_home)
+
+    refresh_content = subparsers.add_parser(
+        "refresh-content",
+        help=(
+            "re-render existing pages from their last synced decision "
+            "without search or AI"
+        ),
+    )
+    refresh_content.add_argument(
+        "--product-id",
+        action="append",
+        help="refresh only this exact product ID; repeat for multiple products",
+    )
+    refresh_content.add_argument("--limit", type=int, default=1000)
+    refresh_content.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply existing-page-only Wiki.js updates; otherwise preview",
+    )
+    refresh_content.add_argument(
+        "--hydrate-parameters",
+        action="store_true",
+        help=(
+            "re-read each stored primary manufacturer PDF and rebuild its "
+            "target-model parameter table without search or AI"
+        ),
+    )
+    refresh_content.add_argument(
+        "--refresh-home",
+        action="store_true",
+        help="refresh the homepage after a fully successful applied batch",
+    )
+    refresh_content.set_defaults(func=_cmd_refresh_content)
     return parser
 
 

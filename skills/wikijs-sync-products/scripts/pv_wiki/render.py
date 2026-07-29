@@ -273,12 +273,15 @@ def _collect_sources(decision: Any) -> list[tuple[str, str, bool]]:
     candidates.extend((item, True) for item in _as_items(_get(decision, "datasheets")))
     for key in ("source_url", "sources", "related_links", "references"):
         candidates.extend((item, False) for item in _as_items(_get(decision, key)))
-    for fact in _as_items(_get(decision, "facts")):
-        if not isinstance(fact, Mapping):
-            continue
-        fact_name = _first(fact, ("name", "label")) or "规格参数"
-        for url in _as_items(_get(fact, "evidence_urls")):
-            candidates.append(({"title": f"{fact_name}（证据）", "url": url}, False))
+    for collection in ("datasheet_parameters", "facts"):
+        for fact in _as_items(_get(decision, collection)):
+            if not isinstance(fact, Mapping):
+                continue
+            fact_name = _first(fact, ("name", "label")) or "产品参数"
+            for url in _as_items(_get(fact, "evidence_urls")):
+                candidates.append(
+                    ({"title": f"{fact_name}（证据）", "url": url}, False)
+                )
     for conflict in _as_items(_get(decision, "conflicts")):
         if not isinstance(conflict, Mapping):
             continue
@@ -340,15 +343,191 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
     )
 
 
+def _datasheet_parameters(decision: Any) -> list[tuple[str, str, Any]]:
+    """Return source-ordered datasheet parameters without sorting or regrouping."""
+
+    parameters: list[tuple[str, str, Any]] = []
+    for item in _as_items(_get(decision, "datasheet_parameters")):
+        if not isinstance(item, Mapping):
+            continue
+        name = _first(item, ("name", "key", "label", "parameter"))
+        value = _first(item, ("value", "content", "text"))
+        if name is None or value is None:
+            continue
+        unit = _first(item, ("unit", "units"))
+        rendered_value = _plain_text(value)
+        if unit is not None and _plain_text(unit):
+            rendered_value = f"{rendered_value} {_plain_text(unit)}"
+        parameters.append(
+            (
+                _plain_text(_get(item, "section")),
+                _plain_text(name),
+                rendered_value,
+            )
+        )
+    return parameters
+
+
+def _derived_insights(decision: Any) -> list[dict[str, Any]]:
+    """Return bounded renderer-facing insights; validation owns their semantics."""
+
+    insights: list[dict[str, Any]] = []
+    for item in _as_items(_get(decision, "derived_insights")):
+        if not isinstance(item, Mapping):
+            continue
+        name = _first(item, ("name", "label", "title"))
+        value = _first(item, ("value", "content", "text"))
+        formula = _get(item, "formula")
+        basis = _as_items(_get(item, "basis"))
+        if name is None or value is None or formula is None or not basis:
+            continue
+        unit = _first(item, ("unit", "units"))
+        rendered_value = _plain_text(value)
+        if unit is not None and _plain_text(unit):
+            rendered_value = f"{rendered_value} {_plain_text(unit)}"
+        insights.append(
+            {
+                "name": _plain_text(name),
+                "value": rendered_value,
+                "formula": _plain_text(formula),
+                "basis": "、".join(_plain_text(value) for value in basis),
+                "explanation": _plain_text(_get(item, "explanation")),
+            }
+        )
+    return insights
+
+
 def _display_identity_key(value: Any) -> str:
     normalized = unicodedata.normalize("NFKC", _plain_text(value)).casefold()
     return "".join(character for character in normalized if character.isalnum())
 
 
+def product_page_title(product: Any) -> str:
+    """Return the stable catalogue product ID used by Wiki metadata and H1."""
+
+    product_id = _first(product, ("product_id", "id"))
+    if product_id is None:
+        raise ValueError("product needs a product_id for its page title")
+    return _plain_text(product_id)
+
+
+def _without_leading_identity(value: Any, identities: Sequence[Any]) -> str:
+    """Remove legacy brand/model/series prefixes while preserving description."""
+
+    original = _plain_text(value)
+    text = original
+    normalized_identities = [
+        _plain_text(identity)
+        for identity in identities
+        if _plain_text(identity)
+    ]
+    for _ in range(len(normalized_identities) + 2):
+        changed = False
+        for identity_text in normalized_identities:
+            tokens = re.findall(r"[^\W_]+", identity_text, flags=re.UNICODE)
+            if not tokens:
+                continue
+            pattern = (
+                r"^\s*"
+                + r"[\W_]*".join(re.escape(token) for token in tokens)
+                + r"(?![^\W_])"
+            )
+            match = re.match(pattern, text, flags=re.IGNORECASE | re.UNICODE)
+            if match is None:
+                continue
+            remainder = text[match.end() :].lstrip(
+                " \t|｜:：,，;；—–-"
+            )
+            if remainder:
+                text = remainder
+                changed = True
+                break
+        if changed:
+            continue
+        series_match = re.match(
+            r"^\s*(?:R5\s*/\s*R6|R[56])\s*系列"
+            r"(?:产品)?(?:\s*[-—–:：|｜,，;；]\s*|\s+)?",
+            text,
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+        if series_match is not None:
+            remainder = text[series_match.end() :].lstrip(
+                " \t|｜:：,，;；—–-"
+            )
+            if remainder:
+                text = remainder
+                continue
+        break
+    return text or original
+
+
+def product_description_zh(product: Any, decision: Any) -> str:
+    """Return Chinese descriptive copy with legacy display-title compatibility."""
+
+    localized = _first(
+        decision,
+        ("product_description_zh", "display_title_zh"),
+    )
+    if localized is None:
+        return ""
+    return _without_leading_identity(
+        localized,
+        (
+            _first(
+                decision,
+                ("manufacturer_zh",),
+            ),
+            _first(
+                decision,
+                ("manufacturer", "brand", "vendor", "maker"),
+            ),
+            _first(
+                product,
+                (
+                    "manufacturer",
+                    "brand",
+                    "vendor",
+                    "maker",
+                    "brand_code",
+                ),
+            ),
+            _first(
+                decision,
+                (
+                    "model",
+                    "model_number",
+                    "part_number",
+                    "mpn",
+                    "sku",
+                    "product_code",
+                    "code",
+                ),
+            ),
+            _first(product, ("product_id", "id")),
+        ),
+    )
+
+
+def product_bilingual_description(product: Any, decision: Any) -> str:
+    """Join the PostgreSQL source description and Chinese AI description."""
+
+    source = _first(product, ("product_name", "name", "description"))
+    source_text = _plain_text(source)
+    localized_text = product_description_zh(product, decision)
+    if source_text and localized_text:
+        if _display_identity_key(source_text) == _display_identity_key(localized_text):
+            return source_text
+        return f"{source_text}｜{localized_text}"
+    return source_text or localized_text
+
+
 def product_display_title(product: Any, decision: Any) -> str:
     """Return a Chinese reader title while always preserving the model."""
 
-    localized = _first(decision, ("display_title_zh",))
+    localized = _first(
+        decision,
+        ("product_description_zh", "display_title_zh"),
+    )
     model = _first(
         decision,
         (
@@ -443,9 +622,13 @@ def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
             decision,
             ("product_category", "category", "product_type", "type"),
         ),
-        ("产品名称", decision, ("display_title_zh",)),
+        ("产品类型", decision, ("product_type",)),
+        (
+            "产品描述",
+            decision,
+            ("product_description_zh", "display_title_zh"),
+        ),
         ("计量单位", product, ("unit_of_measure", "uom", "unit")),
-        ("数据库描述", product, ("description",)),
     )
     rows = []
     for label, owner, aliases in fields:
@@ -465,8 +648,8 @@ def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
                     "code",
                 ),
             )
-        elif label == "产品名称":
-            value = product_display_title(product, decision)
+        elif label == "产品描述":
+            value = product_bilingual_description(product, decision)
         if value is not None:
             rows.append((label, value))
     return rows
@@ -509,29 +692,30 @@ def _home_catalogue_entries(products: Sequence[Any]) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     for index, product in enumerate(products):
         product_id = _first(product, ("product_id", "id"))
-        title = _first(
-            product,
-            ("model", "product_name", "name", "title", "product_id", "id"),
-        )
         wiki_path = _first(product, ("wiki_path", "path"))
         published_at = _first(
             product, ("published_at", "last_success_at", "updated_at")
         )
-        if product_id is None or title is None or wiki_path is None:
+        if product_id is None or wiki_path is None:
             raise ValueError(
-                f"published_products[{index}] needs product_id, title, and wiki_path"
+                f"published_products[{index}] needs product_id and wiki_path"
             )
         published_text = _checked_at(published_at)
         if not published_text:
             raise ValueError(
                 f"published_products[{index}] needs a publication timestamp"
             )
+        description = product_bilingual_description(product, product)
+        if not description:
+            description = _plain_text(
+                _first(product, ("product_name", "name", "description", "model"))
+            )
         # Validate the path before it can influence counts or links.
-        _internal_link(title, wiki_path)
+        _internal_link(product_id, wiki_path)
         entries.append(
             {
                 "product_id": _plain_text(product_id),
-                "title": _plain_text(title),
+                "description": description,
                 "brand": _plain_text(
                     _first(
                         product,
@@ -670,12 +854,20 @@ def render_home_page(
     if entries:
         lines.extend(
             [
-                "| 产品 | 品牌 | 产品类别 | 更新时间 |",
-                "| --- | --- | --- | --- |",
+                "| 产品 ID | 产品描述 | 品牌 | 产品类别 | 更新时间 |",
+                "| --- | --- | --- | --- | --- |",
             ]
         )
         for entry in entries[:recent_limit]:
-            product_link = _internal_link(entry["title"], entry["wiki_path"])
+            product_link = _internal_link(
+                entry["product_id"],
+                entry["wiki_path"],
+            )
+            description = (
+                escape_table_cell(entry["description"])
+                if entry["description"]
+                else "暂无描述"
+            )
             brand = (
                 _tag_index_link(entry["brand"], "brand", entry["brand"])
                 if entry["brand"]
@@ -687,7 +879,7 @@ def render_home_page(
                 else "待分类"
             )
             lines.append(
-                f"| {product_link} | {brand} | {category} | "
+                f"| {product_link} | {description} | {brand} | {category} | "
                 f"{escape_table_cell(_display_publication_date(entry['published_at']))} |"
             )
     else:
@@ -721,17 +913,24 @@ def render_product_page(
     """
 
     decision = {} if decision is None else decision
-    title = product_display_title(product, decision)
+    title = product_page_title(product)
+    subtitle = product_bilingual_description(product, decision)
 
     lines = [
         AUTO_BEGIN,
         f"# {_escape_markdown_text(title)}",
-        "",
-        "## 产品信息",
-        "",
-        "| 字段 | 值 |",
-        "| --- | --- |",
     ]
+    if subtitle:
+        lines.extend(["", f"## {_escape_markdown_text(subtitle)}"])
+    lines.extend(
+        [
+            "",
+            "## 产品信息",
+            "",
+            "| 字段 | 值 |",
+            "| --- | --- |",
+        ]
+    )
     rows = _product_rows(product, decision)
     if rows:
         lines.extend(
@@ -754,12 +953,42 @@ def render_product_page(
             ]
         )
 
+    datasheet_parameters = _datasheet_parameters(decision)
     specifications = _specifications(product, decision)
+    derived_insights = _derived_insights(decision)
+    lines.extend(["", "## 产品参数", ""])
+    if datasheet_parameters:
+        lines.append(
+            f"**参数完整性：** 已安全提取 {len(datasheet_parameters)} 项数据表参数，"
+            "按原数据表顺序和章节展示；此数量不代表数据表的全部字段。"
+        )
+        lines.extend(
+            [
+                "",
+                "### 数据表参数",
+                "",
+                "| 数据表章节 | 参数 | 值 |",
+                "| --- | --- | --- |",
+            ]
+        )
+        lines.extend(
+            (
+                f"| {escape_table_cell(section or '未分组')} | "
+                f"{escape_table_cell(name)} | {escape_table_cell(value)} |"
+            )
+            for section, name, value in datasheet_parameters
+        )
+    else:
+        lines.append(
+            "**参数完整性：** 暂未提取到可安全归属该型号的数据表参数；"
+            "请以参考文献中的原始数据表为准。"
+        )
+
     if specifications:
         lines.extend(
             [
                 "",
-                "## 规格参数",
+                "### 关键参数",
                 "",
                 "| 类别 | 参数 | 值 |",
                 "| --- | --- | --- |",
@@ -771,6 +1000,35 @@ def render_product_page(
                 f"{escape_table_cell(key)} | {escape_table_cell(value)} |"
             )
             for category, key, value in specifications
+        )
+    elif not datasheet_parameters:
+        lines.extend(["", "暂无可安全展示的已核验关键参数。"])
+
+    if derived_insights:
+        lines.extend(
+            [
+                "",
+                "### AI 参数对照（需复核）",
+                "",
+                (
+                    "系统仅复核二元算术，以及两个操作数是否分别对应"
+                    "“依据参数”中的源数值；不验证工程含义、量纲兼容性"
+                    "或单位换算。以下结果并非数据表原文，使用前需人工复核。"
+                ),
+                "",
+                "| 衍生项 | 结果 | 公式 | 依据参数 | 说明 |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        lines.extend(
+            (
+                f"| {escape_table_cell(item['name'])} | "
+                f"{escape_table_cell(item['value'])} | "
+                f"{escape_table_cell(item['formula'])} | "
+                f"{escape_table_cell(item['basis'])} | "
+                f"{escape_table_cell(item['explanation'] or '—')} |"
+            )
+            for item in derived_insights
         )
 
     sources = _collect_sources(decision)

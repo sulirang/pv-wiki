@@ -36,6 +36,7 @@ publishStartDate
 publishEndDate
 scriptCss
 scriptJs
+editor
 content
 createdAt
 updatedAt
@@ -715,7 +716,11 @@ class WikiJSClient:
         if not isinstance(current_content, str):
             raise WikiJSResponseError("Wiki.js page is missing Markdown content")
 
-        editor = existing.get("editor", "markdown")
+        if "editor" not in existing:
+            raise WikiJSResponseError(
+                "Wiki.js page is missing editor metadata; automatic update refused"
+            )
+        editor = existing.get("editor")
         if not isinstance(editor, str) or editor.casefold() != "markdown":
             raise WikiJSResponseError(
                 "Wiki.js page is not a Markdown page; automatic update refused"
@@ -868,3 +873,42 @@ class WikiJSClient:
                 tags=normalized_tags,
             )
         return {"action": "created", "page": page}
+
+    def update_existing_page(
+        self,
+        path: str,
+        locale: str,
+        title: str,
+        description: str,
+        managed_content: str,
+        tags: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Update one exact existing page without ever creating or moving it.
+
+        This is the content-migration entry point. The normal update path still
+        preserves visibility, publish windows, scripts, human tags, and every
+        Markdown section outside the managed block.
+        """
+
+        path = _clean_path(path)
+        locale = _clean_string(locale, "locale")
+        title = _clean_string(title, "title")
+        description = _clean_string(description, "description", allow_empty=True)
+        normalized_tags = _normalize_tags(tags)
+        if not isinstance(managed_content, str):
+            raise TypeError("managed_content must be a string")
+
+        existing = self.single_by_path(locale, path)
+        if existing is None:
+            raise WikiJSResponseError(
+                "existing-page-only update refused because the page was not found"
+            )
+        return self._update_existing(
+            existing,
+            path=path,
+            locale=locale,
+            title=title,
+            description=description,
+            managed_content=managed_content,
+            tags=normalized_tags,
+        )

@@ -97,6 +97,8 @@ class RenderTests(unittest.TestCase):
             {
                 "product_id": "HP-1",
                 "model": "HeatPro 1",
+                "product_name": "HeatPro 1 air-to-water heat pump",
+                "product_description_zh": "空气源热泵",
                 "manufacturer": "Acme",
                 "product_category": "热泵",
                 "wiki_path": "products/hp-1-a1",
@@ -105,14 +107,18 @@ class RenderTests(unittest.TestCase):
             {
                 "product_id": "INV-1",
                 "model": "SUN 1",
+                "product_name": "SUN 1 three-phase solar inverter",
+                "product_description_zh": "三相太阳能逆变器",
                 "manufacturer": "Huawei",
-                "product_category": "光伏逆变器",
+                "product_category": "逆变器",
                 "wiki_path": "products/inv-1-b2",
                 "published_at": datetime(2026, 7, 19, tzinfo=timezone.utc),
             },
             {
                 "product_id": "HP-2",
                 "model": "HeatPro 2",
+                "product_name": "HeatPro 2 air-to-water heat pump",
+                "product_description_zh": "空气源热泵",
                 "manufacturer": "Acme",
                 "product_category": "热泵",
                 "wiki_path": "products/hp-2-c3",
@@ -135,6 +141,11 @@ class RenderTests(unittest.TestCase):
             rendered,
         )
         self.assertLess(rendered.index("HeatPro 2"), rendered.index("SUN 1"))
+        self.assertIn("[HP-2](/products/hp-2-c3)", rendered)
+        self.assertIn(
+            "HeatPro 2 air-to-water heat pump｜空气源热泵",
+            rendered,
+        )
         self.assertNotIn("Due now", rendered)
         self.assertNotIn("family_code", rendered)
         self.assertEqual(
@@ -212,8 +223,9 @@ class RenderTests(unittest.TestCase):
                 "manufacturer": "Acme",
                 "manufacturer_zh": "艾克米（Acme）",
                 "model": "PV-42",
-                "display_title_zh": "PV-42 商用光伏并网逆变器",
-                "product_category": "光伏逆变器",
+                "product_description_zh": "商用光伏并网逆变器",
+                "product_category": "逆变器",
+                "product_type": "商用光伏并网逆变器",
                 "summary": "艾克米 PV-42 是一款面向商用屋顶的光伏并网逆变器。",
                 "review_summary": "Installers praise its compact enclosure and clear commissioning workflow.",
                 "datasheets": [
@@ -256,10 +268,12 @@ class RenderTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("# PV-42 商用光伏并网逆变器", rendered)
+        self.assertIn("# 42", rendered)
+        self.assertIn("## PV-42｜商用光伏并网逆变器", rendered)
         self.assertIn("| 品牌/制造商 | 艾克米（Acme） |", rendered)
-        self.assertIn("| 产品类别 | 光伏逆变器 |", rendered)
-        self.assertIn("| 产品名称 | PV-42 商用光伏并网逆变器 |", rendered)
+        self.assertIn("| 产品类别 | 逆变器 |", rendered)
+        self.assertIn("| 产品类型 | 商用光伏并网逆变器 |", rendered)
+        self.assertIn("| 产品描述 | PV-42｜商用光伏并网逆变器 |", rendered)
         self.assertIn(
             "艾克米 PV-42 是一款面向商用屋顶的光伏并网逆变器。",
             rendered,
@@ -271,6 +285,99 @@ class RenderTests(unittest.TestCase):
         self.assertIn("- 判定：publish", rendered)
         self.assertIn("## 未解决的来源冲突", rendered)
         self.assertIn("IP65 / IP67", rendered)
+
+    def test_datasheet_parameters_keep_source_order_and_show_derived_basis(
+        self,
+    ) -> None:
+        rendered = render.render_product_page(
+            {
+                "product_id": "R5-10K-T2-15",
+                "product_name": "10kW Three Phase Solar Inverter, Dual MPPT",
+            },
+            {
+                "product_description_zh": "10kW 三相太阳能逆变器，双 MPPT",
+                "datasheet_parameters": [
+                    {"section": "DC Input", "name": "Max. DC voltage", "value": 1000, "unit": "V"},
+                    {"section": "AC Output", "name": "Rated output power", "value": 10, "unit": "kW"},
+                ],
+                "facts": [],
+                "derived_insights": [
+                    {
+                        "name": "直流交流电压比",
+                        "value": 100,
+                        "formula": "1000 ÷ 10",
+                        "basis": ["Max. DC voltage", "Rated output power"],
+                        "explanation": "仅用于参数对照。",
+                    }
+                ],
+            },
+        )
+
+        self.assertIn("# R5-10K-T2-15", rendered)
+        self.assertIn(
+            "## 10kW Three Phase Solar Inverter, Dual MPPT｜"
+            "10kW 三相太阳能逆变器，双 MPPT",
+            rendered,
+        )
+        self.assertIn("## 产品参数", rendered)
+        self.assertLess(
+            rendered.index("Max. DC voltage"),
+            rendered.index("Rated output power"),
+        )
+        self.assertIn("| DC Input | Max. DC voltage | 1000 V |", rendered)
+        self.assertIn("### AI 参数对照（需复核）", rendered)
+        self.assertIn("1000 ÷ 10", rendered)
+        self.assertIn("Max. DC voltage、Rated output power", rendered)
+        self.assertIn("仅复核二元算术", rendered)
+        self.assertIn("不验证工程含义、量纲兼容性或单位换算", rendered)
+
+    def test_legacy_description_removes_brand_model_and_series_prefixes(
+        self,
+    ) -> None:
+        product = {
+            "product_id": "R5-10K-T2-15",
+            "brand_code": "SOLIS",
+            "product_name": "10kW Three Phase Solar Inverter, Dual MPPT",
+        }
+        branded = {
+            "manufacturer": "Solis",
+            "model": "R5-10K-T2-15",
+            "display_title_zh": (
+                "Solis R5-10K-T2-15 10kW 三相太阳能逆变器，双 MPPT"
+            ),
+        }
+
+        self.assertEqual(
+            "10kW 三相太阳能逆变器，双 MPPT",
+            render.product_description_zh(product, branded),
+        )
+        self.assertEqual(
+            "10kW 三相太阳能逆变器，双 MPPT",
+            render.product_description_zh(
+                product,
+                {
+                    "display_title_zh": (
+                        "R5/R6系列 10kW 三相太阳能逆变器，双 MPPT"
+                    )
+                },
+            ),
+        )
+        rendered = render.render_product_page(product, branded)
+        self.assertIn(
+            "## 10kW Three Phase Solar Inverter, Dual MPPT｜"
+            "10kW 三相太阳能逆变器，双 MPPT",
+            rendered,
+        )
+
+    def test_empty_parameters_section_is_still_visible(self) -> None:
+        rendered = render.render_product_page(
+            {"product_id": "EMPTY-1", "product_name": "Empty product"},
+            {},
+        )
+
+        self.assertIn("## 产品参数", rendered)
+        self.assertIn("暂未提取到可安全归属该型号的数据表参数", rendered)
+        self.assertIn("暂无可安全展示的已核验关键参数", rendered)
 
 
 class MergeTests(unittest.TestCase):

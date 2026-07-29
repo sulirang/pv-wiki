@@ -13,13 +13,55 @@
     "decision_notes",
     "datasheets",
     "sources",
+    "datasheet_parameters",
     "facts",
+    "derived_insights",
     "conflicts"
   ],
+  "$defs": {
+    "scalar": {
+      "type": ["string", "number", "boolean"]
+    },
+    "evidenceQuote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "quote"],
+      "properties": {
+        "url": {"type": "string", "format": "uri"},
+        "quote": {"type": "string", "minLength": 1, "maxLength": 500},
+        "model_quote": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "Optional exact Markdown, TSV, or fixed-width PDF-layout model header row paired with quote as the same-table parameter row."
+        }
+      }
+    },
+    "groundedEvidence": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 200},
+        "value": {"$ref": "#/$defs/scalar"},
+        "unit": {"type": "string", "maxLength": 80},
+        "confidence": {"type": "number", "minimum": 0.8, "maximum": 1},
+        "evidence_urls": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "format": "uri"}
+        },
+        "evidence_quotes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 5,
+          "items": {"$ref": "#/$defs/evidenceQuote"}
+        }
+      }
+    }
+  },
   "properties": {
     "schema_version": {"const": "1"},
-    "product_id": {"type": "string", "minLength": 1},
-    "lease_token": {"type": "string", "minLength": 16},
+    "product_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "lease_token": {"type": "string", "minLength": 16, "maxLength": 200},
     "outcome": {
       "enum": [
         "publish",
@@ -30,9 +72,48 @@
       ]
     },
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-    "manufacturer": {"type": "string"},
-    "model": {"type": "string"},
-    "product_category": {"type": "string", "maxLength": 100},
+    "manufacturer": {"type": "string", "maxLength": 300},
+    "manufacturer_zh": {"type": "string", "maxLength": 200},
+    "model": {"type": "string", "maxLength": 300},
+    "product_description_zh": {"type": "string", "maxLength": 200},
+    "display_title_zh": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Legacy compatibility field; new decisions use product_description_zh."
+    },
+    "product_category_code": {
+      "enum": [
+        "pv_cell",
+        "pv_module",
+        "energy_storage_battery",
+        "inverter",
+        "energy_storage_system",
+        "heat_pump",
+        "ev_charging",
+        "power_electronics",
+        "thermal_equipment",
+        "solar_equipment",
+        "accessory",
+        "other"
+      ]
+    },
+    "product_category": {
+      "enum": [
+        "光伏电池",
+        "光伏组件",
+        "储能电池",
+        "逆变器",
+        "储能系统",
+        "热泵",
+        "充电设备",
+        "电力电子设备",
+        "热能设备",
+        "光伏设备",
+        "配件",
+        "其他"
+      ]
+    },
+    "product_type": {"type": "string", "maxLength": 100},
     "summary": {"type": "string", "maxLength": 2000},
     "review_summary": {"type": "string", "maxLength": 1500},
     "review_evidence_urls": {
@@ -93,50 +174,89 @@
         }
       }
     },
+    "datasheet_parameters": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "allOf": [
+          {"$ref": "#/$defs/groundedEvidence"},
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "value",
+              "confidence",
+              "evidence_urls",
+              "evidence_quotes"
+            ],
+            "properties": {
+              "name": true,
+              "section": {"type": "string", "maxLength": 100},
+              "value": true,
+              "unit": true,
+              "confidence": true,
+              "evidence_urls": true,
+              "evidence_quotes": true
+            }
+          }
+        ]
+      }
+    },
     "facts": {
       "type": "array",
       "maxItems": 100,
       "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "name",
-          "value",
-          "confidence",
-          "evidence_urls",
-          "evidence_quotes"
-        ],
-        "properties": {
-          "name": {"type": "string", "minLength": 1},
-          "category": {"type": "string", "maxLength": 100},
-          "value": {"type": ["string", "number", "boolean"]},
-          "unit": {"type": "string"},
-          "confidence": {"type": "number", "minimum": 0.8, "maximum": 1},
-          "evidence_urls": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "string", "format": "uri"}
-          },
-          "evidence_quotes": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 5,
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["url", "quote"],
-              "properties": {
-                "url": {"type": "string", "format": "uri"},
-                "quote": {"type": "string", "minLength": 1, "maxLength": 500},
-                "model_quote": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 500,
-                  "description": "Optional exact Markdown, TSV, or fixed-width PDF-layout model header row paired with quote as the same-table parameter row."
-                }
-              }
+        "allOf": [
+          {"$ref": "#/$defs/groundedEvidence"},
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "value",
+              "confidence",
+              "evidence_urls",
+              "evidence_quotes"
+            ],
+            "properties": {
+              "name": true,
+              "category": {"type": "string", "maxLength": 100},
+              "value": true,
+              "unit": true,
+              "confidence": true,
+              "evidence_urls": true,
+              "evidence_quotes": true
             }
           }
+        ]
+      }
+    },
+    "derived_insights": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value", "formula", "basis"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1, "maxLength": 200},
+          "value": {"type": "number"},
+          "unit": {"type": "string", "maxLength": 80},
+          "formula": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "pattern": "^[ \\t]*[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[eE][-+]?\\d+)?[ \\t]*[-+*/×÷][ \\t]*[-+]?(?:\\d+(?:\\.\\d+)?|\\.\\d+)(?:[eE][-+]?\\d+)?[ \\t]*$"
+          },
+          "basis": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1, "maxLength": 200}
+          },
+          "explanation": {"type": "string", "maxLength": 500}
         }
       }
     },
@@ -152,7 +272,7 @@
           "values": {
             "type": "array",
             "minItems": 2,
-            "items": {"type": ["string", "number", "boolean"]}
+            "items": {"$ref": "#/$defs/scalar"}
           },
           "source_urls": {
             "type": "array",
@@ -170,11 +290,45 @@
         "required": ["outcome"]
       },
       "then": {
-        "required": ["product_category", "summary"],
+        "required": [
+          "manufacturer",
+          "manufacturer_zh",
+          "model",
+          "product_category_code",
+          "product_category",
+          "product_type",
+          "summary"
+        ],
+        "anyOf": [
+          {"required": ["product_description_zh"]},
+          {"required": ["display_title_zh"]}
+        ],
         "properties": {
-          "product_category": {"minLength": 1},
+          "manufacturer": {"minLength": 1},
+          "manufacturer_zh": {"minLength": 1},
+          "model": {"minLength": 1},
+          "product_description_zh": {"minLength": 1},
+          "display_title_zh": {"minLength": 1},
+          "product_type": {"minLength": 1},
           "summary": {"minLength": 1},
           "datasheets": {"minItems": 1}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": ["no_datasheet", "ambiguous", "insufficient_identity"]
+          }
+        },
+        "required": ["outcome"]
+      },
+      "then": {
+        "properties": {
+          "datasheet_parameters": {"maxItems": 0},
+          "facts": {"maxItems": 0},
+          "derived_insights": {"maxItems": 0}
         }
       }
     },
@@ -191,13 +345,14 @@
           "classification_evidence_quotes"
         ],
         "properties": {
-          "product_category": {"minLength": 1},
           "summary": {"minLength": 1},
           "classification_evidence_urls": {"minItems": 1},
           "classification_evidence_quotes": {"minItems": 1},
           "datasheets": {"maxItems": 0},
           "sources": {"maxItems": 0},
+          "datasheet_parameters": {"maxItems": 0},
           "facts": {"maxItems": 0},
+          "derived_insights": {"maxItems": 0},
           "conflicts": {"maxItems": 0}
         }
       }

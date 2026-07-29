@@ -20,6 +20,7 @@ import resource
 import socket
 import ssl
 import time
+import unicodedata
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from typing import Any
 from .render import validate_public_http_url
 
 
-PDF_EXTRACTION_CONTRACT_VERSION = "2026-07-28.3"
+PDF_EXTRACTION_CONTRACT_VERSION = "2026-07-29.1"
 PDF_MAGIC = b"%PDF-"
 PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/x-pdf"})
 PDF_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -43,6 +44,11 @@ MAX_DERIVED_LAYOUT_ROWS = 50
 MAX_DERIVED_LAYOUT_CELL_CHARS = 200
 MAX_DERIVED_LAYOUT_ROW_CHARS = 500
 MAX_DERIVED_LAYOUT_CHARS = 12_000
+MAX_MODEL_PARAMETER_TARGETS = 16
+MAX_MODEL_PARAMETER_ROWS = 500
+MAX_MODEL_PARAMETER_PAGES = 500
+MAX_MODEL_PARAMETER_PAGE_CHARS = 200_000
+MAX_LAYOUT_TABLE_MISSES = 12
 
 
 class PDFDocumentError(RuntimeError):
@@ -67,11 +73,27 @@ class PDFDownload:
 
 
 @dataclass(frozen=True, slots=True)
+class PDFParameterRow:
+    """One locally bound value from a target model's datasheet table column."""
+
+    model: str
+    source_label: str
+    value: str
+    unit: str
+    section: str
+    page: int
+    order: int
+    model_quote: str
+    quote: str
+
+
+@dataclass(frozen=True, slots=True)
 class PDFText:
     text: str
     page_count: int
     extracted_pages: int
     truncated: bool
+    parameter_rows: tuple[PDFParameterRow, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +105,7 @@ class PDFEvidence:
     page_count: int
     extracted_pages: int
     truncated: bool
+    parameter_rows: tuple[PDFParameterRow, ...] = ()
 
 
 def looks_like_pdf_url(value: Any) -> bool:
@@ -348,12 +371,13 @@ def _normalized_page_text(value: Any) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class _CompositeLayoutHeader:
-    """One visually tabular model header split across two PDF text rows."""
+class _LayoutHeader:
+    """One normalized multi-model header from one or two PDF layout rows."""
 
-    suffix_line_index: int
+    end_line_index: int
     column_count: int
     normalized_row: str
+    models: tuple[str, ...]
 
 
 def _collapsed_layout_cell(value: str) -> str:
@@ -369,10 +393,78 @@ def _model_shaped_layout_token(value: str) -> bool:
     )
 
 
+def _normalized_model_key(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def _source_model_token(value: str) -> bool:
+    return (
+        len(value) <= 80
+        and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+/\-]*", value) is not None
+        and _model_shaped_layout_token(value)
+    )
+
+
+def _single_line_layout_header(
+    lines: Sequence[str],
+    line_index: int,
+) -> _LayoutHeader | None:
+    """Recognize a normal fixed-width header containing complete model cells."""
+
+    if not 0 <= line_index < len(lines):
+        return None
+    line = lines[line_index]
+    if not line.strip() or len(line) > MAX_LAYOUT_LINE_CHARS:
+        return None
+    tokens = list(re.finditer(r"\S+", line))
+    if len(tokens) < 3:
+        return None
+
+    trailing: list[re.Match[str]] = []
+    for token in reversed(tokens):
+        if not _source_model_token(token.group(0)):
+            break
+        trailing.append(token)
+    trailing.reverse()
+    if not 2 <= len(trailing) <= MAX_DERIVED_LAYOUT_COLUMNS:
+        return None
+
+    label = _collapsed_layout_cell(line[: trailing[0].start()])
+    label_key = label.casefold().rstrip(":")
+    if not (
+        label_key in {
+            "type",
+            "model",
+            "model type",
+            "models",
+            "specification",
+            "specifications",
+            "technical specification",
+            "technical specifications",
+            "型号",
+            "类型",
+        }
+        or label_key.endswith(" model")
+    ):
+        return None
+    models = tuple(token.group(0) for token in trailing)
+    if len({_normalized_model_key(model) for model in models}) != len(models):
+        return None
+    normalized_row = "\t".join((label, *models))
+    if len(normalized_row) > MAX_DERIVED_LAYOUT_ROW_CHARS:
+        return None
+    return _LayoutHeader(
+        end_line_index=line_index,
+        column_count=len(models),
+        normalized_row=normalized_row,
+        models=models,
+    )
+
+
 def _composite_layout_header(
     lines: Sequence[str],
     line_index: int,
-) -> _CompositeLayoutHeader | None:
+) -> _LayoutHeader | None:
     """Join a repeated model prefix row with its following suffix row.
 
     Some manufacturer PDFs draw ``SUN2000L`` and ``-4.6KTL`` as separate text
@@ -443,11 +535,22 @@ def _composite_layout_header(
     normalized_row = "\t".join((label, *models))
     if len(normalized_row) > MAX_DERIVED_LAYOUT_ROW_CHARS:
         return None
-    return _CompositeLayoutHeader(
-        suffix_line_index=suffix_line_index,
+    return _LayoutHeader(
+        end_line_index=suffix_line_index,
         column_count=len(models),
         normalized_row=normalized_row,
+        models=tuple(models),
     )
+
+
+def _layout_header(
+    lines: Sequence[str],
+    line_index: int,
+) -> _LayoutHeader | None:
+    return _single_line_layout_header(
+        lines,
+        line_index,
+    ) or _composite_layout_header(lines, line_index)
 
 
 def _normalized_layout_data_row(
@@ -531,16 +634,16 @@ def _derived_layout_table_text(page_text: str) -> str:
         and len(blocks) < MAX_DERIVED_LAYOUT_TABLES
         and used < MAX_DERIVED_LAYOUT_CHARS
     ):
-        header = _composite_layout_header(lines, line_index)
+        header = _layout_header(lines, line_index)
         if header is None:
             line_index += 1
             continue
 
         table_number = len(blocks) + 1
         rows = [header.normalized_row]
-        scan_index = header.suffix_line_index + 1
+        scan_index = header.end_line_index + 1
         while scan_index < len(lines) and len(rows) < MAX_DERIVED_LAYOUT_ROWS:
-            if _composite_layout_header(lines, scan_index) is not None:
+            if _layout_header(lines, scan_index) is not None:
                 break
             stripped = lines[scan_index].strip()
             if stripped.startswith("*"):
@@ -549,8 +652,13 @@ def _derived_layout_table_text(page_text: str) -> str:
                 lines[scan_index],
                 column_count=header.column_count,
             )
+            if normalized_row is None:
+                normalized_row = _shared_layout_data_row(
+                    lines[scan_index],
+                    column_count=header.column_count,
+                )
             if normalized_row is not None:
-                rows.append(normalized_row)
+                rows.append(_auditable_layout_data_row(normalized_row))
             scan_index += 1
 
         block = "\n".join(
@@ -566,8 +674,403 @@ def _derived_layout_table_text(page_text: str) -> str:
             break
         blocks.append(block)
         used += separator_chars + len(block)
-        line_index = max(scan_index, header.suffix_line_index + 1)
+        line_index = max(scan_index, header.end_line_index + 1)
     return "\n\n".join(blocks)
+
+
+def _normalized_target_models(
+    target_models: str | Sequence[str],
+) -> tuple[str, ...]:
+    if isinstance(target_models, str):
+        candidates: Sequence[str] = (target_models,)
+    elif isinstance(target_models, Sequence) and not isinstance(
+        target_models,
+        (bytes, bytearray),
+    ):
+        candidates = target_models
+    else:
+        raise TypeError("target_models must be a string or a sequence of strings")
+    if len(candidates) > MAX_MODEL_PARAMETER_TARGETS:
+        raise ValueError(
+            f"target_models must contain at most {MAX_MODEL_PARAMETER_TARGETS} entries"
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            raise TypeError("target_models entries must be strings")
+        model = unicodedata.normalize("NFKC", candidate).strip()
+        if not model or len(model) > 200:
+            raise ValueError("target model values must contain 1 to 200 characters")
+        key = _normalized_model_key(model)
+        if key not in seen:
+            normalized.append(model)
+            seen.add(key)
+    return tuple(normalized)
+
+
+def _text_contains_complete_model(value: str, model: str) -> bool:
+    pattern = (
+        r"(?<![A-Za-z0-9_.+/\-])"
+        + re.escape(unicodedata.normalize("NFKC", model))
+        + r"(?![A-Za-z0-9_.+/\-])"
+    )
+    normalized = unicodedata.normalize("NFKC", value)
+    return re.search(pattern, normalized, flags=re.IGNORECASE) is not None
+
+
+def _shared_layout_data_row(
+    line: str,
+    *,
+    column_count: int,
+) -> str | None:
+    """Repeat one clearly table-wide value across every model column.
+
+    Grouped values remain ambiguous and are rejected. A shared value is accepted
+    only when one dominant layout gap cleanly separates a short field label from
+    one bounded scalar or short text value.
+    """
+
+    stripped = line.strip()
+    if (
+        not stripped
+        or len(stripped) > MAX_LAYOUT_LINE_CHARS
+        or not 2 <= column_count <= MAX_DERIVED_LAYOUT_COLUMNS
+    ):
+        return None
+    gaps = list(re.finditer(r"[ \u00a0]{2,}", stripped))
+    if not gaps:
+        return None
+    ranked = sorted(gaps, key=lambda match: -len(match.group(0)))
+    selected = ranked[0]
+    if len(selected.group(0)) < 4 or (
+        len(ranked) > 1
+        and len(selected.group(0)) < len(ranked[1].group(0)) * 2
+    ):
+        return None
+
+    label = _collapsed_layout_cell(stripped[: selected.start()])
+    value = _collapsed_layout_cell(stripped[selected.end() :])
+    if (
+        not label
+        or not value
+        or len(label) > MAX_DERIVED_LAYOUT_CELL_CHARS
+        or len(value) > MAX_DERIVED_LAYOUT_CELL_CHARS
+        or not any(character.isalpha() for character in label)
+        or len(value.split()) > 12
+        or value.endswith((".", "!", "?"))
+    ):
+        return None
+    cells = (label, *((value,) * column_count))
+    normalized = "\t".join(cells)
+    return (
+        normalized
+        if len(normalized) <= MAX_DERIVED_LAYOUT_ROW_CHARS
+        else None
+    )
+
+
+def _layout_section_heading(line: str) -> str | None:
+    value = _collapsed_layout_cell(line)
+    if not value or len(value) > 100 or any(character.isdecimal() for character in value):
+        return None
+    key = value.casefold().replace("（", "(").replace("）", ")")
+    if re.fullmatch(
+        r"(?:"
+        r"(?:pv |dc |ac |grid |battery |backup )?(?:input|output)"
+        r"(?:\s*\([^)]{1,20}\))?"
+        r"|efficiency|protection|interface|communication"
+        r"|general data|environmental data|mechanical data"
+        r"|storage|battery|photovoltaic|operating conditions"
+        r"|输入(?:（[^）]{1,20}）|\([^)]{1,20}\))?"
+        r"|输出(?:（[^）]{1,20}）|\([^)]{1,20}\))?"
+        r"|效率|保护|接口|通信|常规参数|环境参数|机械参数|储能|电池"
+        r")",
+        key,
+    ):
+        return value
+    return None
+
+
+_VALUE_UNIT_RE = re.compile(
+    r"^(?P<value>.+?\d)\s*(?P<unit>"
+    r"kWh|MWh|Wh|kWp|Wp|kVA|VA|kW|MW|W|mA|A|mV|kV|V|"
+    r"MHz|kHz|Hz|dBA|dB|kg|mm|cm|km|m|°C|℃|%|years?|year"
+    r")$",
+    flags=re.IGNORECASE,
+)
+
+
+def _parameter_value_and_unit(
+    source_label: str,
+    raw_value: str,
+) -> tuple[str, str]:
+    bracket_units = [
+        _collapsed_layout_cell(candidate)
+        for candidate in re.findall(r"\[([^\[\]]{1,20})\]", source_label)
+    ]
+    unit = ""
+    for candidate in reversed(bracket_units):
+        if candidate.casefold() not in {"dc", "ac", "stc", "h*w*d", "w*h*d"}:
+            unit = candidate
+            break
+    value = _collapsed_layout_cell(raw_value)
+    if unit:
+        unit_suffix = re.fullmatch(
+            rf"(.+?)\s*{re.escape(unit)}",
+            value,
+            flags=re.IGNORECASE,
+        )
+        if unit_suffix is not None:
+            value = unit_suffix.group(1).strip()
+    else:
+        match = _VALUE_UNIT_RE.fullmatch(value)
+        if match is not None:
+            value = match.group("value").strip()
+            unit = match.group("unit")
+    return value, unit
+
+
+def _auditable_layout_data_row(normalized_row: str) -> str:
+    """Carry a label-level unit into each value cell of a normalized TSV row."""
+
+    cells = normalized_row.split("\t")
+    if len(cells) < 2:
+        return normalized_row
+    source_label = cells[0]
+    values = []
+    for raw_value in cells[1:]:
+        value, unit = _parameter_value_and_unit(source_label, raw_value)
+        values.append(f"{value} {unit}".strip())
+    return "\t".join((source_label, *values))
+
+
+def _parameter_input_pages(
+    pages_or_text: str | Mapping[int, str] | Sequence[tuple[int, str]],
+) -> tuple[tuple[int, str], ...]:
+    if isinstance(pages_or_text, str):
+        if len(pages_or_text) > MAX_MODEL_PARAMETER_PAGE_CHARS:
+            raise ValueError(
+                "page-labelled parameter text exceeds the configured character limit"
+            )
+        matches = tuple(
+            re.finditer(
+                r"(?ms)^\[PDF page ([1-9]\d*)/[1-9]\d*\]\n"
+                r"(.*?)^\[End PDF page \1\]$",
+                pages_or_text,
+            )
+        )
+        if matches:
+            return tuple(
+                (int(match.group(1)), match.group(2))
+                for match in matches
+            )
+        return ((1, _normalized_page_text(pages_or_text)),)
+
+    if isinstance(pages_or_text, Mapping):
+        raw_items = tuple(pages_or_text.items())
+    elif isinstance(pages_or_text, Sequence) and not isinstance(
+        pages_or_text,
+        (bytes, bytearray),
+    ):
+        raw_items = tuple(pages_or_text)
+    else:
+        raise TypeError(
+            "pages_or_text must be page-labelled text, a page mapping, "
+            "or a sequence of (page, text) pairs"
+        )
+    if len(raw_items) > MAX_MODEL_PARAMETER_PAGES:
+        raise ValueError(
+            f"pages_or_text must contain at most {MAX_MODEL_PARAMETER_PAGES} pages"
+        )
+
+    pages: list[tuple[int, str]] = []
+    seen_pages: set[int] = set()
+    for item in raw_items:
+        if (
+            not isinstance(item, Sequence)
+            or isinstance(item, (str, bytes, bytearray))
+            or len(item) != 2
+        ):
+            raise TypeError("each parameter page must be a (page, text) pair")
+        page, text = item
+        if (
+            isinstance(page, bool)
+            or not isinstance(page, int)
+            or not 1 <= page <= MAX_MODEL_PARAMETER_PAGES
+        ):
+            raise ValueError(
+                f"parameter page numbers must be between 1 and {MAX_MODEL_PARAMETER_PAGES}"
+            )
+        if page in seen_pages:
+            raise ValueError("parameter page numbers must be unique")
+        if not isinstance(text, str):
+            raise TypeError("parameter page text must be a string")
+        normalized = _normalized_page_text(text)
+        if len(normalized) > MAX_MODEL_PARAMETER_PAGE_CHARS:
+            raise ValueError(
+                "parameter page text exceeds the configured character limit"
+            )
+        pages.append((page, normalized))
+        seen_pages.add(page)
+    return tuple(sorted(pages))
+
+
+def _model_indexes_for_header(
+    header: _LayoutHeader,
+    target_models: Sequence[str],
+) -> tuple[tuple[str, int], ...]:
+    indexes = {
+        _normalized_model_key(model): index
+        for index, model in enumerate(header.models)
+    }
+    return tuple(
+        (target, indexes[_normalized_model_key(target)])
+        for target in target_models
+        if _normalized_model_key(target) in indexes
+    )
+
+
+def _page_model_parameter_rows(
+    page_text: str,
+    *,
+    page: int,
+    target_models: Sequence[str],
+) -> list[PDFParameterRow]:
+    lines = page_text.splitlines()[:MAX_LAYOUT_SCAN_LINES]
+    rows: list[PDFParameterRow] = []
+    line_index = 0
+    while line_index < len(lines) and len(rows) < MAX_MODEL_PARAMETER_ROWS:
+        header = _layout_header(lines, line_index)
+        if header is None:
+            line_index += 1
+            continue
+        model_indexes = _model_indexes_for_header(header, target_models)
+        scan_index = header.end_line_index + 1
+        if not model_indexes:
+            line_index = scan_index
+            continue
+
+        section = ""
+        misses = 0
+        while (
+            scan_index < len(lines)
+            and len(rows) < MAX_MODEL_PARAMETER_ROWS
+        ):
+            if _layout_header(lines, scan_index) is not None:
+                break
+            stripped = lines[scan_index].strip()
+            if stripped.startswith("*"):
+                break
+            section_heading = _layout_section_heading(stripped)
+            if section_heading is not None:
+                section = section_heading
+                misses = 0
+                scan_index += 1
+                continue
+
+            normalized_row = _normalized_layout_data_row(
+                lines[scan_index],
+                column_count=header.column_count,
+            )
+            if normalized_row is None:
+                normalized_row = _shared_layout_data_row(
+                    lines[scan_index],
+                    column_count=header.column_count,
+                )
+            if normalized_row is not None:
+                normalized_row = _auditable_layout_data_row(normalized_row)
+                cells = normalized_row.split("\t")
+                source_label = cells[0]
+                for model, model_index in model_indexes:
+                    value, unit = _parameter_value_and_unit(
+                        source_label,
+                        cells[model_index + 1],
+                    )
+                    rows.append(
+                        PDFParameterRow(
+                            model=model,
+                            source_label=source_label,
+                            value=value,
+                            unit=unit,
+                            section=section,
+                            page=page,
+                            order=0,
+                            model_quote=header.normalized_row,
+                            quote=normalized_row,
+                        )
+                    )
+                    if len(rows) >= MAX_MODEL_PARAMETER_ROWS:
+                        break
+                misses = 0
+            elif stripped:
+                misses += 1
+                if misses >= MAX_LAYOUT_TABLE_MISSES:
+                    break
+            scan_index += 1
+        line_index = max(scan_index, header.end_line_index + 1)
+    return rows
+
+
+def extract_model_parameter_rows(
+    pages_or_text: str | Mapping[int, str] | Sequence[tuple[int, str]],
+    target_models: str | Sequence[str],
+) -> list[PDFParameterRow]:
+    """Return bounded, deterministic target-column rows from PDF layout text.
+
+    ``pages_or_text`` may be the page-labelled output of :func:`parse_pdf_text`,
+    a mapping of one-based page numbers to raw layout text, or a sequence of
+    ``(page, text)`` pairs. No network, AI, environment, or production state is
+    consulted.
+    """
+
+    models = _normalized_target_models(target_models)
+    if not models:
+        return []
+    pages = _parameter_input_pages(pages_or_text)
+    candidates: list[PDFParameterRow] = []
+    for page, page_text in pages:
+        candidates.extend(
+            _page_model_parameter_rows(
+                page_text,
+                page=page,
+                target_models=models,
+            )
+        )
+        if len(candidates) >= MAX_MODEL_PARAMETER_ROWS:
+            break
+
+    result: list[PDFParameterRow] = []
+    seen: set[tuple[Any, ...]] = set()
+    for candidate in candidates:
+        key = (
+            _normalized_model_key(candidate.model),
+            candidate.source_label.casefold(),
+            candidate.value.casefold(),
+            candidate.unit.casefold(),
+            candidate.section.casefold(),
+            candidate.page,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(
+            PDFParameterRow(
+                model=candidate.model,
+                source_label=candidate.source_label,
+                value=candidate.value,
+                unit=candidate.unit,
+                section=candidate.section,
+                page=candidate.page,
+                order=len(result) + 1,
+                model_quote=candidate.model_quote,
+                quote=candidate.quote,
+            )
+        )
+        if len(result) >= MAX_MODEL_PARAMETER_ROWS:
+            break
+    return result
 
 
 def _page_text_with_derived_layout_tables(value: Any) -> str:
@@ -617,36 +1120,87 @@ def _unique_derived_layout_tables(
     pages: Sequence[_PDFPageLayoutText],
     *,
     max_chars: int,
+    target_models: Sequence[str] = (),
 ) -> dict[int, tuple[str, ...]]:
-    """Keep the earliest unique tables within one PDF-wide enrichment budget."""
+    """Keep target-bearing tables first, then source order, within the budget."""
 
     budget = min(MAX_DERIVED_LAYOUT_CHARS, max_chars // 3)
     selected: dict[int, list[str]] = {}
     seen: set[str] = set()
     used = 0
     selected_count = 0
-    for page in pages:
-        for table in page.derived_tables:
-            key = _derived_layout_block_key(table)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            separator_chars = 2 if selected_count else 0
-            cost = separator_chars + len(table)
-            if cost > budget - used:
-                continue
-            selected.setdefault(page.page_number, []).append(table)
-            used += cost
-            selected_count += 1
-            if selected_count >= MAX_DERIVED_LAYOUT_TABLES:
-                return {
-                    page_number: tuple(tables)
-                    for page_number, tables in selected.items()
-                }
+    candidates = [
+        (page.page_number, table)
+        for page in pages
+        for table in page.derived_tables
+    ]
+    if target_models:
+        candidates.sort(
+            key=lambda item: (
+                0
+                if any(
+                    _text_contains_complete_model(item[1], model)
+                    for model in target_models
+                )
+                else 1,
+                item[0],
+            )
+        )
+    for page_number, table in candidates:
+        key = _derived_layout_block_key(table)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        separator_chars = 2 if selected_count else 0
+        cost = separator_chars + len(table)
+        if cost > budget - used:
+            continue
+        selected.setdefault(page_number, []).append(table)
+        used += cost
+        selected_count += 1
+        if selected_count >= MAX_DERIVED_LAYOUT_TABLES:
+            return {
+                page_number: tuple(tables)
+                for page_number, tables in selected.items()
+            }
     return {
         page_number: tuple(tables)
         for page_number, tables in selected.items()
     }
+
+
+def _page_target_priority(
+    page: _PDFPageLayoutText,
+    target_models: Sequence[str],
+) -> int:
+    if not target_models:
+        return 0
+    if any(
+        _text_contains_complete_model(table, model)
+        for table in page.derived_tables
+        for model in target_models
+    ):
+        return 2
+    lines = page.raw_text.splitlines()[:MAX_LAYOUT_SCAN_LINES]
+    for line_index in range(len(lines)):
+        header = _layout_header(lines, line_index)
+        if header is None:
+            continue
+        header_keys = {
+            _normalized_model_key(model)
+            for model in header.models
+        }
+        if any(
+            _normalized_model_key(model) in header_keys
+            for model in target_models
+        ):
+            return 2
+    if any(
+        _text_contains_complete_model(page.raw_text, model)
+        for model in target_models
+    ):
+        return 1
+    return 0
 
 
 def _page_text_scaffold(
@@ -721,19 +1275,64 @@ def _fair_text_allocations(
     return allocations
 
 
+def _target_first_text_allocations(
+    pages: Sequence[_PDFPageLayoutText],
+    *,
+    total: int,
+    target_models: Sequence[str],
+) -> list[int]:
+    """Preserve one character per page, then fill target tables/pages first."""
+
+    if not target_models:
+        return _fair_text_allocations(
+            [len(page.raw_text) for page in pages],
+            total=total,
+        )
+    allocations = [
+        min(1, len(page.raw_text))
+        for page in pages
+    ]
+    remaining = total - sum(allocations)
+    priorities = [
+        _page_target_priority(page, target_models)
+        for page in pages
+    ]
+    for priority in (2, 1, 0):
+        indexes = [
+            index
+            for index, page_priority in enumerate(priorities)
+            if page_priority == priority
+            and allocations[index] < len(pages[index].raw_text)
+        ]
+        if not indexes or remaining <= 0:
+            continue
+        needs = [
+            len(pages[index].raw_text) - allocations[index]
+            for index in indexes
+        ]
+        tier_budget = min(remaining, sum(needs))
+        additions = _fair_text_allocations(needs, total=tier_budget)
+        for index, addition in zip(indexes, additions, strict=True):
+            allocations[index] += addition
+        remaining -= tier_budget
+    return allocations
+
+
 def _assemble_pdf_page_texts(
     pages: Sequence[_PDFPageLayoutText],
     *,
     page_count: int,
     max_chars: int,
+    target_models: Sequence[str] = (),
 ) -> tuple[str, int, bool]:
-    """Assemble a fair, PDF-wide budget with deduplicated TSV projections."""
+    """Assemble bounded text, prioritizing target tables/pages when supplied."""
 
     if not pages:
         return "", 0, False
     derived_by_page = _unique_derived_layout_tables(
         pages,
         max_chars=max_chars,
+        target_models=target_models,
     )
     derived_section = _pdf_derived_layout_section(
         derived_by_page,
@@ -760,22 +1359,29 @@ def _assemble_pdf_page_texts(
         included
         and scaffold_size(included) + len(included) > max_chars
     ):
-        removable_index = next(
+        priorities = [
             (
-                index
-                for index in range(len(included) - 1, -1, -1)
-                if included[index].page_number not in derived_by_page
-            ),
-            len(included) - 1,
+                3
+                if page.page_number in derived_by_page
+                else _page_target_priority(page, target_models)
+            )
+            for page in included
+        ]
+        minimum_priority = min(priorities)
+        removable_index = max(
+            index
+            for index, priority in enumerate(priorities)
+            if priority == minimum_priority
         )
         included.pop(removable_index)
     if not included:
         return "", 0, True
 
     source_budget = max_chars - scaffold_size(included)
-    allocations = _fair_text_allocations(
-        [len(page.raw_text) for page in included],
+    allocations = _target_first_text_allocations(
+        included,
         total=source_budget,
+        target_models=target_models,
     )
     pieces: list[str] = [derived_section] if derived_section else []
     truncated = len(included) < len(pages)
@@ -801,6 +1407,7 @@ def _parse_pdf_in_child(
     max_pages: int,
     max_chars: int,
     cpu_seconds: int,
+    target_models: tuple[str, ...],
 ) -> None:
     """Child-process target. Send only bounded text or a generic error type."""
 
@@ -847,10 +1454,18 @@ def _parse_pdf_in_child(
                     raw_truncated=len(page_text) > max_chars,
                 )
             )
+        parameter_rows = extract_model_parameter_rows(
+            tuple(
+                (page.page_number, page.raw_text)
+                for page in page_layouts
+            ),
+            target_models,
+        )
         text, extracted_pages, truncated = _assemble_pdf_page_texts(
             page_layouts,
             page_count=page_count,
             max_chars=max_chars,
+            target_models=target_models,
         )
         if len(text.strip()) < MIN_USABLE_PDF_TEXT_CHARS:
             raise PDFParseError("PDF has no usable embedded text")
@@ -861,6 +1476,20 @@ def _parse_pdf_in_child(
                 "page_count": page_count,
                 "extracted_pages": extracted_pages,
                 "truncated": truncated,
+                "parameter_rows": [
+                    {
+                        "model": row.model,
+                        "source_label": row.source_label,
+                        "value": row.value,
+                        "unit": row.unit,
+                        "section": row.section,
+                        "page": row.page,
+                        "order": row.order,
+                        "model_quote": row.model_quote,
+                        "quote": row.quote,
+                    }
+                    for row in parameter_rows
+                ],
             }
         )
     except BaseException as exc:
@@ -883,6 +1512,7 @@ def parse_pdf_text(
     max_pages: int,
     max_chars: int,
     timeout: float,
+    target_models: str | Sequence[str] = (),
 ) -> PDFText:
     """Extract page-labelled text in a time- and memory-bounded subprocess."""
 
@@ -907,6 +1537,7 @@ def parse_pdf_text(
         or not 1 <= float(timeout) <= 60
     ):
         raise ValueError("timeout must be between 1 and 60 seconds")
+    normalized_target_models = _normalized_target_models(target_models)
 
     # The worker serves requests from threads. ``spawn`` avoids inheriting
     # locks or partially initialized library state from that threaded parent.
@@ -915,7 +1546,14 @@ def parse_pdf_text(
     cpu_seconds = max(1, int(math.ceil(float(timeout))))
     process = context.Process(
         target=_parse_pdf_in_child,
-        args=(sender, content, max_pages, max_chars, cpu_seconds),
+        args=(
+            sender,
+            content,
+            max_pages,
+            max_chars,
+            cpu_seconds,
+            normalized_target_models,
+        ),
         daemon=True,
     )
     process.start()
@@ -953,6 +1591,11 @@ def parse_pdf_text(
         page_count=int(result["page_count"]),
         extracted_pages=int(result["extracted_pages"]),
         truncated=bool(result["truncated"]),
+        parameter_rows=tuple(
+            PDFParameterRow(**item)
+            for item in result.get("parameter_rows", ())
+            if isinstance(item, Mapping)
+        ),
     )
 
 
@@ -964,6 +1607,7 @@ def extract_pdf_evidence(
     max_chars: int,
     download_timeout: float,
     parse_timeout: float,
+    target_models: str | Sequence[str] = (),
     downloader: Callable[..., PDFDownload] = download_pdf,
     parser: Callable[..., PDFText] = parse_pdf_text,
 ) -> PDFEvidence:
@@ -974,12 +1618,15 @@ def extract_pdf_evidence(
         max_bytes=max_bytes,
         timeout=download_timeout,
     )
-    parsed = parser(
-        downloaded.content,
-        max_pages=max_pages,
-        max_chars=max_chars,
-        timeout=parse_timeout,
-    )
+    normalized_target_models = _normalized_target_models(target_models)
+    parser_arguments: dict[str, Any] = {
+        "max_pages": max_pages,
+        "max_chars": max_chars,
+        "timeout": parse_timeout,
+    }
+    if normalized_target_models:
+        parser_arguments["target_models"] = normalized_target_models
+    parsed = parser(downloaded.content, **parser_arguments)
     return PDFEvidence(
         text=parsed.text,
         requested_url=downloaded.requested_url,
@@ -988,6 +1635,7 @@ def extract_pdf_evidence(
         page_count=parsed.page_count,
         extracted_pages=parsed.extracted_pages,
         truncated=parsed.truncated,
+        parameter_rows=parsed.parameter_rows,
     )
 
 
@@ -997,10 +1645,12 @@ __all__ = [
     "PDFDownload",
     "PDFDownloadError",
     "PDFEvidence",
+    "PDFParameterRow",
     "PDFParseError",
     "PDFText",
     "download_pdf",
     "extract_pdf_evidence",
+    "extract_model_parameter_rows",
     "looks_like_pdf_url",
     "parse_pdf_text",
 ]

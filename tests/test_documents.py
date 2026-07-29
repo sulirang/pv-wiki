@@ -124,6 +124,64 @@ def sun2000l_fixed_width_layout(*, repeated_rows: int = 1) -> str:
     return "\n".join((header, suffixes, *rows))
 
 
+def r5_fixed_width_layout(*, tail_chars: int = 0) -> str:
+    """Representative single-row model table from the SAJ R5 series manual."""
+
+    gap = " " * 12
+    lines = [
+        "R5-8K/9K/10K/12K-T2-15",
+        gap.join(
+            (
+                "Type",
+                "R5-8K-T2-15",
+                "R5-9K-T2-15",
+                "R5-10K-T2-15",
+                "R5-12K-T2-15",
+            )
+        ),
+        "Input (DC)",
+        gap.join(
+            (
+                "Max. PV Array Power [Wp]@STC",
+                "12000",
+                "13500",
+                "15000",
+                "15600",
+            )
+        ),
+        "Max. DC Voltage [V]" + (" " * 60) + "1100",
+        "MPPT Voltage Range [V]" + (" " * 55) + "160-950",
+        gap.join(
+            (
+                "Max. DC Input Current [A]",
+                "15/15",
+                "15/15",
+                "15/15",
+                "15/15",
+            )
+        ),
+        # Two grouped values cannot be bound safely to four model columns.
+        "European Efficiency" + (" " * 28) + "98.2%" + (" " * 28) + "98.3%",
+        "Output (AC)",
+        gap.join(
+            (
+                "Rated AC Power [W]",
+                "8000",
+                "9000",
+                "10000",
+                "12000",
+            )
+        ),
+        "Efficiency",
+        "Max. Efficiency" + (" " * 60) + "98.6%",
+        "General Data",
+        "Ingress Protection" + (" " * 60) + "IP65",
+    ]
+    if tail_chars:
+        lines.append("TARGET-PAGE-TAIL " + ("z" * tail_chars))
+    return "\n".join(lines)
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -212,7 +270,10 @@ class PDFDocumentTests(unittest.TestCase):
             "98.0 %\t98.0 %",
             enriched,
         )
-        self.assertNotIn("Max. input voltage\t600 V", enriched)
+        self.assertIn(
+            "Max. input voltage\t600 V\t600 V\t600 V\t600 V\t600 V",
+            enriched,
+        )
         self.assertTrue(
             decision.text_contains_catalogue_identity(
                 "SUN2000L-4.6KTL",
@@ -255,6 +316,114 @@ class PDFDocumentTests(unittest.TestCase):
                 expected_product_name="SUN2000L-4.6KTL",
             )
         )
+
+    def test_single_line_model_header_emits_auditable_tsv(self) -> None:
+        enriched = documents._page_text_with_derived_layout_tables(
+            r5_fixed_width_layout()
+        )
+
+        self.assertIn(
+            "[Derived PDF layout table 1]\n"
+            "Type\tR5-8K-T2-15\tR5-9K-T2-15\t"
+            "R5-10K-T2-15\tR5-12K-T2-15\n",
+            enriched,
+        )
+        self.assertIn(
+            "Rated AC Power [W]\t8000 W\t9000 W\t10000 W\t12000 W",
+            enriched,
+        )
+
+    def test_extract_model_parameter_rows_binds_r5_target_and_sections(self) -> None:
+        source = r5_fixed_width_layout()
+        rows = documents.extract_model_parameter_rows(
+            [(20, source)],
+            ("R5-10K-T2-15",),
+        )
+        by_label = {row.source_label: row for row in rows}
+
+        self.assertEqual(
+            (
+                "15000",
+                "Wp",
+                "Input (DC)",
+                20,
+                1,
+            ),
+            (
+                by_label["Max. PV Array Power [Wp]@STC"].value,
+                by_label["Max. PV Array Power [Wp]@STC"].unit,
+                by_label["Max. PV Array Power [Wp]@STC"].section,
+                by_label["Max. PV Array Power [Wp]@STC"].page,
+                by_label["Max. PV Array Power [Wp]@STC"].order,
+            ),
+        )
+        self.assertEqual("1100", by_label["Max. DC Voltage [V]"].value)
+        self.assertEqual("V", by_label["Max. DC Voltage [V]"].unit)
+        self.assertEqual("10000", by_label["Rated AC Power [W]"].value)
+        self.assertEqual("Output (AC)", by_label["Rated AC Power [W]"].section)
+        self.assertEqual("98.6", by_label["Max. Efficiency"].value)
+        self.assertEqual("%", by_label["Max. Efficiency"].unit)
+        self.assertEqual("IP65", by_label["Ingress Protection"].value)
+        self.assertNotIn("European Efficiency", by_label)
+        self.assertEqual(
+            "Type\tR5-8K-T2-15\tR5-9K-T2-15\t"
+            "R5-10K-T2-15\tR5-12K-T2-15",
+            by_label["Rated AC Power [W]"].model_quote,
+        )
+        self.assertEqual(
+            "Rated AC Power [W]\t8000 W\t9000 W\t10000 W\t12000 W",
+            by_label["Rated AC Power [W]"].quote,
+        )
+        self.assertTrue(
+            decision._structured_table_quote_supports_fact(
+                model_quote=by_label["Rated AC Power [W]"].model_quote,
+                fact_quote=by_label["Rated AC Power [W]"].quote,
+                name="Rated AC Power [W]",
+                value=10000,
+                unit="W",
+                expected_product_name="R5-10K-T2-15",
+                source_body=documents._page_text_with_derived_layout_tables(
+                    source
+                ),
+            )
+        )
+
+    def test_extract_model_parameter_rows_supports_split_model_header(self) -> None:
+        rows = documents.extract_model_parameter_rows(
+            [(7, sun2000l_fixed_width_layout())],
+            "SUN2000L-4.6KTL",
+        )
+        rated = next(
+            row
+            for row in rows
+            if row.source_label == "Rated output power"
+        )
+
+        self.assertEqual("4,600", rated.value)
+        self.assertEqual("W", rated.unit)
+        self.assertEqual(7, rated.page)
+        self.assertIn("SUN2000L-4.6KTL", rated.model_quote)
+
+    def test_grouped_values_are_not_misclassified_as_shared_parameters(self) -> None:
+        row = (
+            "European Efficiency"
+            + (" " * 28)
+            + "98.2%"
+            + (" " * 28)
+            + "98.3%"
+        )
+
+        self.assertIsNone(
+            documents._shared_layout_data_row(row, column_count=4)
+        )
+        labels = {
+            item.source_label
+            for item in documents.extract_model_parameter_rows(
+                [(20, r5_fixed_width_layout())],
+                ("R5-10K-T2-15",),
+            )
+        }
+        self.assertNotIn("European Efficiency", labels)
 
     def test_derived_layout_projection_is_row_bounded(self) -> None:
         enriched = documents._page_text_with_derived_layout_tables(
@@ -313,6 +482,60 @@ class PDFDocumentTests(unittest.TestCase):
             self.assertIn(f"[PDF page {page_number}/6]", text)
             self.assertIn(f"RAW-PAGE-{page_number}", text)
             self.assertIn(f"[End PDF page {page_number}]", text)
+
+    def test_target_table_page_is_preserved_before_non_target_page_details(self) -> None:
+        pages = [
+            documents._PDFPageLayoutText(
+                page_number=page_number,
+                raw_text=(
+                    r5_fixed_width_layout(tail_chars=1_200)
+                    if page_number == 20
+                    else (
+                        f"NON-TARGET-{page_number}\n"
+                        + (f"page-{page_number}-detail " * 200)
+                    )
+                ),
+                derived_tables=(
+                    documents._derived_layout_blocks(
+                        documents._derived_layout_table_text(
+                            r5_fixed_width_layout()
+                        )
+                    )
+                    if page_number == 20
+                    else ()
+                ),
+            )
+            for page_number in range(1, 61)
+        ]
+
+        text, extracted_pages, truncated = documents._assemble_pdf_page_texts(
+            pages,
+            page_count=60,
+            max_chars=8_000,
+            target_models=("R5-10K-T2-15",),
+        )
+
+        self.assertEqual(8_000, len(text))
+        self.assertEqual(60, extracted_pages)
+        self.assertTrue(truncated)
+        self.assertIn("TARGET-PAGE-TAIL", text)
+        self.assertIn(
+            "Type\tR5-8K-T2-15\tR5-9K-T2-15\t"
+            "R5-10K-T2-15\tR5-12K-T2-15",
+            text,
+        )
+        parsed_rows = documents.extract_model_parameter_rows(
+            text,
+            ("R5-10K-T2-15",),
+        )
+        self.assertEqual(
+            "10000",
+            next(
+                row.value
+                for row in parsed_rows
+                if row.source_label == "Rated AC Power [W]"
+            ),
+        )
 
     def test_download_pins_public_dns_and_validates_pdf_wire_format(self) -> None:
         body = minimal_text_pdf("MODEL-42 " + ("specification " * 20))
@@ -510,6 +733,60 @@ class PDFDocumentTests(unittest.TestCase):
             max_pages=20,
             max_chars=30_000,
             timeout=6,
+        )
+
+    def test_extract_propagates_target_models_and_local_parameter_rows(self) -> None:
+        content = minimal_text_pdf("R5-10K-T2-15 " + ("datasheet " * 30))
+        downloaded = documents.PDFDownload(
+            requested_url="https://maker.example/r5.pdf",
+            final_url="https://maker.example/r5.pdf",
+            content=content,
+            sha256="b" * 64,
+            content_type="application/pdf",
+        )
+        row = documents.PDFParameterRow(
+            model="R5-10K-T2-15",
+            source_label="Rated AC Power [W]",
+            value="10000",
+            unit="W",
+            section="Output (AC)",
+            page=20,
+            order=1,
+            model_quote=(
+                "Type\tR5-8K-T2-15\tR5-9K-T2-15\t"
+                "R5-10K-T2-15\tR5-12K-T2-15"
+            ),
+            quote="Rated AC Power [W]\t8000 W\t9000 W\t10000 W\t12000 W",
+        )
+        parsed = documents.PDFText(
+            text="[PDF page 20/60]\nR5-10K-T2-15\n[End PDF page 20]",
+            page_count=60,
+            extracted_pages=60,
+            truncated=True,
+            parameter_rows=(row,),
+        )
+        downloader = mock.Mock(return_value=downloaded)
+        parser = mock.Mock(return_value=parsed)
+
+        evidence = documents.extract_pdf_evidence(
+            downloaded.requested_url,
+            max_bytes=1_000_000,
+            max_pages=60,
+            max_chars=30_000,
+            download_timeout=5,
+            parse_timeout=6,
+            target_models=("R5-10K-T2-15",),
+            downloader=downloader,
+            parser=parser,
+        )
+
+        self.assertEqual((row,), evidence.parameter_rows)
+        parser.assert_called_once_with(
+            content,
+            max_pages=60,
+            max_chars=30_000,
+            timeout=6,
+            target_models=("R5-10K-T2-15",),
         )
 
 

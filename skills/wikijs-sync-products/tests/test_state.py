@@ -4,8 +4,10 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -46,6 +48,115 @@ class StateStoreTests(unittest.TestCase):
             ),
             state._postgres_placeholders(sql),
         )
+
+    def test_parse_time_accepts_postgres_timestamptz_datetime(self) -> None:
+        value = datetime(
+            2026,
+            1,
+            1,
+            13,
+            0,
+            tzinfo=timezone(timedelta(hours=1)),
+        )
+
+        self.assertEqual(T0, state._parse_time(value))
+
+    def test_postgres_publication_fence_uses_independent_session_lock(
+        self,
+    ) -> None:
+        class FakeConnection:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def execute(self, statement, parameters=()):
+                self.calls.append((statement, tuple(parameters)))
+
+        connection = FakeConnection()
+
+        @contextmanager
+        def connection_scope():
+            yield connection
+
+        store = object.__new__(state.StateStore)
+        store.backend = "postgresql"
+        store._connection = connection_scope
+
+        with store.publication_fence():
+            pass
+
+        lock_calls = [
+            call
+            for call in connection.calls
+            if "pg_advisory_lock" in call[0]
+            and "unlock" not in call[0]
+        ]
+        unlock_calls = [
+            call
+            for call in connection.calls
+            if "pg_advisory_unlock" in call[0]
+        ]
+        self.assertEqual(
+            [("SELECT pg_advisory_lock(?)", (state._POSTGRES_PUBLICATION_LOCK,))],
+            lock_calls,
+        )
+        self.assertEqual(
+            [
+                (
+                    "SELECT pg_advisory_unlock(?)",
+                    (state._POSTGRES_PUBLICATION_LOCK,),
+                )
+            ],
+            unlock_calls,
+        )
+        self.assertNotEqual(
+            state._POSTGRES_ADVISORY_LOCK,
+            state._POSTGRES_PUBLICATION_LOCK,
+        )
+
+    def test_postgres_v10_migration_rechecks_version_under_lock(self) -> None:
+        class Cursor:
+            def __init__(self, row):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class InitialConnection:
+            def execute(self, statement, _parameters=()):
+                if "to_regclass" in statement:
+                    return Cursor({"metadata_table": "state_metadata"})
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": 9})
+                raise AssertionError(f"unexpected initial SQL: {statement}")
+
+        class LockedConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, _parameters=()):
+                self.calls.append(statement)
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": state.SCHEMA_VERSION})
+                raise AssertionError(f"DDL should have been skipped: {statement}")
+
+        initial = InitialConnection()
+        locked = LockedConnection()
+
+        @contextmanager
+        def initial_scope():
+            yield initial
+
+        @contextmanager
+        def locked_scope():
+            yield locked
+
+        store = object.__new__(state.StateStore)
+        store.backend = "postgresql"
+        store._connection = initial_scope
+        store._write_transaction = locked_scope
+
+        self.assertEqual(state.SCHEMA_VERSION, store._migrate_postgresql())
+        self.assertEqual(1, len(locked.calls))
 
     def test_creates_missing_parent_for_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -96,6 +207,27 @@ class StateStoreTests(unittest.TestCase):
             self.store.get_product("P-1").leased_from_next_run_at,
         )
         self.assertEqual([], self.store.requeue_event_history())
+
+    def test_sqlite_publication_fence_serializes_store_instances(self):
+        other = state.StateStore(self.path)
+        started = threading.Event()
+        acquired = threading.Event()
+
+        def acquire_other() -> None:
+            started.set()
+            with other.publication_fence():
+                acquired.set()
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with self.store.publication_fence():
+                    future = executor.submit(acquire_other)
+                    self.assertTrue(started.wait(1))
+                    self.assertFalse(acquired.wait(0.1))
+                self.assertTrue(acquired.wait(2))
+                future.result()
+        finally:
+            other.close()
 
     def test_changed_database_row_is_rescheduled_immediately(self):
         self.store.upsert_product(product(), now=T0)
@@ -437,9 +569,90 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual("Acme Public", published[0].decision["manufacturer"])
         self.assertEqual("products/p-1-a1", published[0].wiki_path)
         self.assertEqual(T0 + timedelta(minutes=1), published[0].published_at)
+        self.assertEqual("Panel", published[0].payload["product_name"])
+        self.assertEqual(0, published[0].content_schema_version)
 
         with self.assertRaisesRegex(ValueError, "positive integer"):
             self.store.published_products(limit=0)
+
+    def test_content_refresh_uses_last_synced_snapshot_and_audits_counts(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("publisher", now=T0)
+        verified_at = T0 + timedelta(minutes=1)
+        self.store.record_outcome(
+            lease,
+            "synced",
+            payload={
+                "decision": {
+                    "outcome": "publish",
+                    "manufacturer": "Acme Public",
+                    "model": "Panel One",
+                    "facts": [{"name": "Power", "value": 42}],
+                },
+                "validation_policy_fingerprint": "verified-policy",
+                "fact_diagnostics": {
+                    "complete": True,
+                    "proposed": 2,
+                    "retained": 1,
+                    "rejected": 1,
+                    "rejection_reasons": {"validation_failed": 1},
+                },
+            },
+            wiki_path="products/p-1-a1",
+            now=verified_at,
+        )
+        self.store.upsert_product(
+            product(
+                name="Panel unverified revision B",
+                updated_at=T0 + timedelta(days=1),
+            ),
+            now=T0 + timedelta(days=1),
+        )
+
+        candidates = self.store.content_refresh_candidates(1)
+
+        self.assertEqual(1, len(candidates))
+        candidate = candidates[0]
+        self.assertEqual("Panel", candidate.payload["product_name"])
+        self.assertEqual("products/p-1-a1", candidate.wiki_path)
+        self.assertEqual(verified_at, candidate.verified_at)
+        self.assertEqual(0, candidate.previous_content_schema_version)
+        self.assertEqual(1, candidate.fact_diagnostics["retained"])
+        event = self.store.record_content_refresh(
+            candidate,
+            1,
+            wiki_action="updated",
+            fact_diagnostics=candidate.fact_diagnostics,
+            now=T0 + timedelta(days=2),
+        )
+
+        self.assertEqual(0, event.previous_content_schema_version)
+        self.assertEqual(1, event.content_schema_version)
+        self.assertEqual("updated", event.wiki_action)
+        self.assertEqual(
+            1,
+            self.store.get_product("P-1").content_schema_version,
+        )
+        self.assertEqual([], self.store.content_refresh_candidates(1))
+        self.assertEqual(
+            [event],
+            self.store.content_refresh_event_history("P-1"),
+        )
+
+    def test_synced_outcome_can_record_current_content_schema(self):
+        self.store.upsert_product(product(), now=T0)
+        lease = self.store.lease_next("publisher", now=T0)
+
+        self.store.record_outcome(
+            lease,
+            "synced",
+            content_schema_version=3,
+            now=T0 + timedelta(seconds=1),
+        )
+
+        current = self.store.get_product("P-1")
+        self.assertEqual(3, current.content_schema_version)
+        self.assertEqual([], self.store.content_refresh_candidates(3))
 
     def test_failures_back_off_30_90_then_180_days(self):
         self.store.upsert_product(product(), now=T0)
@@ -2873,12 +3086,14 @@ class StateStoreTests(unittest.TestCase):
             self.assertIn("research_actions_scope_idx", research_indexes)
             self.assertIn("scope_fingerprint", research_columns)
             self.assertIn("requeue_events", tables)
+            self.assertIn("content_refresh_events", tables)
             self.assertIn(
                 "content_failure_cutoff_attempt_id",
                 product_columns,
             )
             self.assertIn("leased_from_status", product_columns)
             self.assertIn("leased_from_next_run_at", product_columns)
+            self.assertIn("content_schema_version", product_columns)
             self.assertIn("requeue_events_product_idx", requeue_indexes)
             legacy_product = migrated.get_product("LEGACY")
             self.assertEqual("due", legacy_product.leased_from_status)

@@ -6,6 +6,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -235,22 +236,112 @@ _DERIVED_TABLE_START_RE = re.compile(
 _DERIVED_TABLE_END_RE = re.compile(
     r"\[End derived PDF layout table ([1-9]\d*)\]"
 )
-_PRODUCT_CATEGORY_ALIASES = {
-    "heat pump": "热泵",
-    "heat pumps": "热泵",
-    "air source heat pump": "热泵",
-    "air-to-water heat pump": "热泵",
-    "ground source heat pump": "热泵",
-    "water source heat pump": "热泵",
-    "空气源热泵": "热泵",
-    "空气能热泵": "热泵",
-    "地源热泵": "热泵",
-    "水源热泵": "热泵",
-    "solar inverter": "光伏逆变器",
-    "photovoltaic inverter": "光伏逆变器",
-    "pv inverter": "光伏逆变器",
-    "太阳能逆变器": "光伏逆变器",
+PRODUCT_CATEGORY_LABELS = {
+    "pv_cell": "光伏电池",
+    "pv_module": "光伏组件",
+    "energy_storage_battery": "储能电池",
+    "inverter": "逆变器",
+    "energy_storage_system": "储能系统",
+    "heat_pump": "热泵",
+    "ev_charging": "充电设备",
+    "power_electronics": "电力电子设备",
+    "thermal_equipment": "热能设备",
+    "solar_equipment": "光伏设备",
+    "accessory": "配件",
+    "other": "其他",
 }
+_PRODUCT_CATEGORY_ALIASES = {
+    # Photovoltaic cells and complete modules remain separate broad catalogue
+    # classes, while wattage, cell technology and dimensions belong in
+    # ``product_type`` or parameters.
+    "solar cell": "pv_cell",
+    "photovoltaic cell": "pv_cell",
+    "pv cell": "pv_cell",
+    "太阳能电池": "pv_cell",
+    "光伏电池": "pv_cell",
+    "solar module": "pv_module",
+    "photovoltaic module": "pv_module",
+    "pv module": "pv_module",
+    "solar panel": "pv_module",
+    "太阳能组件": "pv_module",
+    "太阳能光伏组件": "pv_module",
+    "太阳能板": "pv_module",
+    "光伏组件": "pv_module",
+    # Phase count, grid mode, topology and MPPT count are deliberately types or
+    # parameters, never public catalogue categories.
+    "solar inverter": "inverter",
+    "photovoltaic inverter": "inverter",
+    "pv inverter": "inverter",
+    "grid-tied inverter": "inverter",
+    "grid connected inverter": "inverter",
+    "hybrid inverter": "inverter",
+    "single-phase hybrid inverter": "inverter",
+    "microinverter": "inverter",
+    "太阳能逆变器": "inverter",
+    "光伏逆变器": "inverter",
+    "并网逆变器": "inverter",
+    "混合逆变器": "inverter",
+    "储能逆变器": "inverter",
+    "微型逆变器": "inverter",
+    "三相太阳能逆变器": "inverter",
+    "三相并网逆变器": "inverter",
+    "三相并网太阳能逆变器": "inverter",
+    "三相太阳能并网逆变器": "inverter",
+    "单相太阳能逆变器": "inverter",
+    "单相光伏逆变器": "inverter",
+    "battery": "energy_storage_battery",
+    "battery module": "energy_storage_battery",
+    "lithium battery": "energy_storage_battery",
+    "energy storage battery": "energy_storage_battery",
+    "储能电池": "energy_storage_battery",
+    "锂电池": "energy_storage_battery",
+    "energy storage system": "energy_storage_system",
+    "battery energy storage system": "energy_storage_system",
+    "ess": "energy_storage_system",
+    "bess": "energy_storage_system",
+    "储能系统": "energy_storage_system",
+    "heat pump": "heat_pump",
+    "heat pumps": "heat_pump",
+    "air source heat pump": "heat_pump",
+    "air-to-water heat pump": "heat_pump",
+    "ground source heat pump": "heat_pump",
+    "water source heat pump": "heat_pump",
+    "空气源热泵": "heat_pump",
+    "空气能热泵": "heat_pump",
+    "地源热泵": "heat_pump",
+    "水源热泵": "heat_pump",
+    "热泵": "heat_pump",
+    "ev charger": "ev_charging",
+    "electric vehicle charger": "ev_charging",
+    "charging station": "ev_charging",
+    "充电桩": "ev_charging",
+    "充电设备": "ev_charging",
+    "converter": "power_electronics",
+    "power converter": "power_electronics",
+    "power supply": "power_electronics",
+    "变流器": "power_electronics",
+    "电源": "power_electronics",
+    "电力电子设备": "power_electronics",
+    "compressor": "thermal_equipment",
+    "压缩机": "thermal_equipment",
+    "热能设备": "thermal_equipment",
+    "solar pile driver": "solar_equipment",
+    "光伏施工设备": "solar_equipment",
+    "光伏设备": "solar_equipment",
+    "accessory": "accessory",
+    "accessories": "accessory",
+    "heat pump accessories": "accessory",
+    "附件": "accessory",
+    "配件": "accessory",
+    "other": "other",
+    "其他": "other",
+    "fastener": "other",
+    "fasteners": "other",
+    "紧固件": "other",
+}
+for _category_code, _category_label in PRODUCT_CATEGORY_LABELS.items():
+    _PRODUCT_CATEGORY_ALIASES.setdefault(_category_code, _category_code)
+    _PRODUCT_CATEGORY_ALIASES.setdefault(_category_label.casefold(), _category_code)
 _TOP_LEVEL = frozenset(
     {
         "schema_version",
@@ -261,8 +352,11 @@ _TOP_LEVEL = frozenset(
         "manufacturer",
         "manufacturer_zh",
         "model",
+        "product_description_zh",
         "display_title_zh",
+        "product_category_code",
         "product_category",
+        "product_type",
         "summary",
         "review_summary",
         "review_evidence_urls",
@@ -271,11 +365,27 @@ _TOP_LEVEL = frozenset(
         "decision_notes",
         "datasheets",
         "sources",
+        "datasheet_parameters",
         "facts",
+        "derived_insights",
         "conflicts",
     }
 )
 _HAN_TEXT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_DERIVED_FORMULA_NUMBER = (
+    r"[+\-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+\-]?\d+)?"
+)
+_DERIVED_FORMULA_RE = re.compile(
+    rf"^\s*({_DERIVED_FORMULA_NUMBER})\s*([+\-*/×÷])\s*"
+    rf"({_DERIVED_FORMULA_NUMBER})\s*$"
+)
+_SOURCE_NUMERIC_RE = re.compile(
+    r"^[+\-]?(?:"
+    r"\d{1,3}(?:[,\u00a0\u202f ]\d{3})+(?:\.\d+)?"
+    r"|\d+(?:\.\d+)?"
+    r"|\.\d+"
+    r")(?:[eE][+\-]?\d+)?$"
+)
 
 
 class DecisionError(ValueError):
@@ -286,11 +396,30 @@ class SourceVerificationError(DecisionError):
     """Raised when publication evidence cannot verify its claimed authority."""
 
 
-def canonical_product_category(value: str) -> str:
-    """Normalize common source-language aliases into broad reader categories."""
+def canonical_product_category_code(value: str) -> str:
+    """Return a closed broad-category code for one code, label, or known alias."""
 
     cleaned = " ".join(value.split())
-    return _PRODUCT_CATEGORY_ALIASES.get(cleaned.casefold(), cleaned)
+    return _PRODUCT_CATEGORY_ALIASES.get(cleaned.casefold(), "")
+
+
+def product_category_label(code: str) -> str:
+    """Return the fixed Simplified Chinese label for a broad category code."""
+
+    return PRODUCT_CATEGORY_LABELS.get(code, "")
+
+
+def canonical_product_category(value: str) -> str:
+    """Normalize a known source-language alias into a broad Chinese label.
+
+    Unknown text is retained for historical read compatibility. New decisions
+    still fail closed in :func:`validate_decision` unless the value resolves to
+    one of :data:`PRODUCT_CATEGORY_LABELS`.
+    """
+
+    cleaned = " ".join(value.split())
+    code = canonical_product_category_code(cleaned)
+    return product_category_label(code) if code else cleaned
 
 
 def _text(value: Any, field: str, *, required: bool = False, limit: int = 2000) -> str:
@@ -341,6 +470,104 @@ def _scalar(value: Any, field: str) -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         raise DecisionError(f"{field} must be finite")
     return value
+
+
+def _source_decimal(value: Any, field: str) -> Decimal:
+    """Return one exact numeric parameter value without interpreting its unit."""
+
+    if isinstance(value, bool):
+        raise DecisionError(f"{field} must be a numeric verified parameter")
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise DecisionError(f"{field} must be finite")
+        candidate = str(value)
+    elif isinstance(value, str):
+        candidate = unicodedata.normalize("NFKC", value).strip()
+        if _SOURCE_NUMERIC_RE.fullmatch(candidate) is None:
+            raise DecisionError(f"{field} must be a numeric verified parameter")
+        candidate = re.sub(r"[,\u00a0\u202f ]", "", candidate)
+    else:
+        raise DecisionError(f"{field} must be a numeric verified parameter")
+    try:
+        number = Decimal(candidate)
+    except InvalidOperation as exc:
+        raise DecisionError(
+            f"{field} must be a numeric verified parameter"
+        ) from exc
+    if not number.is_finite():
+        raise DecisionError(f"{field} must be finite")
+    return number
+
+
+def _recompute_derived_insight(
+    *,
+    formula: str,
+    reported_value: Any,
+    basis_values: tuple[Any, Any],
+    prefix: str,
+) -> int | float:
+    """Validate and recompute one strictly binary arithmetic comparison."""
+
+    match = _DERIVED_FORMULA_RE.fullmatch(formula)
+    if match is None:
+        raise DecisionError(
+            f"{prefix}.formula must be exactly two numeric literals joined by "
+            "one of +, -, *, /, ×, or ÷"
+        )
+    operands = (
+        _source_decimal(match.group(1), f"{prefix}.formula operand 1"),
+        _source_decimal(match.group(3), f"{prefix}.formula operand 2"),
+    )
+    expected_operands = (
+        _source_decimal(basis_values[0], f"{prefix}.basis[0] value"),
+        _source_decimal(basis_values[1], f"{prefix}.basis[1] value"),
+    )
+    if operands != expected_operands:
+        raise DecisionError(
+            f"{prefix}.formula operands must respectively equal the two basis "
+            "source values"
+        )
+
+    if (
+        isinstance(reported_value, bool)
+        or not isinstance(reported_value, (int, float))
+        or (
+            isinstance(reported_value, float)
+            and not math.isfinite(reported_value)
+        )
+    ):
+        raise DecisionError(f"{prefix}.value must be a finite number")
+    reported = Decimal(str(reported_value))
+    operator = match.group(2)
+    with localcontext() as context:
+        context.prec = 50
+        if operator == "+":
+            recomputed = operands[0] + operands[1]
+        elif operator == "-":
+            recomputed = operands[0] - operands[1]
+        elif operator in {"*", "×"}:
+            recomputed = operands[0] * operands[1]
+        else:
+            if operands[1] == 0:
+                raise DecisionError(
+                    f"{prefix}.formula cannot divide by zero"
+                )
+            recomputed = operands[0] / operands[1]
+
+    tolerance = max(
+        abs(recomputed) * Decimal("1e-9"),
+        Decimal("1e-12"),
+    )
+    if abs(reported - recomputed) > tolerance:
+        raise DecisionError(
+            f"{prefix}.value does not match the runtime-recomputed formula"
+        )
+    if recomputed == recomputed.to_integral_value():
+        return int(recomputed)
+    result = float(recomputed)
+    if not math.isfinite(result):
+        raise DecisionError(f"{prefix}.value is outside the supported numeric range")
+    return result
 
 
 def identity_key(value: str) -> str:
@@ -1390,6 +1617,7 @@ def _decision_identifies_generic_hardware(
     *,
     model: str,
     product_category: str,
+    product_type: str,
     summary: str,
 ) -> bool:
     """Return whether identity-bearing fields describe commodity hardware."""
@@ -1397,7 +1625,7 @@ def _decision_identifies_generic_hardware(
     if any(
         _OUT_OF_SCOPE_ENGLISH_TYPE_RE.search(value) is not None
         or any(term in value for term in _OUT_OF_SCOPE_CJK_TYPE_TERMS)
-        for value in (model, product_category)
+        for value in (model, product_category, product_type)
     ):
         return True
     normalized_summary = re.sub(
@@ -1432,6 +1660,14 @@ def _require_list(decision: Mapping[str, Any], name: str, limit: int) -> list[An
     if len(value) > limit:
         raise DecisionError(f"{name} may contain at most {limit} entries")
     return value
+
+
+def _optional_list(decision: Mapping[str, Any], name: str, limit: int) -> list[Any]:
+    """Return a bounded list while accepting absence in historical decisions."""
+
+    if name not in decision:
+        return []
+    return _require_list(decision, name, limit)
 
 
 def validate_decision(
@@ -1497,23 +1733,62 @@ def validate_decision(
             "catalogue brand identity"
         )
     model = _text(raw.get("model"), "model", limit=300)
-    display_title_zh = _text(
+    product_description_zh = _text(
+        raw.get("product_description_zh"),
+        "product_description_zh",
+        limit=200,
+    )
+    legacy_display_title_zh = _text(
         raw.get("display_title_zh"),
         "display_title_zh",
         limit=200,
     )
+    if not product_description_zh:
+        product_description_zh = legacy_display_title_zh
     manufacturer_zh = _text(
         raw.get("manufacturer_zh"),
         "manufacturer_zh",
         limit=200,
     )
-    product_category = canonical_product_category(
-        _text(raw.get("product_category"), "product_category", limit=100)
+    raw_product_category = _text(
+        raw.get("product_category"),
+        "product_category",
+        limit=100,
     )
+    product_category_code = _text(
+        raw.get("product_category_code"),
+        "product_category_code",
+        limit=50,
+    )
+    if product_category_code and product_category_code not in PRODUCT_CATEGORY_LABELS:
+        raise DecisionError(
+            "product_category_code must be one of the documented broad categories"
+        )
+    category_from_label = canonical_product_category_code(raw_product_category)
+    if raw_product_category and not category_from_label:
+        raise DecisionError(
+            "product_category must resolve to one of the documented broad categories"
+        )
+    if (
+        product_category_code
+        and category_from_label
+        and category_from_label != product_category_code
+    ):
+        raise DecisionError(
+            "product_category does not match product_category_code"
+        )
+    product_category_code = product_category_code or category_from_label
+    product_category = product_category_label(product_category_code)
+    product_type = _text(raw.get("product_type"), "product_type", limit=100)
+    if not product_type and raw_product_category:
+        # Historical decisions carried the fine-grained type in
+        # ``product_category``. Preserve that reader information while
+        # canonicalising the public category.
+        product_type = raw_product_category
     if outcome == "publish":
-        display_title_zh = _chinese_display_text(
-            display_title_zh,
-            "display_title_zh",
+        product_description_zh = _chinese_display_text(
+            product_description_zh,
+            "product_description_zh",
             required=True,
             limit=200,
         )
@@ -1526,6 +1801,12 @@ def validate_decision(
         product_category = _chinese_display_text(
             product_category,
             "product_category",
+            required=True,
+            limit=100,
+        )
+        product_type = _chinese_display_text(
+            product_type,
+            "product_type",
             required=True,
             limit=100,
         )
@@ -1768,57 +2049,61 @@ def validate_decision(
             "community sources may be cited only as review evidence"
         )
 
-    facts: list[dict[str, Any]] = []
-    fact_name_keys: set[str] = set()
-    for index, item in enumerate(_require_list(raw, "facts", 100)):
+    def normalize_grounded_parameter(
+        item: Any,
+        *,
+        collection: str,
+        index: int,
+        grouping_field: str,
+    ) -> dict[str, Any]:
+        """Normalize one source-grounded parameter using the fact safety gate."""
+
+        prefix = f"{collection}[{index}]"
         if not isinstance(item, Mapping):
-            raise DecisionError(f"facts[{index}] must be an object")
-        unknown_item = set(item) - {
+            raise DecisionError(f"{prefix} must be an object")
+        allowed_fields = {
             "name",
-            "category",
+            grouping_field,
             "value",
             "unit",
             "confidence",
             "evidence_urls",
             "evidence_quotes",
         }
-        if unknown_item:
-            raise DecisionError(f"facts[{index}] has unknown fields")
-        value = _scalar(item.get("value"), f"facts[{index}].value")
+        if set(item) - allowed_fields:
+            raise DecisionError(f"{prefix} has unknown fields")
+        value = _scalar(item.get("value"), f"{prefix}.value")
         evidence_raw = item.get("evidence_urls")
         if not isinstance(evidence_raw, list) or not evidence_raw:
-            raise DecisionError(f"facts[{index}].evidence_urls must be non-empty")
+            raise DecisionError(f"{prefix}.evidence_urls must be non-empty")
         evidence = [
-            validate_public_url(url, f"facts[{index}].evidence_urls")
+            validate_public_url(url, f"{prefix}.evidence_urls")
             for url in evidence_raw
         ]
-        fact_confidence = _confidence(
-            item.get("confidence"), f"facts[{index}].confidence"
+        item_confidence = _confidence(
+            item.get("confidence"),
+            f"{prefix}.confidence",
         )
-        if fact_confidence < minimum_fact_confidence:
+        if item_confidence < minimum_fact_confidence:
             raise DecisionError(
-                f"facts[{index}].confidence is below the configured threshold"
+                f"{prefix}.confidence is below the configured threshold"
             )
         if not set(evidence) <= declared_urls:
             raise DecisionError(
-                f"facts[{index}].evidence_urls must reference declared sources"
+                f"{prefix}.evidence_urls must reference declared sources"
             )
         if set(evidence) & community_urls:
             raise DecisionError(
-                f"facts[{index}] cannot use community review evidence"
+                f"{prefix} cannot use community review evidence"
             )
         name = _text(
             item.get("name"),
-            f"facts[{index}].name",
+            f"{prefix}.name",
             required=True,
             limit=200,
         )
-        name_key = identity_key(name)
-        if not name_key or name_key in fact_name_keys:
-            raise DecisionError("fact names must be non-empty and unique")
-        fact_name_keys.add(name_key)
         unit = (
-            _text(item.get("unit"), f"facts[{index}].unit", limit=80)
+            _text(item.get("unit"), f"{prefix}.unit", limit=80)
             if "unit" in item
             else ""
         )
@@ -1827,19 +2112,17 @@ def validate_decision(
             quotes_raw = []
         if not isinstance(quotes_raw, list) or len(quotes_raw) > 5:
             raise DecisionError(
-                f"facts[{index}].evidence_quotes must be an array of at most 5 entries"
+                f"{prefix}.evidence_quotes must be an array of at most 5 entries"
             )
         if outcome == "publish" and not quotes_raw:
             raise DecisionError(
-                f"facts[{index}].evidence_quotes must contain 1-5 entries"
+                f"{prefix}.evidence_quotes must contain 1-5 entries"
             )
         evidence_quotes: list[dict[str, str]] = []
         for quote_index, quote_item in enumerate(quotes_raw):
+            quote_prefix = f"{prefix}.evidence_quotes[{quote_index}]"
             if not isinstance(quote_item, Mapping):
-                raise DecisionError(
-                    f"facts[{index}].evidence_quotes[{quote_index}] "
-                    "must be an object"
-                )
+                raise DecisionError(f"{quote_prefix} must be an object")
             quote_fields = set(quote_item)
             structured_table_quote = "model_quote" in quote_fields
             if quote_fields not in (
@@ -1847,24 +2130,23 @@ def validate_decision(
                 {"url", "quote", "model_quote"},
             ):
                 raise DecisionError(
-                    f"facts[{index}].evidence_quotes[{quote_index}] "
-                    "must contain url and quote, with only an optional "
-                    "model_quote table-header span"
+                    f"{quote_prefix} must contain url and quote, with only an "
+                    "optional model_quote table-header span"
                 )
             quote_url = validate_public_url(
                 quote_item.get("url"),
-                f"facts[{index}].evidence_quotes[{quote_index}].url",
+                f"{quote_prefix}.url",
             )
             quote = _text(
                 quote_item.get("quote"),
-                f"facts[{index}].evidence_quotes[{quote_index}].quote",
+                f"{quote_prefix}.quote",
                 required=True,
                 limit=500,
             )
             if quote_url not in evidence:
                 raise DecisionError(
-                    f"facts[{index}].evidence_quotes URLs must also be "
-                    "listed in evidence_urls"
+                    f"{prefix}.evidence_quotes URLs must also be listed in "
+                    "evidence_urls"
                 )
             if outcome == "publish":
                 grounded_quote = _ground_extract_quote(
@@ -1872,14 +2154,11 @@ def validate_decision(
                     evidence_body_by_url.get(quote_url, ""),
                 )
                 grounded_model_quote: str | None = None
-                supports_fact = False
+                supports_parameter = False
                 if grounded_quote is not None and structured_table_quote:
                     model_quote = _text(
                         quote_item.get("model_quote"),
-                        (
-                            f"facts[{index}].evidence_quotes[{quote_index}]"
-                            ".model_quote"
-                        ),
+                        f"{quote_prefix}.model_quote",
                         required=True,
                         limit=500,
                     )
@@ -1887,7 +2166,7 @@ def validate_decision(
                         model_quote,
                         evidence_body_by_url.get(quote_url, ""),
                     )
-                    supports_fact = (
+                    supports_parameter = (
                         grounded_model_quote is not None
                         and _structured_table_quote_supports_fact(
                             model_quote=grounded_model_quote,
@@ -1903,21 +2182,22 @@ def validate_decision(
                         )
                     )
                 elif grounded_quote is not None:
-                    supports_fact = _quote_supports_fact(
+                    supports_parameter = _quote_supports_fact(
                         grounded_quote,
                         name=name,
                         value=value,
                         unit=unit,
                         expected_product_name=model,
-                        normalized_body=normalized_evidence_text.get(quote_url, ""),
+                        normalized_body=normalized_evidence_text.get(
+                            quote_url,
+                            "",
+                        ),
                     )
-                if not supports_fact:
+                if not supports_parameter:
                     raise DecisionError(
-                        f"facts[{index}].evidence_quotes[{quote_index}] is not "
-                        "an exact supporting extract span"
+                        f"{quote_prefix} is not an exact supporting extract span"
                     )
-                quote = grounded_quote
-                normalized_quote = {"url": quote_url, "quote": quote}
+                normalized_quote = {"url": quote_url, "quote": grounded_quote}
                 if grounded_model_quote is not None:
                     normalized_quote["model_quote"] = grounded_model_quote
                 evidence_quotes.append(normalized_quote)
@@ -1926,28 +2206,175 @@ def validate_decision(
                 if structured_table_quote:
                     normalized_quote["model_quote"] = _text(
                         quote_item.get("model_quote"),
-                        (
-                            f"facts[{index}].evidence_quotes[{quote_index}]"
-                            ".model_quote"
-                        ),
+                        f"{quote_prefix}.model_quote",
                         required=True,
                         limit=500,
                     )
                 evidence_quotes.append(normalized_quote)
-        fact = {
+        normalized = {
             "name": name,
             "value": value,
-            "confidence": fact_confidence,
+            "confidence": item_confidence,
             "evidence_urls": evidence,
             "evidence_quotes": evidence_quotes,
         }
         if "unit" in item:
-            fact["unit"] = unit
-        if "category" in item:
-            fact["category"] = _text(
-                item.get("category"), f"facts[{index}].category", limit=100
+            normalized["unit"] = unit
+        if grouping_field in item:
+            normalized[grouping_field] = _text(
+                item.get(grouping_field),
+                f"{prefix}.{grouping_field}",
+                limit=100,
             )
+        return normalized
+
+    facts: list[dict[str, Any]] = []
+    fact_name_keys: set[str] = set()
+    for index, item in enumerate(_require_list(raw, "facts", 100)):
+        if isinstance(item, Mapping):
+            raw_name = _text(
+                item.get("name"),
+                f"facts[{index}].name",
+                required=True,
+                limit=200,
+            )
+            raw_name_key = identity_key(raw_name)
+            if not raw_name_key or raw_name_key in fact_name_keys:
+                raise DecisionError("fact names must be non-empty and unique")
+            fact_name_keys.add(raw_name_key)
+        fact = normalize_grounded_parameter(
+            item,
+            collection="facts",
+            index=index,
+            grouping_field="category",
+        )
+        name_key = identity_key(fact["name"])
+        if not name_key:
+            raise DecisionError("fact names must be non-empty and unique")
         facts.append(fact)
+
+    datasheet_parameters: list[dict[str, Any]] = []
+    parameter_keys: set[tuple[str, str]] = set()
+    for index, item in enumerate(
+        _optional_list(raw, "datasheet_parameters", 30)
+    ):
+        parameter = normalize_grounded_parameter(
+            item,
+            collection="datasheet_parameters",
+            index=index,
+            grouping_field="section",
+        )
+        parameter_key = (
+            identity_key(str(parameter.get("section") or "")),
+            identity_key(parameter["name"]),
+        )
+        if not parameter_key[1] or parameter_key in parameter_keys:
+            raise DecisionError(
+                "datasheet parameter names must be unique within each section"
+            )
+        parameter_keys.add(parameter_key)
+        datasheet_parameters.append(parameter)
+
+    grounded_names: dict[str, str] = {}
+    grounded_parameters: dict[str, dict[str, Any]] = {}
+    ambiguous_grounded_names: set[str] = set()
+    for item in [*datasheet_parameters, *facts]:
+        name_key = identity_key(item["name"])
+        if name_key in grounded_names:
+            ambiguous_grounded_names.add(name_key)
+        else:
+            grounded_names[name_key] = item["name"]
+            grounded_parameters[name_key] = item
+
+    derived_insights: list[dict[str, Any]] = []
+    insight_name_keys: set[str] = set()
+    for index, item in enumerate(_optional_list(raw, "derived_insights", 5)):
+        prefix = f"derived_insights[{index}]"
+        if not isinstance(item, Mapping):
+            raise DecisionError(f"{prefix} must be an object")
+        if set(item) - {
+            "name",
+            "value",
+            "unit",
+            "formula",
+            "basis",
+            "explanation",
+        }:
+            raise DecisionError(f"{prefix} has unknown fields")
+        insight_name = _chinese_display_text(
+            item.get("name"),
+            f"{prefix}.name",
+            required=True,
+            limit=200,
+        )
+        insight_name_key = identity_key(insight_name)
+        if not insight_name_key or insight_name_key in insight_name_keys:
+            raise DecisionError("derived insight names must be non-empty and unique")
+        insight_name_keys.add(insight_name_key)
+        basis_raw = item.get("basis")
+        if not isinstance(basis_raw, list) or len(basis_raw) != 2:
+            raise DecisionError(
+                f"{prefix}.basis must contain exactly 2 parameter names"
+            )
+        basis: list[str] = []
+        basis_keys: set[str] = set()
+        basis_values: list[Any] = []
+        for basis_index, basis_name in enumerate(basis_raw):
+            normalized_basis = _text(
+                basis_name,
+                f"{prefix}.basis[{basis_index}]",
+                required=True,
+                limit=200,
+            )
+            basis_key = identity_key(normalized_basis)
+            if (
+                not basis_key
+                or basis_key not in grounded_names
+                or basis_key in ambiguous_grounded_names
+            ):
+                raise DecisionError(
+                    f"{prefix}.basis must reference unambiguous verified parameters"
+                )
+            if basis_key in basis_keys:
+                raise DecisionError(
+                    f"{prefix}.basis must reference 2 distinct verified parameters"
+                )
+            basis_keys.add(basis_key)
+            canonical_basis = grounded_names[basis_key]
+            basis.append(canonical_basis)
+            basis_values.append(grounded_parameters[basis_key]["value"])
+        formula = _text(
+            item.get("formula"),
+            f"{prefix}.formula",
+            required=True,
+            limit=500,
+        )
+        recomputed_value = _recompute_derived_insight(
+            formula=formula,
+            reported_value=item.get("value"),
+            basis_values=(basis_values[0], basis_values[1]),
+            prefix=prefix,
+        )
+        insight = {
+            "name": insight_name,
+            "value": recomputed_value,
+            "formula": formula,
+            "basis": basis,
+        }
+        if "unit" in item:
+            insight["unit"] = _text(
+                item.get("unit"),
+                f"{prefix}.unit",
+                limit=80,
+            )
+        if "explanation" in item:
+            insight["explanation"] = _chinese_display_text(
+                item.get("explanation"),
+                f"{prefix}.explanation",
+                required=True,
+                limit=500,
+            )
+        derived_insights.append(insight)
 
     conflicts = _require_list(raw, "conflicts", 100)
     normalized_conflicts: list[dict[str, Any]] = []
@@ -1983,15 +2410,16 @@ def validate_decision(
         )
 
     disputed_facts = {
-        identity_key(item["name"]) for item in facts
+        identity_key(item["name"])
+        for item in [*datasheet_parameters, *facts]
     } & conflict_fields
     if disputed_facts:
         raise DecisionError("conflicted fields must not also appear as verified facts")
 
     if outcome in {"no_datasheet", "ambiguous", "insufficient_identity"}:
-        if facts:
+        if facts or datasheet_parameters or derived_insights:
             raise DecisionError(
-                f"{outcome} must not contain verified specification facts"
+                f"{outcome} must not contain verified parameters or derived insights"
             )
         if any(item["is_primary"] for item in datasheets):
             raise DecisionError(
@@ -2035,7 +2463,9 @@ def validate_decision(
             (
                 datasheets,
                 sources,
+                datasheet_parameters,
                 facts,
+                derived_insights,
                 normalized_conflicts,
                 review_summary,
                 review_evidence_urls,
@@ -2086,6 +2516,7 @@ def validate_decision(
         if _decision_identifies_generic_hardware(
             model=model,
             product_category=product_category,
+            product_type=product_type,
             summary=summary,
         ):
             raise DecisionError(
@@ -2160,20 +2591,21 @@ def validate_decision(
             for item in publication_primary
             if item in auto_primary
         }
-        for index, fact in enumerate(facts):
+        grounded_parameters = [*datasheet_parameters, *facts]
+        for index, fact in enumerate(grounded_parameters):
             quoted_urls = {
                 item["url"] for item in fact["evidence_quotes"]
             }
             if configured_primary_urls:
                 if not quoted_urls & configured_primary_urls:
                     raise SourceVerificationError(
-                        f"facts[{index}] needs evidence from the configured "
+                        f"verified parameter {index} needs evidence from the configured "
                         "primary manufacturer datasheet"
                     )
             elif auto_primary_urls:
                 if not quoted_urls & auto_primary_urls:
                     raise SourceVerificationError(
-                        f"facts[{index}] needs evidence from the automatically "
+                        f"verified parameter {index} needs evidence from the automatically "
                         "verified primary manufacturer datasheet"
                     )
 
@@ -2186,8 +2618,13 @@ def validate_decision(
         "manufacturer": manufacturer,
         "manufacturer_zh": manufacturer_zh,
         "model": model,
-        "display_title_zh": display_title_zh,
+        "product_description_zh": product_description_zh,
+        # Retain the legacy field in normalized historical decisions so older
+        # renderers and stored attempt readers continue to work during rollout.
+        "display_title_zh": legacy_display_title_zh,
+        "product_category_code": product_category_code,
         "product_category": product_category,
+        "product_type": product_type,
         "summary": summary,
         "review_summary": review_summary,
         "review_evidence_urls": review_evidence_urls,
@@ -2198,19 +2635,24 @@ def validate_decision(
         ),
         "datasheets": datasheets,
         "sources": sources,
+        "datasheet_parameters": datasheet_parameters,
         "facts": facts,
+        "derived_insights": derived_insights,
         "conflicts": normalized_conflicts,
     }
 
 
 __all__ = [
     "DecisionError",
+    "PRODUCT_CATEGORY_LABELS",
     "SourceVerificationError",
     "catalogue_model_candidates",
     "canonical_product_category",
+    "canonical_product_category_code",
     "identity_key",
     "model_matches_catalogue_identity",
     "preferred_catalogue_model",
+    "product_category_label",
     "text_contains_competing_identity",
     "text_contains_catalogue_identity",
     "text_contains_exact_identity",

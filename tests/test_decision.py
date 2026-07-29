@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -11,10 +12,13 @@ sys.path.insert(0, str(SCRIPTS))
 
 from pv_wiki.decision import (  # noqa: E402
     DecisionError,
+    PRODUCT_CATEGORY_LABELS,
     SourceVerificationError,
+    _TOP_LEVEL,
     _cell_has_unambiguous_fact_value,
     _fact_value_present,
     catalogue_model_candidates,
+    canonical_product_category_code,
     model_matches_catalogue_identity,
     preferred_catalogue_model,
     text_contains_catalogue_identity,
@@ -392,7 +396,13 @@ class DecisionTests(unittest.TestCase):
             expected_lease_token="1234567890abcdef",
         )
         self.assertEqual("publish", result["outcome"])
-        self.assertEqual("光伏逆变器", result["product_category"])
+        self.assertEqual("inverter", result["product_category_code"])
+        self.assertEqual("逆变器", result["product_category"])
+        self.assertEqual("光伏逆变器", result["product_type"])
+        self.assertEqual(
+            "PV-42 光伏逆变器",
+            result["product_description_zh"],
+        )
 
     def test_common_uppercase_spec_labels_are_not_sibling_models(self) -> None:
         item = valid_decision()
@@ -1190,9 +1200,9 @@ class DecisionTests(unittest.TestCase):
 
     def test_publish_requires_safe_chinese_display_copy(self) -> None:
         invalid_values = (
-            ("display_title_zh", "", "display_title_zh"),
+            ("display_title_zh", "", "product_description_zh"),
             ("manufacturer_zh", "Acme", "Simplified Chinese"),
-            ("product_category", "Grid-tied inverter", "Simplified Chinese"),
+            ("product_category", "unknown category", "documented broad"),
             ("summary", "A documented product.", "Simplified Chinese"),
         )
         for field, value, message in invalid_values:
@@ -1205,6 +1215,231 @@ class DecisionTests(unittest.TestCase):
                         expected_product_id="P-42",
                         expected_lease_token="1234567890abcdef",
                     )
+
+    def test_closed_category_code_matches_label_and_keeps_specific_type(self) -> None:
+        item = valid_decision()
+        item.update(
+            {
+                "product_description_zh": "10kW 三相太阳能逆变器，双 MPPT",
+                "product_category_code": "inverter",
+                "product_category": "逆变器",
+                "product_type": "三相太阳能并网逆变器",
+                "datasheet_parameters": [],
+                "derived_insights": [],
+            }
+        )
+
+        result = validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+        )
+        self.assertEqual("inverter", result["product_category_code"])
+        self.assertEqual("逆变器", result["product_category"])
+        self.assertEqual("三相太阳能并网逆变器", result["product_type"])
+
+        item["product_category_code"] = "pv_module"
+        with self.assertRaisesRegex(DecisionError, "does not match"):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+    def test_historical_detailed_categories_map_to_closed_broad_classes(self) -> None:
+        expected = {
+            "Single-phase hybrid inverter": "inverter",
+            "三相并网逆变器": "inverter",
+            "单相太阳能逆变器": "inverter",
+            "单相光伏逆变器": "inverter",
+            "太阳能光伏组件": "pv_module",
+        }
+
+        self.assertEqual(
+            expected,
+            {
+                value: canonical_product_category_code(value)
+                for value in expected
+            },
+        )
+
+    def test_datasheet_parameters_and_insights_are_grounded_and_ordered(self) -> None:
+        item = valid_decision()
+        item["facts"] = []
+        item["datasheet_parameters"] = [
+            {
+                **{key: value for key, value in fact.items() if key != "category"},
+                "section": section,
+            }
+            for fact, section in zip(
+                valid_decision()["facts"][:2],
+                ("Output", "Input"),
+                strict=True,
+            )
+        ]
+        item["derived_insights"] = [
+            {
+                "name": "电压功率比",
+                "value": 48 / 42,
+                "formula": "48 ÷ 42",
+                "basis": ["Input voltage", "Power"],
+                "explanation": "用于参数间的直接对照。",
+            }
+        ]
+
+        result = validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+        )
+
+        self.assertEqual(
+            ["Power", "Input voltage"],
+            [parameter["name"] for parameter in result["datasheet_parameters"]],
+        )
+        self.assertEqual(
+            ["Input voltage", "Power"],
+            result["derived_insights"][0]["basis"],
+        )
+        self.assertAlmostEqual(
+            48 / 42,
+            result["derived_insights"][0]["value"],
+        )
+
+        item["datasheet_parameters"] = [{} for _ in range(31)]
+        with self.assertRaisesRegex(DecisionError, "at most 30"):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+        item["datasheet_parameters"] = ["not-an-object"]
+        with self.assertRaisesRegex(
+            DecisionError,
+            r"datasheet_parameters\[0\] must be an object",
+        ):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+    def test_derived_insights_require_recomputable_binary_arithmetic(self) -> None:
+        base = valid_decision()
+        base["facts"] = base["facts"][:2]
+        base["datasheet_parameters"] = []
+        base["derived_insights"] = [
+            {
+                "name": "电压功率比",
+                "value": 48 / 42,
+                "formula": "48 / 42",
+                "basis": ["Input voltage", "Power"],
+            }
+        ]
+
+        invalid = (
+            (
+                {"formula": "48 V / 42 W"},
+                "exactly two numeric literals",
+            ),
+            (
+                {"formula": "48 / 42 + 1"},
+                "exactly two numeric literals",
+            ),
+            (
+                {"basis": ["Input voltage"]},
+                "exactly 2 parameter names",
+            ),
+            (
+                {"basis": ["Input voltage", "Input voltage"]},
+                "2 distinct verified parameters",
+            ),
+            (
+                {"value": "1.14"},
+                "value must be a finite number",
+            ),
+            (
+                {"formula": "42 / 48", "value": 42 / 48},
+                "respectively equal",
+            ),
+            (
+                {"value": 99},
+                "runtime-recomputed",
+            ),
+        )
+        for replacement, message in invalid:
+            with self.subTest(replacement=replacement):
+                item = copy.deepcopy(base)
+                item["derived_insights"][0].update(replacement)
+                with self.assertRaisesRegex(DecisionError, message):
+                    validate_decision(
+                        item,
+                        expected_product_id="P-42",
+                        expected_lease_token="1234567890abcdef",
+                    )
+
+        too_many = copy.deepcopy(base)
+        too_many["derived_insights"] = [
+            {
+                **base["derived_insights"][0],
+                "name": f"参数对照{index}",
+            }
+            for index in range(6)
+        ]
+        with self.assertRaisesRegex(DecisionError, "at most 5"):
+            validate_decision(
+                too_many,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+    def test_documented_schema_matches_runtime_fields_and_taxonomy(self) -> None:
+        schema = json.loads(
+            (
+                SCRIPTS.parent
+                / "references"
+                / "decision.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(set(_TOP_LEVEL), set(schema["properties"]))
+        self.assertEqual(
+            set(PRODUCT_CATEGORY_LABELS),
+            set(schema["properties"]["product_category_code"]["enum"]),
+        )
+        self.assertEqual(
+            set(PRODUCT_CATEGORY_LABELS.values()),
+            set(schema["properties"]["product_category"]["enum"]),
+        )
+        self.assertTrue(
+            {
+                "datasheet_parameters",
+                "derived_insights",
+            }
+            <= set(schema["required"])
+        )
+        self.assertEqual(
+            30,
+            schema["properties"]["datasheet_parameters"]["maxItems"],
+        )
+        insight_schema = schema["properties"]["derived_insights"]
+        self.assertEqual(5, insight_schema["maxItems"])
+        self.assertEqual(
+            "number",
+            insight_schema["items"]["properties"]["value"]["type"],
+        )
+        self.assertEqual(
+            (2, 2),
+            (
+                insight_schema["items"]["properties"]["basis"]["minItems"],
+                insight_schema["items"]["properties"]["basis"]["maxItems"],
+            ),
+        )
+        self.assertIn(
+            "×÷",
+            insight_schema["items"]["properties"]["formula"]["pattern"],
+        )
 
     def test_restricts_decision_to_extracted_urls_when_provided(self) -> None:
         with self.assertRaisesRegex(DecisionError, "not extracted"):

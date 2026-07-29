@@ -141,6 +141,27 @@ class CLITests(unittest.TestCase):
             store.begin_search(lease)
             store.finish_search(lease, [url], {"credits": 3})
 
+    def record_synced_page(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("verified-publisher")
+            verified = decision(lease.token)
+            store.record_outcome(
+                lease,
+                "synced",
+                payload={
+                    "decision": verified,
+                    "validation_policy_fingerprint": "verified-policy",
+                    "fact_diagnostics": {
+                        "complete": True,
+                        "proposed": len(verified["facts"]),
+                        "retained": len(verified["facts"]),
+                        "rejected": 0,
+                        "rejection_reasons": {},
+                    },
+                },
+                wiki_path="products/p-42-c8d5a4d2d3",
+            )
+
     def test_requeue_command_wakes_only_the_requested_cutover_outcome(
         self,
     ) -> None:
@@ -476,7 +497,233 @@ class CLITests(unittest.TestCase):
         self.assertIn("当前已更新 **1** 款产品", arguments[4])
         self.assertIn("[热泵](/t/category-%E7%83%AD%E6%B3%B5)", arguments[4])
         self.assertIn("[Acme](/t/brand-acme)", arguments[4])
-        self.assertIn("HeatPro 42", arguments[4])
+        self.assertIn("[P-42](/products/p-42-c8d5a4d2d3)", arguments[4])
+
+    def test_parameter_hydration_revalidates_local_primary_pdf_rows(
+        self,
+    ) -> None:
+        os.environ.update(
+            {
+                "PV_WIKI_PDF_DIRECT_FETCH": "true",
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON": (
+                    '{"Acme":["acme.example"]}'
+                ),
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON": '{"Acme":"Acme"}',
+            }
+        )
+        url = "https://acme.example/pv-42.pdf"
+        model_quote = "Type\tPV-40\tPV-42"
+        quote = "Rated power\t40 W\t42 W"
+        evidence = documents.PDFEvidence(
+            text=f"Acme PV-42\n{model_quote}\n{quote}",
+            requested_url=url,
+            final_url=url,
+            sha256="a" * 64,
+            page_count=2,
+            extracted_pages=2,
+            truncated=False,
+            parameter_rows=(
+                documents.PDFParameterRow(
+                    model="PV-42",
+                    source_label="Rated power",
+                    value="42",
+                    unit="W",
+                    section="Output",
+                    page=2,
+                    order=1,
+                    model_quote=model_quote,
+                    quote=quote,
+                ),
+            ),
+        )
+        stored = decision("1234567890abcdef")
+        with mock.patch.object(
+            cli,
+            "extract_pdf_evidence",
+            return_value=evidence,
+        ) as extract_pdf:
+            refreshed, audit = (
+                cli._refresh_decision_parameters_from_primary_pdf(
+                    "P-42",
+                    product(),
+                    stored,
+                )
+            )
+
+        self.assertEqual(1, len(refreshed["datasheet_parameters"]))
+        self.assertEqual("Rated power", refreshed["datasheet_parameters"][0]["name"])
+        self.assertEqual("42", refreshed["datasheet_parameters"][0]["value"])
+        self.assertEqual(1, audit["retained_parameter_count"])
+        self.assertEqual("a" * 64, audit["pdf_sha256"])
+        extract_pdf.assert_called_once_with(
+            url,
+            max_bytes=12_000_000,
+            max_pages=80,
+            max_chars=30_000,
+            download_timeout=20.0,
+            parse_timeout=15.0,
+            target_models=("P-42", "PV-42"),
+        )
+
+    def test_refresh_content_parameter_hydration_preview_is_read_only(self) -> None:
+        self.record_synced_page()
+        refresh_audit = {
+            "url": "https://acme.example/pv-42.pdf",
+            "pdf_sha256": "a" * 64,
+            "page_count": 2,
+            "extracted_pages": 2,
+            "parsed_parameter_count": 1,
+            "retained_parameter_count": 1,
+        }
+        with (
+            mock.patch.object(
+                cli,
+                "_refresh_decision_parameters_from_primary_pdf",
+                return_value=({"outcome": "publish"}, refresh_audit),
+            ) as hydrate,
+            mock.patch.object(cli, "WikiJSClient") as wiki_client,
+        ):
+            code, payload, error = self.run_cli(
+                "refresh-content",
+                "--product-id",
+                "P-42",
+                "--hydrate-parameters",
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["apply"])
+        self.assertTrue(payload["hydrate_parameters"])
+        self.assertEqual(
+            refresh_audit,
+            payload["candidates"][0]["datasheet_parameter_refresh"],
+        )
+        hydrate.assert_called_once()
+        wiki_client.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            self.assertEqual(0, store.get_product("P-42").content_schema_version)
+            self.assertEqual([], store.content_refresh_event_history("P-42"))
+
+    def test_refresh_content_previews_last_synced_page_without_wiki(self) -> None:
+        self.record_synced_page()
+
+        code, payload, error = self.run_cli("refresh-content")
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["apply"])
+        self.assertEqual(cli.CONTENT_SCHEMA_VERSION, payload["content_schema_version"])
+        self.assertEqual(1, payload["candidate_count"])
+        self.assertEqual("P-42", payload["candidates"][0]["product_id"])
+        self.assertEqual(
+            "products/p-42-c8d5a4d2d3",
+            payload["candidates"][0]["path"],
+        )
+        with state.StateStore(self.state_path) as store:
+            self.assertEqual(0, store.get_product("P-42").content_schema_version)
+            self.assertEqual([], store.content_refresh_event_history("P-42"))
+
+    def test_refresh_content_updates_existing_page_without_research(self) -> None:
+        self.record_synced_page()
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+                "WIKIJS_LOCALE": "zh-cn",
+            }
+        )
+        client = mock.Mock()
+        client.update_existing_page.return_value = {
+            "action": "updated",
+            "page": {"id": 42},
+        }
+
+        with (
+            mock.patch.object(cli, "WikiJSClient", return_value=client),
+            mock.patch.object(cli, "ExaClient") as search_client,
+            mock.patch.object(cli, "OpenAICompatibleClient") as ai_client,
+        ):
+            code, payload, error = self.run_cli(
+                "refresh-content",
+                "--apply",
+                "--product-id",
+                "P-42",
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(1, payload["refreshed_count"])
+        self.assertEqual(0, payload["failed_count"])
+        search_client.assert_not_called()
+        ai_client.assert_not_called()
+        arguments = client.update_existing_page.call_args.args
+        self.assertEqual("products/p-42-c8d5a4d2d3", arguments[0])
+        self.assertEqual("zh-cn", arguments[1])
+        self.assertEqual("P-42", arguments[2])
+        self.assertIn("| 产品类别 | 逆变器 |", arguments[4])
+        self.assertIn("| 产品类型 | 光伏逆变器 |", arguments[4])
+        with state.StateStore(self.state_path) as store:
+            self.assertEqual(
+                cli.CONTENT_SCHEMA_VERSION,
+                store.get_product("P-42").content_schema_version,
+            )
+            events = store.content_refresh_event_history("P-42")
+        self.assertEqual(1, len(events))
+        self.assertEqual("updated", events[0].wiki_action)
+
+    def test_refresh_content_rechecks_candidate_before_wiki_mutation(self) -> None:
+        self.record_synced_page()
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+                "WIKIJS_LOCALE": "zh-cn",
+            }
+        )
+        with state.StateStore(self.state_path) as store:
+            stale_candidate = store.content_refresh_candidates(
+                cli.CONTENT_SCHEMA_VERSION,
+                product_ids=["P-42"],
+            )[0]
+        client = mock.Mock()
+
+        with (
+            mock.patch.object(cli, "WikiJSClient", return_value=client),
+            mock.patch.object(
+                state.StateStore,
+                "content_refresh_candidates",
+                side_effect=([stale_candidate], []),
+            ) as candidates,
+        ):
+            code, payload, error = self.run_cli(
+                "refresh-content",
+                "--apply",
+                "--product-id",
+                "P-42",
+            )
+
+        self.assertEqual(1, code, error)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(1, payload["failed_count"])
+        self.assertIn(
+            "candidate changed before Wiki update",
+            payload["failures"][0]["error"],
+        )
+        client.update_existing_page.assert_not_called()
+        self.assertEqual(2, candidates.call_count)
+        with state.StateStore(self.state_path) as store:
+            self.assertEqual(0, store.get_product("P-42").content_schema_version)
+            self.assertEqual([], store.content_refresh_event_history("P-42"))
+
+    def test_refresh_content_home_requires_apply(self) -> None:
+        code, payload, error = self.run_cli(
+            "refresh-content",
+            "--refresh-home",
+        )
+
+        self.assertEqual(2, code, error)
+        self.assertEqual({}, payload)
+        self.assertIn("--refresh-home requires --apply", error)
 
     def test_search_uses_leased_snapshot_and_bounded_client(self) -> None:
         token = self.claim()
@@ -628,7 +875,7 @@ class CLITests(unittest.TestCase):
             }
         )
 
-        self.assertEqual("光伏逆变器", category)
+        self.assertEqual("逆变器", category)
 
     def test_unresolved_decision_records_backoff_without_wiki_credentials(self) -> None:
         token = self.claim()
@@ -851,6 +1098,7 @@ class CLITests(unittest.TestCase):
             max_chars=30_000,
             download_timeout=20.0,
             parse_timeout=15.0,
+            target_models=("P-42", "PV-42"),
         )
 
     def test_extract_recovers_direct_pdf_when_exa_returns_only_failure(
@@ -884,6 +1132,19 @@ class CLITests(unittest.TestCase):
             page_count=1,
             extracted_pages=1,
             truncated=False,
+            parameter_rows=(
+                documents.PDFParameterRow(
+                    model="PV-42",
+                    source_label="Rated power",
+                    value="42",
+                    unit="W",
+                    section="Output",
+                    page=1,
+                    order=1,
+                    model_quote="Type\tPV-40\tPV-42",
+                    quote="Rated power\t40 W\t42 W",
+                ),
+            ),
         )
         with (
             mock.patch.object(cli, "ExaClient", return_value=client),
@@ -908,6 +1169,20 @@ class CLITests(unittest.TestCase):
         self.assertEqual("direct_pdf_text", result["content_source"])
         self.assertEqual("used", result["pdf_direct_status"])
         self.assertTrue(result["identity_verified"])
+        self.assertEqual(
+            {
+                "model": "PV-42",
+                "source_label": "Rated power",
+                "value": "42",
+                "unit": "W",
+                "section": "Output",
+                "page": 1,
+                "order": 1,
+                "model_quote": "Type\tPV-40\tPV-42",
+                "quote": "Rated power\t40 W\t42 W",
+            },
+            result["pdf_parameter_rows"][0],
+        )
         with state.StateStore(self.state_path) as store:
             self.assertEqual([url], store.allowed_evidence_urls(token))
 
@@ -1031,6 +1306,7 @@ class CLITests(unittest.TestCase):
                     "pdf_page_count": 2,
                     "pdf_extracted_pages": 2,
                     "pdf_final_hostname": "attacker.example.net",
+                    "pdf_parameter_rows": [{"value": "forged"}],
                 }
             ]
         }
@@ -1047,6 +1323,7 @@ class CLITests(unittest.TestCase):
         self.assertNotIn("pdf_page_count", result)
         self.assertNotIn("pdf_extracted_pages", result)
         self.assertNotIn("pdf_final_hostname", result)
+        self.assertNotIn("pdf_parameter_rows", result)
         self.assertTrue(result["identity_verified"])
         self.assertEqual(
             {
@@ -1110,6 +1387,73 @@ class CLITests(unittest.TestCase):
         self.assertEqual(
             "cdn.acme.example",
             result["pdf_final_hostname"],
+        )
+
+    def test_runtime_binds_only_selected_model_rows_from_primary_pdf(
+        self,
+    ) -> None:
+        url = "https://acme.example/pv-42.pdf"
+        model_quote = "Type\tPV-40\tPV-42"
+        quote = "Rated power\t40 W\t42 W"
+        raw = {
+            "outcome": "publish",
+            "model": "PV-42",
+            "datasheets": [
+                {
+                    "url": url,
+                    "title": "PV-42 datasheet",
+                    "source_type": "manufacturer",
+                    "is_primary": True,
+                }
+            ],
+            "datasheet_parameters": [{"name": "model-authored"}],
+        }
+        extract = {
+            "results": [
+                {
+                    "url": url,
+                    "raw_content": f"{model_quote}\n{quote}",
+                    "pdf_direct_status": "used",
+                    "pdf_parameter_rows": [
+                        {
+                            "model": "PV-40",
+                            "source_label": "Rated power",
+                            "value": "40",
+                            "unit": "W",
+                            "section": "Output",
+                            "page": 1,
+                            "order": 1,
+                            "model_quote": model_quote,
+                            "quote": quote,
+                        },
+                        {
+                            "model": "PV-42",
+                            "source_label": "Rated power",
+                            "value": "42",
+                            "unit": "W",
+                            "section": "Output",
+                            "page": 1,
+                            "order": 2,
+                            "model_quote": model_quote,
+                            "quote": quote,
+                        },
+                    ],
+                }
+            ]
+        }
+
+        bound = cli._with_locally_bound_datasheet_parameters(raw, extract)
+
+        self.assertEqual([{"name": "model-authored"}], raw["datasheet_parameters"])
+        self.assertEqual(1, len(bound["datasheet_parameters"]))
+        parameter = bound["datasheet_parameters"][0]
+        self.assertEqual("Rated power", parameter["name"])
+        self.assertEqual("42", parameter["value"])
+        self.assertEqual("W", parameter["unit"])
+        self.assertEqual(1.0, parameter["confidence"])
+        self.assertEqual(
+            [{"url": url, "model_quote": model_quote, "quote": quote}],
+            parameter["evidence_quotes"],
         )
 
     def test_research_evidence_context_rejects_html_and_open_redirect(
@@ -1248,6 +1592,7 @@ class CLITests(unittest.TestCase):
         }
         observed_facts: list[list[str]] = []
         observed_verified_urls: list[set[str] | None] = []
+        diagnostics: dict = {}
 
         def strict_validator(
             candidate: dict,
@@ -1284,6 +1629,7 @@ class CLITests(unittest.TestCase):
                     pdf_url: "PV-42 datasheet",
                 },
                 verified_primary_document_urls={pdf_url},
+                fact_diagnostics=diagnostics,
             )
 
         self.assertEqual(
@@ -1297,6 +1643,101 @@ class CLITests(unittest.TestCase):
         )
         self.assertTrue(
             all(urls == {pdf_url} for urls in observed_verified_urls)
+        )
+        self.assertEqual(
+            {
+                "complete": True,
+                "proposed": 4,
+                "retained": 1,
+                "rejected": 3,
+                "rejection_reasons": {
+                    "duplicate_name": 2,
+                    "validation_failed": 1,
+                },
+            },
+            diagnostics,
+        )
+
+    def test_pdf_target_models_are_bounded_to_parser_contract(self) -> None:
+        product_name = " ".join(
+            [f"AB{index}X" for index in range(30)]
+            + ["solar inverter"]
+        )
+
+        targets = cli._bounded_pdf_target_models("P-42", product_name)
+
+        self.assertLessEqual(len(targets), 16)
+        self.assertTrue(all(len(target) <= 200 for target in targets))
+        self.assertEqual("P-42", targets[0])
+
+    def test_publish_enrichment_drops_one_bad_parameter_and_insight(
+        self,
+    ) -> None:
+        pdf_url = "https://acme.example/pv-42.pdf"
+        store = mock.Mock()
+        store.allowed_evidence_urls.return_value = [pdf_url]
+        lease = mock.Mock(
+            product_id="P-42",
+            token="lease-token",
+            payload=product(),
+        )
+        raw = {
+            "outcome": "publish",
+            "facts": [],
+            "datasheet_parameters": [
+                {"name": "Rated power", "section": "Output"},
+                {"name": "Cooling mode", "section": "General"},
+            ],
+            "derived_insights": [
+                {"name": "有效结论", "basis": ["Rated power"]},
+                {"name": "无效结论", "basis": ["Cooling mode"]},
+            ],
+        }
+
+        def strict_validator(candidate: dict, **_kwargs: object) -> dict:
+            parameter_names = [
+                str(item["name"])
+                for item in candidate.get("datasheet_parameters", [])
+            ]
+            insight_names = [
+                str(item["name"])
+                for item in candidate.get("derived_insights", [])
+            ]
+            if "Cooling mode" in parameter_names or "无效结论" in insight_names:
+                raise cli.DecisionError("unsupported enrichment")
+            return {
+                **candidate,
+                "facts": [dict(item) for item in candidate.get("facts", [])],
+                "datasheet_parameters": [
+                    dict(item)
+                    for item in candidate.get("datasheet_parameters", [])
+                ],
+                "derived_insights": [
+                    dict(item)
+                    for item in candidate.get("derived_insights", [])
+                ],
+            }
+
+        with mock.patch.object(
+            cli,
+            "validate_decision",
+            side_effect=strict_validator,
+        ):
+            validated = cli._validate_decision_for_lease(
+                store,
+                lease,
+                raw,
+                evidence_text_by_url={pdf_url: "PV-42 datasheet"},
+                verified_primary_document_urls={pdf_url},
+            )
+
+        self.assertEqual(
+            ["Rated power"],
+            [item["name"] for item in validated["datasheet_parameters"]],
+        )
+        self.assertEqual(
+            ["有效结论"],
+            [item["name"] for item in validated["derived_insights"]],
         )
 
     def test_research_extract_summary_accepts_bounded_direct_pdf_counts(
@@ -1558,15 +1999,16 @@ class CLITests(unittest.TestCase):
         self.assertEqual("products/p-42-c8d5a4d2d3", payload["wiki"]["path"])
         self.assertEqual("created", payload["wiki"]["action"])
         publish_arguments = client.upsert_page.call_args.args
-        self.assertEqual("PV-42 光伏逆变器", publish_arguments[2])
+        self.assertEqual("P-42", publish_arguments[2])
         self.assertEqual("PV-42 已与官方资料精确匹配。", publish_arguments[3])
-        self.assertIn("# PV-42 光伏逆变器", publish_arguments[4])
+        self.assertIn("# P-42", publish_arguments[4])
+        self.assertIn("## PV-42｜光伏逆变器", publish_arguments[4])
         self.assertIn("| 品牌/制造商 | Acme（制造商） |", publish_arguments[4])
         tags = publish_arguments[5]
         self.assertIn("managed-by-pv-wiki", tags)
         self.assertNotIn("managed-by-hermes", tags)
         self.assertNotIn("family-pv", tags)
-        self.assertIn("category-光伏逆变器", tags)
+        self.assertIn("category-逆变器", tags)
         with state.StateStore(self.state_path) as store:
             current = store.get_product("P-42")
             self.assertEqual("synced", current.status)

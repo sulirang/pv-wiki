@@ -337,6 +337,26 @@ pv-wiki run-one --worker-id manual-acceptance
 pv-wiki publish-home
 ```
 
+After a renderer-only release, preview pages backed by the last successful
+validated decision without spending search or AI credits:
+
+```bash
+pv-wiki refresh-content
+pv-wiki refresh-content --product-id R5-10K-T2-15 --hydrate-parameters
+pv-wiki refresh-content --apply --product-id R5-10K-T2-15 --hydrate-parameters
+pv-wiki refresh-content --apply --limit 100 --refresh-home
+```
+
+`refresh-content` defaults to a read-only preview. `--apply` updates only an
+existing page at its recorded path, preserves visibility and human-authored
+content outside `PV-WIKI-AUTO`, and advances the durable content schema version
+only after Wiki.js succeeds. `--hydrate-parameters` explicitly re-downloads the
+stored primary manufacturer PDF, binds at most 30 rows to the exact target-model
+column, and revalidates every row locally; it calls neither the search provider
+nor AI. Use its read-only preview for one private page before a batch.
+`--refresh-home` is explicit and runs only after a fully successful applied
+batch.
+
 Copy `.env.example` to an ignored `.env` and export it before running the CLI.
 Prefer `PGSSLMODE=verify-full` with `PGSSLROOTCERT` pointing at the mounted
 public/private CA. All standard libpq modes must be selected explicitly.

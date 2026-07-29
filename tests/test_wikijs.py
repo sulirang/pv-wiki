@@ -133,6 +133,7 @@ class WikiJSProtocolTests(unittest.TestCase):
             {"locale": "zh-cn", "path": "products/acme/pv-42"},
             payload["variables"],
         )
+        self.assertIn("\neditor\n", payload["query"])
         self.assertIn("singleByPath", payload["query"])
         for field in (
             "publishStartDate",
@@ -408,6 +409,101 @@ class WikiJSUpsertTests(unittest.TestCase):
             variables["tags"],
         )
         self.assertEqual(1, variables["content"].count(render.AUTO_BEGIN))
+
+    def test_existing_only_update_refuses_to_create_missing_page(self) -> None:
+        opener = ScriptedOpener(
+            response({"pages": {"singleByPath": None}}),
+        )
+        client = wikijs.WikiJSClient(
+            "https://wiki.example.com",
+            "token",
+            opener=opener,
+        )
+
+        with self.assertRaisesRegex(
+            wikijs.WikiJSResponseError,
+            "existing-page-only update refused",
+        ):
+            client.update_existing_page(
+                "products/p-42",
+                "en",
+                "P-42",
+                "description",
+                "generated",
+                ["product"],
+            )
+
+        self.assertEqual(1, len(opener.calls))
+        self.assertIn("singleByPath", opener.calls[0][2]["query"])
+
+    def test_existing_only_update_requires_explicit_markdown_editor(self) -> None:
+        existing = page(content="Human content")
+        existing.pop("editor")
+        opener = ScriptedOpener(
+            response({"pages": {"singleByPath": existing}}),
+        )
+        client = wikijs.WikiJSClient(
+            "https://wiki.example.com",
+            "token",
+            opener=opener,
+        )
+
+        with self.assertRaisesRegex(
+            wikijs.WikiJSResponseError,
+            "missing editor metadata",
+        ):
+            client.update_existing_page(
+                "products/p-42",
+                "en",
+                "P-42",
+                "description",
+                "generated",
+                ["product"],
+            )
+
+        self.assertEqual(1, len(opener.calls))
+
+    def test_existing_only_update_preserves_human_content_and_visibility(self) -> None:
+        current = (
+            "Human introduction\n\n"
+            + render.AUTO_BEGIN
+            + "\nold\n"
+            + render.AUTO_END
+            + "\n\nHuman notes\n"
+        )
+        existing = page(
+            content=current,
+            is_private=False,
+            is_published=True,
+        )
+        opener = ScriptedOpener(
+            response({"pages": {"singleByPath": existing}}),
+            response({"pages": {"checkConflicts": False}}),
+            success("update", page(content="server value")),
+        )
+        client = wikijs.WikiJSClient(
+            "https://wiki.example.com",
+            "token",
+            opener=opener,
+        )
+
+        result = client.update_existing_page(
+            "products/p-42",
+            "en",
+            "P-42",
+            "description",
+            "new managed content",
+            ["managed-by-pv-wiki", "product"],
+        )
+
+        self.assertEqual("updated", result["action"])
+        variables = opener.calls[2][2]["variables"]
+        self.assertEqual("products/p-42", variables["path"])
+        self.assertIs(variables["isPrivate"], False)
+        self.assertIs(variables["isPublished"], True)
+        self.assertTrue(variables["content"].startswith("Human introduction"))
+        self.assertTrue(variables["content"].endswith("Human notes\n"))
+        self.assertIn("new managed content", variables["content"])
 
     def test_create_uses_configured_new_page_visibility(self) -> None:
         opener = ScriptedOpener(
