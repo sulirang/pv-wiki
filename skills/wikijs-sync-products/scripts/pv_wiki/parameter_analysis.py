@@ -14,7 +14,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v16"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v17"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v6"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -407,6 +407,9 @@ _THREE_PHASE_COMPOSITE_VALUE_RE = re.compile(
 _THREE_PHASE_SOURCE_TEXT_RE = re.compile(
     r"^\s*(?:three|3)(?:[\s-]+)phase\s*$",
     re.IGNORECASE,
+)
+_SAFE_PHASE_FEEDBACK_LABELS = frozenset(
+    {"并网接线方式", "并网接线制式", "馈电方式"}
 )
 _CODE_ONLY_ALPHA_VALUES = frozenset({"AFD"})
 _TECHNICAL_TOKEN_SHARE_GAP_RE = re.compile(
@@ -2034,6 +2037,28 @@ def _ground_numbers(
                 invalid_measurements.append(_bounded_descriptor(match.group()))
 
     if unsupported or invalid_measurements:
+        invalid_phase = any(
+            _GROUNDED_THREE_PHASE_RE.search(item) is not None
+            for item in invalid_measurements
+        )
+        phase_requirement = ""
+        if invalid_phase:
+            safe_phase_labels = (
+                grounded_three_phase_labels & _SAFE_PHASE_FEEDBACK_LABELS
+            )
+            safe_phase_label = min(
+                safe_phase_labels,
+                key=lambda item: (len(item), item),
+                default="",
+            )
+            phase_requirement = (
+                "; phase clause required exactly: "
+                + safe_phase_label
+                + "为三相"
+                + " as a whole independent clause; otherwise omit 三相"
+                if safe_phase_label
+                else "; phase clause unavailable in cited basis; omit 三相"
+            )
         unsupported_text = ", ".join(
             _bounded_descriptor(item, 32)
             for item in list(dict.fromkeys(unsupported))[:8]
@@ -2049,7 +2074,8 @@ def _ground_numbers(
             f"; invalid measurements: {invalid_text}" if invalid_text else ""
         )
         raise ParameterAnalysisError(
-            f"{field} contains numeric text not present in its basis parameters; "
+            f"{field} contains numeric text not present in its basis parameters"
+            f"{phase_requirement}; "
             f"unsupported: {unsupported_text or 'none'}; "
             f"basis permits: {supported_text}{invalid_suffix}"
         )

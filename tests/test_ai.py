@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import multiprocessing
@@ -688,7 +689,7 @@ class PromptTests(unittest.TestCase):
             "translate_and_analyze_complete_verified_parameter_set",
             prompt["task"],
         )
-        self.assertEqual("pv-parameter-analysis-v16", prompt["prompt_version"])
+        self.assertEqual("pv-parameter-analysis-v17", prompt["prompt_version"])
         self.assertEqual("pv-zh-technical-v6", prompt["glossary_version"])
         self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
         self.assertTrue(
@@ -1396,6 +1397,14 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             repair_content,
         )
         self.assertIn(
+            "phase clause required exactly:",
+            repair_content,
+        )
+        self.assertIn(
+            "phase clause unavailable in cited basis",
+            repair_content,
+        )
+        self.assertIn(
             "conditions_zh and limitations_zh must each be a JSON array "
             "of 0-2 strings",
             repair_content,
@@ -1532,7 +1541,87 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertIn("received string", repair_content)
         self.assertIn("use [] when empty", repair_content)
 
-    def test_parameter_analysis_stops_after_three_invalid_outputs(self) -> None:
+    def test_parameter_analysis_uses_fourth_request_for_late_phase_error(
+        self,
+    ) -> None:
+        calls: list[dict] = []
+        source = analysis_parameters()
+        source[0].update(
+            section="Output (AC)",
+            name="Feed-in",
+            value="3L+N+PE",
+            unit="",
+        )
+        valid = valid_parameter_enrichment()
+        valid["translations"][0].update(
+            name_zh="并网接线方式",
+            section_zh="交流输出（AC）",
+        )
+        paragraph = valid["sections"][0]["paragraphs"][0]
+        paragraph["basis_parameter_ids"] = ["p001"]
+        paragraph["analysis_zh"] = (
+            "并网接线方式为三相；该相制陈述只复述已核验的数据表接线"
+            "参数，项目应用仍需核对现场电网与接地要求。"
+        )
+        scalar_list = copy.deepcopy(valid)
+        scalar_list["sections"][0]["paragraphs"][0]["conditions_zh"] = (
+            "应核对现场条件。"
+        )
+        invalid_phase = copy.deepcopy(valid)
+        invalid_phase["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+            "该并网接线方式为三相；带有前置指代的句式不符合精确独立"
+            "分句模板，工程应用仍需核对现场电网与接地要求。"
+        )
+        responses = [
+            {"translations": [], "sections": [], "overall_limitations_zh": []},
+            scalar_list,
+            invalid_phase,
+            valid,
+        ]
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            result = responses[len(calls) - 1]
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps(result)},
+                        }
+                    ],
+                    "usage": {"total_tokens": 321},
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(max_response_bytes=20_000, max_evidence_chars=12_000),
+            opener=fake_open,
+        )
+        result = client.analyze_parameters(
+            product={"name": "R5-10K-T2-15"},
+            parameters=source,
+        )
+
+        self.assertTrue(result["input_complete"])
+        self.assertEqual(4, client.last_parameter_analysis_provider_requests)
+        final_repair = calls[3]["messages"][-1]["content"]
+        self.assertIn(
+            "phase clause required exactly: 并网接线方式为三相 "
+            "as a whole independent clause",
+            final_repair,
+        )
+        self.assertIn(
+            "conditions_zh must be a JSON array of 0-2 strings",
+            final_repair,
+        )
+        self.assertIn(
+            "translations must contain exactly one item",
+            final_repair,
+        )
+
+    def test_parameter_analysis_stops_after_four_invalid_outputs(self) -> None:
         calls: list[dict] = []
         invalid = {"translations": [], "sections": [], "overall_limitations_zh": []}
 
@@ -1560,8 +1649,8 @@ class OpenAICompatibleClientTests(unittest.TestCase):
                 parameters=analysis_parameters(),
             )
 
-        self.assertEqual(3, client.last_parameter_analysis_provider_requests)
-        self.assertEqual(3, len(calls))
+        self.assertEqual(4, client.last_parameter_analysis_provider_requests)
+        self.assertEqual(4, len(calls))
 
     def test_parameter_analysis_resets_audit_state_before_prompt_build(
         self,
