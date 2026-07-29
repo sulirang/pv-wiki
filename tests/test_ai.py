@@ -689,7 +689,7 @@ class PromptTests(unittest.TestCase):
             "translate_and_analyze_complete_verified_parameter_set",
             prompt["task"],
         )
-        self.assertEqual("pv-parameter-analysis-v17", prompt["prompt_version"])
+        self.assertEqual("pv-parameter-analysis-v18", prompt["prompt_version"])
         self.assertEqual("pv-zh-technical-v6", prompt["glossary_version"])
         self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
         self.assertTrue(
@@ -762,6 +762,14 @@ class PromptTests(unittest.TestCase):
         self.assertIn("source order and without repetition", policy_text)
         self.assertEqual("最大", prompt["controlled_terms"]["Maximum"])
         self.assertEqual("最小", prompt["controlled_terms"]["Minimum"])
+        self.assertIn(
+            "exact Feed-in source name",
+            prompt["controlled_term_rule"],
+        )
+        self.assertIn(
+            "exactly one listed translation",
+            prompt["controlled_term_rule"],
+        )
         self.assertIn(
             "do not repeat numeric standard identifiers",
             policy_text,

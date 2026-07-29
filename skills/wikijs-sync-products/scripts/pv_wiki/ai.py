@@ -1499,7 +1499,8 @@ def build_parameter_analysis_messages(
             "Ingress Protection": ["防护等级"],
         },
         "controlled_term_rule": (
-            "Prefer a matching controlled compound term over word-by-word terms."
+            "Use compound terms. For an exact Feed-in source name, name_zh must be "
+            "exactly one listed translation, with no added text."
         ),
         "output_contract": {
             "translations": {
@@ -1642,10 +1643,9 @@ def build_parameter_analysis_messages(
             "Never claim suitability for a residence, commercial site, climate, "
             "grid code, string design, component, or project without the missing "
             "site-specific inputs. State the limitation instead.",
-            "Keep the JSON compact: normally write one 60-240 character Chinese "
-            "paragraph per included section and use a second paragraph only when "
-            "essential. Use conditions_zh and limitations_zh only for distinct "
-            "information, never to repeat the paragraph.",
+            "Keep JSON compact: normally write one 60-240 character Chinese paragraph "
+            "per section, a second only if essential. Use conditions_zh and "
+            "limitations_zh only for distinct, nonrepeated information.",
             "Return every translation, even when a parameter is not discussed in "
             "the narrative analysis.",
         ],

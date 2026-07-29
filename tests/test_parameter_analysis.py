@@ -461,6 +461,8 @@ class ParameterAnalysisTests(unittest.TestCase):
             ("Cooling Method", "散热方式"),
             ("Ingress Protection", "防护等级"),
             ("Feed-in", "并网接线方式"),
+            ("Feed-in", "并网接线制式"),
+            ("Feed-in", "馈电方式"),
             ("Feed-in Current [A]", "并网电流 [A]"),
             ("Topology", "拓扑结构"),
         ):
@@ -494,6 +496,29 @@ class ParameterAnalysisTests(unittest.TestCase):
                     r"controlled (?:compound )?term",
                 ):
                     validate_parameter_enrichment(item, source)
+
+        exact_feed_in = parameters()
+        exact_feed_in[0]["name"] = "Feed-in"
+        for name_zh in (
+            "并网接线方式（制造商定义）",
+            "并网接线方式 [V]",
+            "并网接线方式（STC）",
+            "并网接线方式@STC",
+        ):
+            with self.subTest(non_exact_feed_in=name_zh):
+                appended_feed_in = translation_enrichment()
+                appended_feed_in["translations"][0]["name_zh"] = name_zh
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    re.escape(
+                        "name_zh must be exactly one controlled Feed-in term: "
+                        "并网接线方式 or 并网接线制式 or 馈电方式"
+                    ),
+                ):
+                    validate_parameter_enrichment(
+                        appended_feed_in,
+                        exact_feed_in,
+                    )
 
     def test_attached_numeric_tokens_are_grounded_in_analysis(self) -> None:
         source = parameters()
@@ -1530,6 +1555,74 @@ class ParameterAnalysisTests(unittest.TestCase):
             validate_parameter_enrichment(normalized, source),
         )
 
+        capacity_source = parameters()
+        capacity_item = copy.deepcopy(enrichment())
+        filler_rows = (
+            ("Ambient Condition", "环境条件"),
+            ("Installation Context", "安装条件"),
+            ("Grid Context", "电网条件"),
+            ("Site Constraint", "现场约束"),
+            ("Design Boundary", "设计边界"),
+        )
+        for source_name, name_zh in filler_rows:
+            capacity_source.append(
+                {
+                    "name": source_name,
+                    "section": "General",
+                    "value": "",
+                    "unit": "",
+                    "confidence": 1.0,
+                }
+            )
+            capacity_item["translations"].append(
+                {
+                    "parameter_id": f"p{len(capacity_source):03d}",
+                    "name_zh": name_zh,
+                    "section_zh": "一般信息",
+                    "subsection_zh": "",
+                    "value_zh": "",
+                }
+            )
+        capacity_source.append(
+            {
+                "name": "Feed-in",
+                "section": "Output (AC)",
+                "value": "3L+N+PE",
+                "unit": "",
+                "confidence": 1.0,
+            }
+        )
+        capacity_item["translations"].append(
+            {
+                "parameter_id": "p009",
+                "name_zh": "并网接线方式",
+                "section_zh": "交流输出（AC）",
+                "subsection_zh": "",
+                "value_zh": "",
+            }
+        )
+        capacity_paragraph = capacity_item["sections"][0]["paragraphs"][0]
+        capacity_paragraph["basis_parameter_ids"] = [
+            f"p{index:03d}" for index in range(1, 9)
+        ]
+        capacity_paragraph["analysis_zh"] = (
+            "最大光伏阵列功率用于说明数据表的直流输入边界；三相表述还必须"
+            "绑定唯一的接线参数，不能因引用容量已满而绕过证据约束。"
+        )
+        capacity_paragraph["conditions_zh"] = []
+        capacity_paragraph["limitations_zh"] = []
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            re.escape(
+                "contains 三相, but adding its unique source parameter ID "
+                "would exceed the 8-ID basis_parameter_ids limit: p009"
+            ),
+        ):
+            validate_parameter_enrichment(
+                capacity_item,
+                capacity_source,
+            )
+
         for forbidden in (
             "并网接线方式为 3L；",
             "并网接线方式为 3L+N+PE；",
@@ -1624,21 +1717,35 @@ class ParameterAnalysisTests(unittest.TestCase):
         ):
             validate_parameter_enrichment(unbound, source)
 
-        unavailable = copy.deepcopy(valid)
-        unavailable["sections"][0]["paragraphs"][0][
+        auto_bound_invalid = copy.deepcopy(valid)
+        auto_bound_invalid["sections"][0]["paragraphs"][0][
             "basis_parameter_ids"
         ] = ["p002"]
-        unavailable["sections"][0]["paragraphs"][0]["analysis_zh"] = (
+        auto_bound_invalid["sections"][0]["paragraphs"][0]["analysis_zh"] = (
             "三相不能脱离明确引用的接线参数单独形成结论；MPPT 电压范围"
             "仅用于讨论直流工作窗口，不能据此推断交流侧相制。"
         )
         with self.assertRaisesRegex(
             ParameterAnalysisError,
             re.escape(
+                "phase clause required exactly: 并网接线方式为三相 "
+                "as a whole independent clause; otherwise omit 三相"
+            ),
+        ):
+            validate_parameter_enrichment(auto_bound_invalid, source)
+
+        unavailable_source = copy.deepcopy(source)
+        unavailable_source[0]["value"] = "2L+N+PE"
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            re.escape(
                 "phase clause unavailable in cited basis; omit 三相"
             ),
         ):
-            validate_parameter_enrichment(unavailable, source)
+            validate_parameter_enrichment(
+                auto_bound_invalid,
+                unavailable_source,
+            )
 
         injected_label = copy.deepcopy(valid)
         injected_label["translations"][0]["name_zh"] = (
@@ -1651,7 +1758,8 @@ class ParameterAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ParameterAnalysisError,
             re.escape(
-                "phase clause unavailable in cited basis; omit 三相"
+                "name_zh must be exactly one controlled Feed-in term: "
+                "并网接线方式 or 并网接线制式 or 馈电方式"
             ),
         ) as raised:
             validate_parameter_enrichment(injected_label, source)

@@ -14,7 +14,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v17"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v18"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v6"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -74,6 +74,15 @@ _REQUIRED_TERMS = (
     (re.compile(r"\bDC\b", re.IGNORECASE), "直流"),
     (re.compile(r"\bPV\b", re.IGNORECASE), "光伏"),
 )
+_FEED_IN_SOURCE_NAME_RE = re.compile(
+    r"^\s*Feed[- ]?in\s*$",
+    re.IGNORECASE,
+)
+_FEED_IN_CONTROLLED_TERMS = (
+    "并网接线方式",
+    "并网接线制式",
+    "馈电方式",
+)
 _COMPOUND_REQUIRED_TERMS = (
     (
         re.compile(r"\bOver(?:[ -]?Current)\b", re.IGNORECASE),
@@ -88,8 +97,8 @@ _COMPOUND_REQUIRED_TERMS = (
         ("散热方式", "冷却方式"),
     ),
     (
-        re.compile(r"^\s*Feed[- ]?in\s*$", re.IGNORECASE),
-        ("并网接线方式", "并网接线制式", "馈电方式"),
+        _FEED_IN_SOURCE_NAME_RE,
+        _FEED_IN_CONTROLLED_TERMS,
     ),
     (
         re.compile(r"\bTopology\b", re.IGNORECASE),
@@ -408,9 +417,7 @@ _THREE_PHASE_SOURCE_TEXT_RE = re.compile(
     r"^\s*(?:three|3)(?:[\s-]+)phase\s*$",
     re.IGNORECASE,
 )
-_SAFE_PHASE_FEEDBACK_LABELS = frozenset(
-    {"并网接线方式", "并网接线制式", "馈电方式"}
-)
+_SAFE_PHASE_FEEDBACK_LABELS = frozenset(_FEED_IN_CONTROLLED_TERMS)
 _CODE_ONLY_ALPHA_VALUES = frozenset({"AFD"})
 _TECHNICAL_TOKEN_SHARE_GAP_RE = re.compile(
     r"^\s*(?:(?:[，,、/+]|和|及|与|以及)\s*)$"
@@ -950,6 +957,14 @@ def _validate_translation(
             )
     name_zh = _restore_name_tokens(name_zh, source_name, prefix)
     _reject_added_numeric_tokens(name_zh, source_name, f"{prefix}.name_zh")
+    if (
+        _FEED_IN_SOURCE_NAME_RE.fullmatch(source_name)
+        and name_zh not in _FEED_IN_CONTROLLED_TERMS
+    ):
+        raise ParameterAnalysisError(
+            f"{prefix}.name_zh must be exactly one controlled Feed-in term: "
+            + " or ".join(_FEED_IN_CONTROLLED_TERMS)
+        )
 
     source_section = str(source["section"])
     section_zh = _heading_translation(
@@ -2179,6 +2194,14 @@ def validate_parameter_enrichment(
             f"{len(ANALYSIS_SECTION_TITLES)} entries"
         )
     source_by_id = {str(item["parameter_id"]): item for item in source_rows}
+    phase_parameter_ids = [
+        parameter_id
+        for parameter_id, source in source_by_id.items()
+        if _source_value_supports_three_phase(source["value"])
+    ]
+    unique_phase_parameter_id = (
+        phase_parameter_ids[0] if len(phase_parameter_ids) == 1 else None
+    )
     seen_sections: set[str] = set()
     normalized_sections: list[dict[str, Any]] = []
     for section_index, section_raw in enumerate(sections_raw):
@@ -2320,6 +2343,21 @@ def validate_parameter_enrichment(
                         f"{', '.join(additional_basis_ids[:8])}"
                     )
                 basis_ids = [*basis_ids, *additional_basis_ids]
+            if (
+                unique_phase_parameter_id is not None
+                and unique_phase_parameter_id not in basis_ids
+                and any(
+                    _GROUNDED_THREE_PHASE_RE.search(text) is not None
+                    for text in paragraph_text_values
+                )
+            ):
+                if len(basis_ids) >= 8:
+                    raise ParameterAnalysisError(
+                        f"{paragraph_prefix} contains 三相, but adding its unique "
+                        "source parameter ID would exceed the 8-ID "
+                        f"basis_parameter_ids limit: {unique_phase_parameter_id}"
+                    )
+                basis_ids = [*basis_ids, unique_phase_parameter_id]
             basis_rows = [source_by_id[item] for item in basis_ids]
             basis_labels = [
                 translation_by_id[item]["name_zh"] for item in basis_ids
