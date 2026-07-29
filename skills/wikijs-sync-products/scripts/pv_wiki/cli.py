@@ -96,6 +96,7 @@ from .decision import (
 )
 from .render import (
     manufacturer_display_name,
+    product_bilingual_description,
     render_home_page,
     render_product_page,
     stable_path,
@@ -146,7 +147,7 @@ INVALID_DECISION_CIRCUIT_WINDOW = timedelta(minutes=30)
 MAX_RESEARCH_EVIDENCE_URLS = 5
 MAX_RESEARCH_SEARCH_RESULTS = 15
 INITIAL_CONTENT_SCHEMA_VERSION = 1
-CONTENT_SCHEMA_VERSION = 2
+CONTENT_SCHEMA_VERSION = 3
 # One AI action may use an initial 300-second call plus one bounded repair.
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
@@ -906,11 +907,16 @@ def _verified_wiki_page_fields(
         "model": render_decision.get("model") or payload.get("product_name"),
     }
     summary = " ".join(str(render_decision.get("summary") or "").split())
+    bilingual_description = product_bilingual_description(
+        product,
+        render_decision,
+    )
     return {
         # Wiki metadata and the catalogue's primary link label are stable IDs.
         "title": clean_product_id,
         "description": (
-            summary
+            bilingual_description
+            or summary
             or f"Datasheet and cited specifications for {clean_product_id}."
         )[:255],
         "managed_content": render_product_page(

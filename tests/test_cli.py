@@ -668,6 +668,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual("products/p-42-c8d5a4d2d3", arguments[0])
         self.assertEqual("zh-cn", arguments[1])
         self.assertEqual("P-42", arguments[2])
+        self.assertEqual("PV-42｜光伏逆变器", arguments[3])
         self.assertIn("| 产品类别 | 逆变器 |", arguments[4])
         self.assertIn("| 产品类型 | 光伏逆变器 |", arguments[4])
         with state.StateStore(self.state_path) as store:
@@ -678,6 +679,41 @@ class CLITests(unittest.TestCase):
             events = store.content_refresh_event_history("P-42")
         self.assertEqual(1, len(events))
         self.assertEqual("updated", events[0].wiki_action)
+
+    def test_verified_wiki_metadata_description_is_bilingual_and_bounded(
+        self,
+    ) -> None:
+        proposal = decision("lease-token")
+        proposal["summary"] = "旧的笼统产品摘要不应再作为页面元数据。"
+        proposal["product_description_zh"] = "10kW 三相太阳能逆变器，双 MPPT"
+        payload = {
+            **product(),
+            "product_id": "R5-10K-T2-15",
+            "product_name": "10kW Three phase solar inverter, 2 MPPT",
+        }
+
+        fields = cli._verified_wiki_page_fields(
+            payload["product_id"],
+            payload,
+            proposal,
+            checked_at=datetime(2026, 7, 29, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(
+            "10kW Three phase solar inverter, 2 MPPT｜"
+            "10kW 三相太阳能逆变器，双 MPPT",
+            fields["description"],
+        )
+        self.assertNotIn(proposal["summary"], fields["description"])
+
+        long_payload = {**payload, "product_name": "E" * 300}
+        long_fields = cli._verified_wiki_page_fields(
+            payload["product_id"],
+            long_payload,
+            proposal,
+            checked_at=datetime(2026, 7, 29, tzinfo=timezone.utc),
+        )
+        self.assertEqual(255, len(long_fields["description"]))
 
     def test_parameter_analysis_is_persisted_and_reused_after_wiki_failure(self) -> None:
         self.record_synced_page()
@@ -2159,7 +2195,8 @@ class CLITests(unittest.TestCase):
         self.assertEqual("created", payload["wiki"]["action"])
         publish_arguments = client.upsert_page.call_args.args
         self.assertEqual("P-42", publish_arguments[2])
-        self.assertEqual("PV-42 已与官方资料精确匹配。", publish_arguments[3])
+        self.assertEqual("PV-42｜光伏逆变器", publish_arguments[3])
+        self.assertNotEqual(proposal["summary"], publish_arguments[3])
         self.assertIn("# P-42", publish_arguments[4])
         self.assertIn("## PV-42｜光伏逆变器", publish_arguments[4])
         self.assertIn("| 品牌/制造商 | Acme（制造商） |", publish_arguments[4])
@@ -2223,7 +2260,8 @@ class CLITests(unittest.TestCase):
         self.assertEqual(0, code, error)
         self.assertTrue(payload["published"])
         publish_arguments = client.upsert_page.call_args.args
-        self.assertEqual(255, len(publish_arguments[3]))
+        self.assertEqual("PV-42｜光伏逆变器", publish_arguments[3])
+        self.assertNotIn("中", publish_arguments[3])
         rendered = publish_arguments[4]
         self.assertIn("中" * 400, rendered)
         self.assertNotIn("## 规格参数", rendered)
