@@ -36,6 +36,7 @@ from .ai import (
     SearchMoreAction,
     TrustedSourcePolicy,
     ValidationFeedback,
+    build_parameter_analysis_messages,
 )
 from .config import (
     ConfigError,
@@ -63,6 +64,14 @@ from .documents import (
     PDFDocumentError,
     extract_pdf_evidence,
     looks_like_pdf_url,
+)
+from .parameter_analysis import (
+    PARAMETER_ANALYSIS_PROMPT_VERSION,
+    PARAMETER_ANALYSIS_SCHEMA_VERSION,
+    PARAMETER_GLOSSARY_VERSION,
+    ParameterAnalysisError,
+    apply_parameter_translations,
+    professional_analysis,
 )
 from .exa import (
     API_BASE_URL as EXA_API_BASE_URL,
@@ -136,7 +145,8 @@ INVALID_DECISION_CIRCUIT_THRESHOLD = 5
 INVALID_DECISION_CIRCUIT_WINDOW = timedelta(minutes=30)
 MAX_RESEARCH_EVIDENCE_URLS = 5
 MAX_RESEARCH_SEARCH_RESULTS = 15
-CONTENT_SCHEMA_VERSION = 1
+INITIAL_CONTENT_SCHEMA_VERSION = 1
+CONTENT_SCHEMA_VERSION = 2
 # One AI action may use an initial 300-second call plus one bounded repair.
 # A duplicate-create-safe Wiki upsert can require four 120-second requests
 # (GET, CREATE, GET, UPDATE), followed by a small scheduling margin.
@@ -209,7 +219,7 @@ _DIRECT_PDF_METADATA_FIELDS = (
     "pdf_final_hostname",
     "pdf_parameter_rows",
 )
-_MAX_LOCAL_DATASHEET_PARAMETERS = 30
+_MAX_LOCAL_DATASHEET_PARAMETERS = 200
 _MAX_PDF_TARGET_MODELS = 16
 _MAX_PDF_TARGET_MODEL_CHARS = 200
 
@@ -1459,6 +1469,8 @@ def _prepare_extract_results(
                     "value": row.value,
                     "unit": row.unit,
                     "section": row.section,
+                    "table_title": row.table_title,
+                    "value_state": row.value_state,
                     "page": row.page,
                     "order": row.order,
                     "model_quote": row.model_quote,
@@ -2702,7 +2714,7 @@ def _apply_decision(
 
     audit_payload: dict[str, Any] = {
         "decision": decision,
-        "content_schema_version": CONTENT_SCHEMA_VERSION,
+        "content_schema_version": INITIAL_CONTENT_SCHEMA_VERSION,
         "validation_policy_fingerprint": _validation_policy_fingerprint(),
     }
     if decision["outcome"] == "publish":
@@ -2844,7 +2856,7 @@ def _apply_decision(
                 "wiki_action": result.get("action"),
             },
             wiki_path=path,
-            content_schema_version=CONTENT_SCHEMA_VERSION,
+            content_schema_version=INITIAL_CONTENT_SCHEMA_VERSION,
         )
     page = result.get("page") if isinstance(result.get("page"), dict) else {}
     return {
@@ -3134,7 +3146,7 @@ def _with_locally_bound_datasheet_parameters(
     if not isinstance(results, list):
         return decision
     parameters: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for result in results:
         if (
             not isinstance(result, Mapping)
@@ -3153,7 +3165,9 @@ def _with_locally_bound_datasheet_parameters(
             name = row.get("source_label")
             value = row.get("value")
             unit = row.get("unit")
-            section = row.get("section")
+            source_section = row.get("section")
+            table_title = row.get("table_title", "")
+            value_state = row.get("value_state", "explicit")
             model_quote = row.get("model_quote")
             quote = row.get("quote")
             if (
@@ -3167,8 +3181,11 @@ def _with_locally_bound_datasheet_parameters(
                 or len(value) > 500
                 or not isinstance(unit, str)
                 or len(unit) > 80
-                or not isinstance(section, str)
-                or len(section) > 100
+                or not isinstance(source_section, str)
+                or len(source_section) > 100
+                or not isinstance(table_title, str)
+                or len(table_title) > 200
+                or value_state not in {"explicit", "merged_shared"}
                 or not isinstance(model_quote, str)
                 or not model_quote.strip()
                 or len(model_quote) > 500
@@ -3179,14 +3196,34 @@ def _with_locally_bound_datasheet_parameters(
                 or quote not in body
             ):
                 continue
-            key = (identity_key(section), identity_key(name))
-            if not key[1] or key in seen:
+            normalized_title = table_title.strip()
+            normalized_source_section = source_section.strip()
+            section = (
+                normalized_title
+                if normalized_title and len(normalized_title) <= 100
+                else normalized_source_section
+            )
+            subsection = (
+                normalized_source_section
+                if normalized_title
+                and len(normalized_title) <= 100
+                and identity_key(normalized_title)
+                != identity_key(normalized_source_section)
+                else ""
+            )
+            key = (
+                identity_key(section),
+                identity_key(subsection),
+                identity_key(name),
+            )
+            if not key[2] or key in seen:
                 continue
             seen.add(key)
             parameters.append(
                 {
                     "name": name.strip(),
-                    "section": section.strip(),
+                    "section": section,
+                    "subsection": subsection,
                     "value": value.strip(),
                     "unit": unit.strip(),
                     "confidence": 1.0,
@@ -3300,6 +3337,8 @@ def _refresh_decision_parameters_from_primary_pdf(
             "value": row.value,
             "unit": row.unit,
             "section": row.section,
+            "table_title": row.table_title,
+            "value_state": row.value_state,
             "page": row.page,
             "order": row.order,
             "model_quote": row.model_quote,
@@ -3403,6 +3442,199 @@ def _refresh_decision_parameters_from_primary_pdf(
         "parsed_parameter_count": len(row_payloads),
         "retained_parameter_count": len(retained_normalized),
     }
+
+
+def _parameter_analysis_product(
+    candidate: ContentRefreshCandidate,
+    decision: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only reader-facing identity fields for parameter analysis."""
+
+    return {
+        "name": str(candidate.payload.get("product_name") or ""),
+        "model": str(decision.get("model") or ""),
+        "manufacturer": str(decision.get("manufacturer") or ""),
+        "product_category": str(decision.get("product_category") or ""),
+        "product_type": str(decision.get("product_type") or ""),
+    }
+
+
+def _parameter_analysis_request_fingerprint(
+    *,
+    product: Mapping[str, Any],
+    parameters: Sequence[Mapping[str, Any]],
+    settings: AISettings,
+) -> str:
+    """Hash the exact model identity and safe request messages."""
+
+    messages = build_parameter_analysis_messages(
+        product=product,
+        parameters=parameters,
+        max_evidence_chars=settings.max_evidence_chars,
+    )
+    payload = {
+        "schema_version": PARAMETER_ANALYSIS_SCHEMA_VERSION,
+        "model": settings.model,
+        "messages": messages,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _enrich_refreshed_parameters(
+    store: StateStore,
+    candidate: ContentRefreshCandidate,
+    decision: Mapping[str, Any],
+    parameter_refresh: Mapping[str, Any],
+    *,
+    client: OpenAICompatibleClient | None,
+    settings: AISettings | None,
+    analyze: bool,
+) -> tuple[dict[str, Any], dict[str, Any], int, int | None]:
+    """Persist one verified set and optionally reuse or run grounded AI analysis."""
+
+    raw_parameters = decision.get("datasheet_parameters")
+    if not isinstance(raw_parameters, list) or not raw_parameters:
+        raise CLIError("parameter enrichment requires verified datasheet rows")
+    parameters: list[Mapping[str, Any]] = []
+    for index, item in enumerate(raw_parameters):
+        if not isinstance(item, Mapping):
+            raise CLIError(
+                f"verified datasheet parameter {index} must be an object"
+            )
+        parameters.append(item)
+    url = parameter_refresh.get("url")
+    pdf_sha256 = parameter_refresh.get("pdf_sha256")
+    if not isinstance(url, str) or not isinstance(pdf_sha256, str):
+        raise CLIError("parameter refresh is missing verified PDF provenance")
+    parameter_set = store.record_verified_parameter_set(
+        candidate,
+        pdf_url=url,
+        pdf_sha256=pdf_sha256,
+        parameters=parameters,
+        extractor_version=PDF_EXTRACTION_CONTRACT_VERSION,
+        validation_policy_fingerprint=_validation_policy_fingerprint(),
+    )
+    metadata: dict[str, Any] = {
+        "parameter_set_id": parameter_set.parameter_set_id,
+        "parameter_count": parameter_set.parameter_count,
+        "parameter_set_sha256": parameter_set.parameter_set_sha256,
+        "extractor_version": parameter_set.extractor_version,
+        "analysis_requested": analyze,
+    }
+    if not analyze:
+        return (
+            dict(decision),
+            metadata,
+            parameter_set.parameter_set_id,
+            None,
+        )
+    if client is None or settings is None:
+        raise CLIError("parameter analysis client is not configured")
+
+    product = _parameter_analysis_product(candidate, decision)
+    fingerprint = _parameter_analysis_request_fingerprint(
+        product=product,
+        parameters=parameters,
+        settings=settings,
+    )
+    run = store.find_completed_parameter_analysis_run(
+        parameter_set.parameter_set_id,
+        fingerprint,
+    )
+    reused = run is not None
+    if run is None:
+        start = store.begin_parameter_analysis_run(
+            parameter_set.parameter_set_id,
+            request_fingerprint=fingerprint,
+            prompt_version=PARAMETER_ANALYSIS_PROMPT_VERSION,
+            glossary_version=PARAMETER_GLOSSARY_VERSION,
+            model=settings.model,
+        )
+        run = start.record
+        if not start.should_execute:
+            if run.status != "completed" or run.analysis is None:
+                raise StateError(
+                    "an identical parameter analysis is already in progress"
+                )
+            reused = True
+        else:
+            try:
+                analysis = client.analyze_parameters(
+                    product=product,
+                    parameters=parameters,
+                )
+            except (AIError, ParameterAnalysisError, TypeError, ValueError) as exc:
+                usage = _ai_response_audit(client)
+                usage["provider_requests"] = _provider_request_count(
+                    client,
+                    "last_parameter_analysis_provider_requests",
+                )
+                store.fail_parameter_analysis_run(
+                    run.analysis_run_id,
+                    error=_safe_error(exc),
+                    usage=usage,
+                )
+                raise
+            usage = _ai_response_audit(client)
+            usage["provider_requests"] = _provider_request_count(
+                client,
+                "last_parameter_analysis_provider_requests",
+            )
+            run = store.complete_parameter_analysis_run(
+                run.analysis_run_id,
+                analysis=analysis,
+                usage=usage,
+            )
+    if run.analysis is None:
+        raise StateError("completed parameter analysis has no result")
+    translated = apply_parameter_translations(parameters, run.analysis)
+    enriched_decision = {
+        **dict(decision),
+        "datasheet_parameters": translated,
+        "professional_analysis": professional_analysis(
+            run.analysis,
+            parameters,
+        ),
+    }
+    metadata.update(
+        {
+            "analysis_run_id": run.analysis_run_id,
+            "analysis_request_fingerprint": fingerprint,
+            "analysis_reused": reused,
+            "prompt_version": run.prompt_version,
+            "glossary_version": run.glossary_version,
+            "model": run.model,
+            "input_parameter_count": len(parameters),
+            "input_complete": True,
+            "provider_requests": (
+                0
+                if reused
+                else _provider_request_count(
+                    client,
+                    "last_parameter_analysis_provider_requests",
+                )
+            ),
+            **(
+                {"usage": run.usage}
+                if isinstance(run.usage, Mapping)
+                else {}
+            ),
+        }
+    )
+    return (
+        enriched_decision,
+        metadata,
+        parameter_set.parameter_set_id,
+        run.analysis_run_id,
+    )
 
 
 def _research_audit(
@@ -4707,20 +4939,36 @@ def _cmd_publish_home(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _same_content_refresh_candidate(
+    expected: ContentRefreshCandidate,
+    current: ContentRefreshCandidate,
+) -> bool:
+    return (
+        current.product_id == expected.product_id
+        and current.source_attempt_id == expected.source_attempt_id
+        and current.source_hash == expected.source_hash
+        and current.previous_content_schema_version
+        == expected.previous_content_schema_version
+        and current.wiki_path == expected.wiki_path
+    )
+
+
 def _cmd_refresh_content(args: argparse.Namespace) -> int:
     if args.refresh_home and not args.apply:
         raise CLIError("--refresh-home requires --apply")
+    if args.analyze_parameters and not args.hydrate_parameters:
+        raise CLIError("--analyze-parameters requires --hydrate-parameters")
 
-    settings: WikiSettings | None = None
-    client: WikiJSClient | None = None
+    wiki_settings: WikiSettings | None = None
+    wiki_client: WikiJSClient | None = None
     if args.apply:
-        settings = WikiSettings.from_env()
-        client = WikiJSClient(
-            settings.base_url,
-            settings.token,
-            timeout=settings.timeout,
-            new_page_private=settings.new_page_private,
-            new_page_published=settings.new_page_published,
+        wiki_settings = WikiSettings.from_env()
+        wiki_client = WikiJSClient(
+            wiki_settings.base_url,
+            wiki_settings.token,
+            timeout=wiki_settings.timeout,
+            new_page_private=wiki_settings.new_page_private,
+            new_page_published=wiki_settings.new_page_published,
         )
 
     refreshed: list[dict[str, Any]] = []
@@ -4755,6 +5003,14 @@ def _cmd_refresh_content(args: argparse.Namespace) -> int:
                             )
                         )
                         item["datasheet_parameter_refresh"] = parameter_refresh
+                        if args.analyze_parameters:
+                            item["parameter_analysis"] = {
+                                "planned": True,
+                                "input_parameter_count": parameter_refresh[
+                                    "retained_parameter_count"
+                                ],
+                                "input_complete": True,
+                            }
                     except (
                         CLIError,
                         ConfigError,
@@ -4775,6 +5031,7 @@ def _cmd_refresh_content(args: argparse.Namespace) -> int:
                     "ok": not failures,
                     "apply": False,
                     "hydrate_parameters": bool(args.hydrate_parameters),
+                    "analyze_parameters": bool(args.analyze_parameters),
                     "content_schema_version": CONTENT_SCHEMA_VERSION,
                     "candidate_count": len(candidates),
                     "candidates": preview,
@@ -4784,51 +5041,85 @@ def _cmd_refresh_content(args: argparse.Namespace) -> int:
             )
             return 0 if not failures else 1
 
-        assert settings is not None
-        assert client is not None
+        assert wiki_settings is not None
+        assert wiki_client is not None
+        analysis_settings: AISettings | None = None
+        analysis_client: OpenAICompatibleClient | None = None
+        if args.analyze_parameters and candidates:
+            analysis_settings = AISettings.from_env()
+            analysis_client = OpenAICompatibleClient(analysis_settings)
         for candidate in candidates:
             try:
+                render_decision = candidate.decision
+                parameter_refresh: dict[str, Any] | None = None
+                parameter_enrichment: dict[str, Any] | None = None
+                parameter_set_id: int | None = None
+                analysis_run_id: int | None = None
+                if args.hydrate_parameters:
+                    render_decision, parameter_refresh = (
+                        _refresh_decision_parameters_from_primary_pdf(
+                            candidate.product_id,
+                            candidate.payload,
+                            candidate.decision,
+                        )
+                    )
+                    preflight = store.content_refresh_candidates(
+                        CONTENT_SCHEMA_VERSION,
+                        product_ids=[candidate.product_id],
+                        limit=1,
+                    )
+                    if (
+                        not preflight
+                        or not _same_content_refresh_candidate(
+                            candidate,
+                            preflight[0],
+                        )
+                    ):
+                        raise StateError(
+                            "content refresh candidate changed during parameter "
+                            "preparation"
+                        )
+                    candidate = preflight[0]
+                    (
+                        render_decision,
+                        parameter_enrichment,
+                        parameter_set_id,
+                        analysis_run_id,
+                    ) = _enrich_refreshed_parameters(
+                        store,
+                        candidate,
+                        render_decision,
+                        parameter_refresh,
+                        client=analysis_client,
+                        settings=analysis_settings,
+                        analyze=bool(args.analyze_parameters),
+                    )
                 with _SOURCE_PUBLISH_FENCE, store.publication_fence():
                     current = store.content_refresh_candidates(
                         CONTENT_SCHEMA_VERSION,
                         product_ids=[candidate.product_id],
                         limit=1,
                     )
-                    if not current:
-                        raise StateError(
-                            "content refresh candidate changed before Wiki update"
-                        )
-                    refreshed_candidate = current[0]
                     if (
-                        refreshed_candidate.source_attempt_id
-                        != candidate.source_attempt_id
-                        or refreshed_candidate.previous_content_schema_version
-                        != candidate.previous_content_schema_version
-                        or refreshed_candidate.wiki_path != candidate.wiki_path
+                        not current
+                        or not _same_content_refresh_candidate(
+                            candidate,
+                            current[0],
+                        )
                     ):
                         raise StateError(
                             "content refresh candidate changed before Wiki update"
                         )
-                    candidate = refreshed_candidate
-                    render_decision = candidate.decision
-                    parameter_refresh: dict[str, Any] | None = None
-                    if args.hydrate_parameters:
-                        render_decision, parameter_refresh = (
-                            _refresh_decision_parameters_from_primary_pdf(
-                                candidate.product_id,
-                                candidate.payload,
-                                candidate.decision,
-                            )
-                        )
+                    candidate = current[0]
                     fields = _verified_wiki_page_fields(
                         candidate.product_id,
                         candidate.payload,
                         render_decision,
                         checked_at=candidate.verified_at,
                     )
-                    result = client.update_existing_page(
+                    result = wiki_client.update_existing_page(
                         candidate.wiki_path,
-                        settings.locale,
+                        wiki_settings.locale,
                         fields["title"],
                         fields["description"],
                         fields["managed_content"],
@@ -4839,6 +5130,8 @@ def _cmd_refresh_content(args: argparse.Namespace) -> int:
                         CONTENT_SCHEMA_VERSION,
                         wiki_action=str(result.get("action") or ""),
                         fact_diagnostics=candidate.fact_diagnostics,
+                        parameter_set_id=parameter_set_id,
+                        analysis_run_id=analysis_run_id,
                     )
                 page = (
                     result.get("page")
@@ -4864,12 +5157,19 @@ def _cmd_refresh_content(args: argparse.Namespace) -> int:
                             if parameter_refresh is not None
                             else {}
                         ),
+                        **(
+                            {"parameter_enrichment": parameter_enrichment}
+                            if parameter_enrichment is not None
+                            else {}
+                        ),
                     }
                 )
             except (
+                AIError,
                 CLIError,
                 ConfigError,
                 DecisionError,
+                ParameterAnalysisError,
                 PDFDocumentError,
                 StateError,
                 WikiJSError,
@@ -4896,6 +5196,7 @@ def _cmd_refresh_content(args: argparse.Namespace) -> int:
         "ok": not failures,
         "apply": True,
         "hydrate_parameters": bool(args.hydrate_parameters),
+        "analyze_parameters": bool(args.analyze_parameters),
         "content_schema_version": CONTENT_SCHEMA_VERSION,
         "candidate_count": len(candidates),
         "refreshed_count": len(refreshed),
@@ -5084,6 +5385,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "re-read each stored primary manufacturer PDF and rebuild its "
             "target-model parameter table without search or AI"
+        ),
+    )
+    refresh_content.add_argument(
+        "--analyze-parameters",
+        action="store_true",
+        help=(
+            "translate every hydrated parameter and generate a complete-set, "
+            "basis-linked professional analysis; requires --hydrate-parameters"
         ),
     )
     refresh_content.add_argument(

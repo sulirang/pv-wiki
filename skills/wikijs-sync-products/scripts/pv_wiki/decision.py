@@ -2055,6 +2055,7 @@ def validate_decision(
         collection: str,
         index: int,
         grouping_field: str,
+        allow_datasheet_display_fields: bool = False,
     ) -> dict[str, Any]:
         """Normalize one source-grounded parameter using the fact safety gate."""
 
@@ -2070,6 +2071,16 @@ def validate_decision(
             "evidence_urls",
             "evidence_quotes",
         }
+        if allow_datasheet_display_fields:
+            allowed_fields.update(
+                {
+                    "name_zh",
+                    "section_zh",
+                    "subsection",
+                    "subsection_zh",
+                    "value_zh",
+                }
+            )
         if set(item) - allowed_fields:
             raise DecisionError(f"{prefix} has unknown fields")
         value = _scalar(item.get("value"), f"{prefix}.value")
@@ -2226,6 +2237,37 @@ def validate_decision(
                 f"{prefix}.{grouping_field}",
                 limit=100,
             )
+        if allow_datasheet_display_fields:
+            if "name_zh" in item:
+                normalized["name_zh"] = _chinese_display_text(
+                    item.get("name_zh"),
+                    f"{prefix}.name_zh",
+                    limit=200,
+                )
+            if "section_zh" in item:
+                normalized["section_zh"] = _chinese_display_text(
+                    item.get("section_zh"),
+                    f"{prefix}.section_zh",
+                    limit=100,
+                )
+            if "subsection" in item:
+                normalized["subsection"] = _text(
+                    item.get("subsection"),
+                    f"{prefix}.subsection",
+                    limit=100,
+                )
+            if "subsection_zh" in item:
+                normalized["subsection_zh"] = _chinese_display_text(
+                    item.get("subsection_zh"),
+                    f"{prefix}.subsection_zh",
+                    limit=100,
+                )
+            if "value_zh" in item:
+                normalized["value_zh"] = _chinese_display_text(
+                    item.get("value_zh"),
+                    f"{prefix}.value_zh",
+                    limit=200,
+                )
         return normalized
 
     facts: list[dict[str, Any]] = []
@@ -2254,23 +2296,26 @@ def validate_decision(
         facts.append(fact)
 
     datasheet_parameters: list[dict[str, Any]] = []
-    parameter_keys: set[tuple[str, str]] = set()
+    parameter_keys: set[tuple[str, str, str]] = set()
     for index, item in enumerate(
-        _optional_list(raw, "datasheet_parameters", 30)
+        _optional_list(raw, "datasheet_parameters", 200)
     ):
         parameter = normalize_grounded_parameter(
             item,
             collection="datasheet_parameters",
             index=index,
             grouping_field="section",
+            allow_datasheet_display_fields=True,
         )
         parameter_key = (
             identity_key(str(parameter.get("section") or "")),
+            identity_key(str(parameter.get("subsection") or "")),
             identity_key(parameter["name"]),
         )
-        if not parameter_key[1] or parameter_key in parameter_keys:
+        if not parameter_key[2] or parameter_key in parameter_keys:
             raise DecisionError(
-                "datasheet parameter names must be unique within each section"
+                "datasheet parameter names must be unique within each "
+                "section and subsection"
             )
         parameter_keys.add(parameter_key)
         datasheet_parameters.append(parameter)

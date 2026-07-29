@@ -158,6 +158,59 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(state.SCHEMA_VERSION, store._migrate_postgresql())
         self.assertEqual(1, len(locked.calls))
 
+    def test_postgres_v11_migrates_v10_parameter_ledger_under_lock(self) -> None:
+        class Cursor:
+            def __init__(self, row=None):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class InitialConnection:
+            def execute(self, statement, _parameters=()):
+                if "to_regclass" in statement:
+                    return Cursor({"metadata_table": "state_metadata"})
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": 10})
+                raise AssertionError(f"unexpected initial SQL: {statement}")
+
+        class LockedConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, parameters=()):
+                self.calls.append((statement, tuple(parameters)))
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": 10})
+                return Cursor()
+
+        initial = InitialConnection()
+        locked = LockedConnection()
+
+        @contextmanager
+        def initial_scope():
+            yield initial
+
+        @contextmanager
+        def locked_scope():
+            yield locked
+
+        store = object.__new__(state.StateStore)
+        store.backend = "postgresql"
+        store._connection = initial_scope
+        store._write_transaction = locked_scope
+
+        self.assertEqual(state.SCHEMA_VERSION, store._migrate_postgresql())
+        statements = "\n".join(statement for statement, _ in locked.calls)
+        self.assertIn("CREATE TABLE IF NOT EXISTS verified_parameter_sets", statements)
+        self.assertIn("CREATE TABLE IF NOT EXISTS parameter_analysis_runs", statements)
+        self.assertIn("ADD COLUMN IF NOT EXISTS parameter_set_id", statements)
+        self.assertIn("ADD COLUMN IF NOT EXISTS analysis_run_id", statements)
+        self.assertIn(
+            (state.SCHEMA_VERSION, 10),
+            [parameters for _, parameters in locked.calls],
+        )
+
     def test_creates_missing_parent_for_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             existing = Path(directory) / "existing"
@@ -182,6 +235,44 @@ class StateStoreTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.tempdir.cleanup()
+
+    def _publish_refresh_candidate(
+        self,
+        product_id: str = "P-1",
+        *,
+        now: datetime = T0,
+    ):
+        self.store.upsert_product(product(product_id), now=now)
+        lease = self.store.lease_next(f"publisher-{product_id}", now=now)
+        self.assertIsNotNone(lease)
+        self.store.record_outcome(
+            lease,
+            "synced",
+            payload={
+                "decision": {
+                    "outcome": "publish",
+                    "manufacturer": "Acme Public",
+                    "model": product_id,
+                    "facts": [],
+                },
+                "validation_policy_fingerprint": "verified-policy",
+                "fact_diagnostics": {
+                    "complete": True,
+                    "proposed": 0,
+                    "retained": 0,
+                    "rejected": 0,
+                    "rejection_reasons": {},
+                },
+            },
+            wiki_path=f"products/{product_id.casefold()}",
+            now=now + timedelta(seconds=1),
+        )
+        candidates = self.store.content_refresh_candidates(
+            1,
+            product_ids=[product_id],
+        )
+        self.assertEqual(1, len(candidates))
+        return candidates[0]
 
     def test_schema_and_source_hash_upsert_are_idempotent(self):
         self.assertEqual(self.store.schema_version, state.SCHEMA_VERSION)
@@ -629,11 +720,282 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(0, event.previous_content_schema_version)
         self.assertEqual(1, event.content_schema_version)
         self.assertEqual("updated", event.wiki_action)
+        self.assertIsNone(event.parameter_set_id)
+        self.assertIsNone(event.analysis_run_id)
         self.assertEqual(
             1,
             self.store.get_product("P-1").content_schema_version,
         )
         self.assertEqual([], self.store.content_refresh_candidates(1))
+        self.assertEqual(
+            [event],
+            self.store.content_refresh_event_history("P-1"),
+        )
+
+    def test_verified_parameter_sets_are_canonical_and_deduplicated(self):
+        candidate = self._publish_refresh_candidate()
+        first = self.store.record_verified_parameter_set(
+            candidate,
+            pdf_url="HTTPS://Example.COM:443/datasheet.pdf#page=1",
+            pdf_sha256="A" * 64,
+            parameters=[
+                {
+                    "name": "Maximum power",
+                    "value": 10,
+                    "unit": "kW",
+                }
+            ],
+            extractor_version=" extractor-v1 ",
+            validation_policy_fingerprint="B" * 64,
+            now=T0 + timedelta(minutes=1),
+        )
+        replay = self.store.record_verified_parameter_set(
+            candidate,
+            pdf_url="https://example.com/datasheet.pdf#page=2",
+            pdf_sha256="a" * 64,
+            parameters=[
+                {
+                    "unit": "kW",
+                    "value": 10,
+                    "name": "Maximum power",
+                }
+            ],
+            extractor_version="extractor-v1",
+            validation_policy_fingerprint="b" * 64,
+            now=T0 + timedelta(minutes=2),
+        )
+
+        self.assertEqual(first.parameter_set_id, replay.parameter_set_id)
+        self.assertEqual(first.parameter_set_sha256, replay.parameter_set_sha256)
+        self.assertEqual(1, first.parameter_count)
+        self.assertEqual("https://example.com/datasheet.pdf", first.pdf_url)
+        self.assertEqual("a" * 64, first.pdf_sha256)
+        self.assertEqual(
+            [first],
+            self.store.verified_parameter_set_history("P-1"),
+        )
+        self.assertEqual(
+            first,
+            self.store.get_verified_parameter_set(first.parameter_set_id),
+        )
+
+    def test_parameter_analysis_run_lifecycle_is_append_only(self):
+        candidate = self._publish_refresh_candidate()
+        parameter_set = self.store.record_verified_parameter_set(
+            candidate,
+            pdf_url="https://example.com/datasheet.pdf",
+            pdf_sha256="a" * 64,
+            parameters=[{"name": "Power", "value": "10 kW"}],
+            extractor_version="extractor-v1",
+            validation_policy_fingerprint="b" * 64,
+            now=T0 + timedelta(minutes=1),
+        )
+        request_fingerprint = "c" * 64
+
+        started = self.store.begin_parameter_analysis_run(
+            parameter_set.parameter_set_id,
+            request_fingerprint=request_fingerprint,
+            prompt_version="prompt-v1",
+            glossary_version="glossary-v1",
+            model="analysis-model",
+            now=T0 + timedelta(minutes=2),
+        )
+        replay_started = self.store.begin_parameter_analysis_run(
+            parameter_set.parameter_set_id,
+            request_fingerprint=request_fingerprint,
+            prompt_version="prompt-v1",
+            glossary_version="glossary-v1",
+            model="analysis-model",
+            now=T0 + timedelta(minutes=3),
+        )
+
+        self.assertTrue(started.should_execute)
+        self.assertFalse(replay_started.should_execute)
+        self.assertEqual(
+            started.record.analysis_run_id,
+            replay_started.record.analysis_run_id,
+        )
+        self.assertIsNone(
+            self.store.find_completed_parameter_analysis_run(
+                parameter_set.parameter_set_id,
+                request_fingerprint,
+            )
+        )
+
+        failed = self.store.fail_parameter_analysis_run(
+            started.record.analysis_run_id,
+            error="provider timeout",
+            usage={"prompt_tokens": 25},
+            now=T0 + timedelta(minutes=4),
+        )
+        self.assertEqual("failed", failed.status)
+        retry = self.store.begin_parameter_analysis_run(
+            parameter_set.parameter_set_id,
+            request_fingerprint=request_fingerprint,
+            prompt_version="prompt-v1",
+            glossary_version="glossary-v1",
+            model="analysis-model",
+            now=T0 + timedelta(minutes=5),
+        )
+        self.assertTrue(retry.should_execute)
+        self.assertEqual(2, retry.record.attempt_number)
+        completed = self.store.complete_parameter_analysis_run(
+            retry.record.analysis_run_id,
+            analysis={"valuable_parameters": ["Maximum power"]},
+            usage={"prompt_tokens": 20, "completion_tokens": 5},
+            now=T0 + timedelta(minutes=6),
+        )
+        self.assertEqual("completed", completed.status)
+        self.assertEqual(
+            completed,
+            self.store.find_completed_parameter_analysis_run(
+                parameter_set.parameter_set_id,
+                request_fingerprint,
+            ),
+        )
+        completed_replay = self.store.begin_parameter_analysis_run(
+            parameter_set.parameter_set_id,
+            request_fingerprint=request_fingerprint,
+            prompt_version="prompt-v1",
+            glossary_version="glossary-v1",
+            model="analysis-model",
+            now=T0 + timedelta(minutes=7),
+        )
+        self.assertFalse(completed_replay.should_execute)
+        self.assertEqual(
+            completed.analysis_run_id,
+            completed_replay.record.analysis_run_id,
+        )
+        self.assertEqual(
+            ["failed", "completed"],
+            [
+                run.status
+                for run in self.store.parameter_analysis_run_history(
+                    parameter_set.parameter_set_id
+                )
+            ],
+        )
+
+    def test_parameter_analysis_begin_is_concurrency_safe(self):
+        candidate = self._publish_refresh_candidate()
+        parameter_set = self.store.record_verified_parameter_set(
+            candidate,
+            pdf_url="https://example.com/datasheet.pdf",
+            pdf_sha256="a" * 64,
+            parameters=[],
+            extractor_version="extractor-v1",
+            validation_policy_fingerprint="b" * 64,
+        )
+        other = state.StateStore(self.path)
+
+        def begin(store):
+            return store.begin_parameter_analysis_run(
+                parameter_set.parameter_set_id,
+                request_fingerprint="c" * 64,
+                prompt_version="prompt-v1",
+                glossary_version="glossary-v1",
+                model="analysis-model",
+                now=T0 + timedelta(minutes=2),
+            )
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(begin, (self.store, other)))
+        finally:
+            other.close()
+
+        self.assertEqual(1, sum(result.should_execute for result in results))
+        self.assertEqual(
+            1,
+            len({result.record.analysis_run_id for result in results}),
+        )
+
+    def test_content_refresh_validates_parameter_and_analysis_provenance(self):
+        candidate = self._publish_refresh_candidate("P-1")
+        other_candidate = self._publish_refresh_candidate(
+            "P-2",
+            now=T0 + timedelta(minutes=1),
+        )
+        parameter_set = self.store.record_verified_parameter_set(
+            candidate,
+            pdf_url="https://example.com/p-1.pdf",
+            pdf_sha256="a" * 64,
+            parameters=[{"name": "Power", "value": "10 kW"}],
+            extractor_version="extractor-v1",
+            validation_policy_fingerprint="b" * 64,
+        )
+        other_parameter_set = self.store.record_verified_parameter_set(
+            other_candidate,
+            pdf_url="https://example.com/p-2.pdf",
+            pdf_sha256="d" * 64,
+            parameters=[],
+            extractor_version="extractor-v1",
+            validation_policy_fingerprint="e" * 64,
+        )
+        started = self.store.begin_parameter_analysis_run(
+            parameter_set.parameter_set_id,
+            request_fingerprint="c" * 64,
+            prompt_version="prompt-v1",
+            glossary_version="glossary-v1",
+            model="analysis-model",
+        )
+
+        with self.assertRaisesRegex(state.StateError, "not completed"):
+            self.store.record_content_refresh(
+                candidate,
+                1,
+                wiki_action="updated",
+                fact_diagnostics=candidate.fact_diagnostics,
+                parameter_set_id=parameter_set.parameter_set_id,
+                analysis_run_id=started.record.analysis_run_id,
+            )
+        with self.assertRaisesRegex(state.StateError, "does not belong"):
+            self.store.record_content_refresh(
+                candidate,
+                1,
+                wiki_action="updated",
+                fact_diagnostics=candidate.fact_diagnostics,
+                parameter_set_id=other_parameter_set.parameter_set_id,
+            )
+
+        other_started = self.store.begin_parameter_analysis_run(
+            other_parameter_set.parameter_set_id,
+            request_fingerprint="f" * 64,
+            prompt_version="prompt-v1",
+            glossary_version="glossary-v1",
+            model="analysis-model",
+        )
+        other_completed = self.store.complete_parameter_analysis_run(
+            other_started.record.analysis_run_id,
+            analysis={"valuable_parameters": []},
+            usage={},
+        )
+        with self.assertRaisesRegex(state.StateError, "parameter set"):
+            self.store.record_content_refresh(
+                candidate,
+                1,
+                wiki_action="updated",
+                fact_diagnostics=candidate.fact_diagnostics,
+                parameter_set_id=parameter_set.parameter_set_id,
+                analysis_run_id=other_completed.analysis_run_id,
+            )
+
+        completed = self.store.complete_parameter_analysis_run(
+            started.record.analysis_run_id,
+            analysis={"valuable_parameters": ["Power"]},
+            usage={},
+        )
+        event = self.store.record_content_refresh(
+            candidate,
+            1,
+            wiki_action="updated",
+            fact_diagnostics=candidate.fact_diagnostics,
+            parameter_set_id=parameter_set.parameter_set_id,
+            analysis_run_id=completed.analysis_run_id,
+        )
+
+        self.assertEqual(parameter_set.parameter_set_id, event.parameter_set_id)
+        self.assertEqual(completed.analysis_run_id, event.analysis_run_id)
         self.assertEqual(
             [event],
             self.store.content_refresh_event_history("P-1"),
@@ -3067,6 +3429,18 @@ class StateStoreTests(unittest.TestCase):
                         "PRAGMA index_list(requeue_events)"
                     )
                 }
+                refresh_columns = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA table_info(content_refresh_events)"
+                    )
+                }
+                analysis_indexes = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA index_list(parameter_analysis_runs)"
+                    )
+                }
             finally:
                 migrated_connection.close()
             self.assertTrue(
@@ -3087,6 +3461,8 @@ class StateStoreTests(unittest.TestCase):
             self.assertIn("scope_fingerprint", research_columns)
             self.assertIn("requeue_events", tables)
             self.assertIn("content_refresh_events", tables)
+            self.assertIn("verified_parameter_sets", tables)
+            self.assertIn("parameter_analysis_runs", tables)
             self.assertIn(
                 "content_failure_cutoff_attempt_id",
                 product_columns,
@@ -3095,6 +3471,16 @@ class StateStoreTests(unittest.TestCase):
             self.assertIn("leased_from_next_run_at", product_columns)
             self.assertIn("content_schema_version", product_columns)
             self.assertIn("requeue_events_product_idx", requeue_indexes)
+            self.assertIn("parameter_set_id", refresh_columns)
+            self.assertIn("analysis_run_id", refresh_columns)
+            self.assertIn(
+                "parameter_analysis_runs_started_idx",
+                analysis_indexes,
+            )
+            self.assertIn(
+                "parameter_analysis_runs_completed_idx",
+                analysis_indexes,
+            )
             legacy_product = migrated.get_product("LEGACY")
             self.assertEqual("due", legacy_product.leased_from_status)
             self.assertEqual(T0, legacy_product.leased_from_next_run_at)
@@ -3112,6 +3498,67 @@ class StateStoreTests(unittest.TestCase):
             )
             self.assertTrue(started.should_execute)
             self.assertEqual("started", started.record.status)
+        finally:
+            migrated.close()
+
+    def test_migrates_v10_refresh_events_with_empty_parameter_links(self):
+        legacy_path = Path(self.tempdir.name) / "legacy-v10.sqlite3"
+        timestamp = "2026-01-01T12:00:00.000000Z"
+        connection = sqlite3.connect(legacy_path)
+        connection.execute(
+            "CREATE TABLE products (product_id TEXT PRIMARY KEY)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE attempts (
+                attempt_id INTEGER PRIMARY KEY,
+                product_id TEXT NOT NULL REFERENCES products(product_id),
+                source_hash TEXT NOT NULL
+            )
+            """
+        )
+        for statement in state._CREATE_CONTENT_REFRESH_EVENT_SCHEMA:
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO products (product_id) VALUES ('LEGACY')"
+        )
+        connection.execute(
+            """
+            INSERT INTO attempts (attempt_id, product_id, source_hash)
+            VALUES (1, 'LEGACY', 'legacy-source')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO content_refresh_events (
+                product_id,
+                source_attempt_id,
+                previous_content_schema_version,
+                content_schema_version,
+                wiki_action,
+                fact_diagnostics_json,
+                refreshed_at
+            ) VALUES ('LEGACY', 1, 0, 1, 'updated', ?, ?)
+            """,
+            (
+                (
+                    '{"complete":true,"proposed":0,"retained":0,'
+                    '"rejected":0,"rejection_reasons":{}}'
+                ),
+                timestamp,
+            ),
+        )
+        connection.execute("PRAGMA user_version = 10")
+        connection.commit()
+        connection.close()
+
+        migrated = state.StateStore(legacy_path)
+        try:
+            self.assertEqual(state.SCHEMA_VERSION, migrated.schema_version)
+            events = migrated.content_refresh_event_history("LEGACY")
+            self.assertEqual(1, len(events))
+            self.assertIsNone(events[0].parameter_set_id)
+            self.assertIsNone(events[0].analysis_run_id)
         finally:
             migrated.close()
 

@@ -343,7 +343,9 @@ validated decision without spending search or AI credits:
 ```bash
 pv-wiki refresh-content
 pv-wiki refresh-content --product-id R5-10K-T2-15 --hydrate-parameters
+pv-wiki refresh-content --product-id R5-10K-T2-15 --hydrate-parameters --analyze-parameters
 pv-wiki refresh-content --apply --product-id R5-10K-T2-15 --hydrate-parameters
+pv-wiki refresh-content --apply --product-id R5-10K-T2-15 --hydrate-parameters --analyze-parameters
 pv-wiki refresh-content --apply --limit 100 --refresh-home
 ```
 
@@ -351,11 +353,21 @@ pv-wiki refresh-content --apply --limit 100 --refresh-home
 existing page at its recorded path, preserves visibility and human-authored
 content outside `PV-WIKI-AUTO`, and advances the durable content schema version
 only after Wiki.js succeeds. `--hydrate-parameters` explicitly re-downloads the
-stored primary manufacturer PDF, binds at most 30 rows to the exact target-model
+stored primary manufacturer PDF, binds at most 200 rows to the exact target-model
 column, and revalidates every row locally; it calls neither the search provider
-nor AI. Use its read-only preview for one private page before a batch.
-`--refresh-home` is explicit and runs only after a fully successful applied
-batch.
+nor AI. Cross-page tables remain bounded to the adjacent page and preserve their
+source table and subsection hierarchy.
+
+`--analyze-parameters` requires `--hydrate-parameters`. In preview mode it only
+reports the complete input count and does not call AI. With `--apply`, every
+verified row is translated into professional Chinese and the model analyzes the
+complete parameter set in basis-linked sections. The immutable parameter set and
+AI run are recorded before Wiki.js is updated, so a Wiki retry reuses the same
+completed result instead of paying for another model call. The reader table is
+rendered as `English source parameter | professional Chinese parameter | value`,
+with source sections as headings rather than a repeated column. Use the read-only
+preview for one private page before a batch. `--refresh-home` is explicit and
+runs only after a fully successful applied batch.
 
 Copy `.env.example` to an ignored `.env` and export it before running the CLI.
 Prefer `PGSSLMODE=verify-full` with `PGSSLROOTCERT` pointing at the mounted

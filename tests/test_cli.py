@@ -582,24 +582,32 @@ class CLITests(unittest.TestCase):
                 return_value=({"outcome": "publish"}, refresh_audit),
             ) as hydrate,
             mock.patch.object(cli, "WikiJSClient") as wiki_client,
+            mock.patch.object(cli, "OpenAICompatibleClient") as model_client,
         ):
             code, payload, error = self.run_cli(
                 "refresh-content",
                 "--product-id",
                 "P-42",
                 "--hydrate-parameters",
+                "--analyze-parameters",
             )
 
         self.assertEqual(0, code, error)
         self.assertTrue(payload["ok"])
         self.assertFalse(payload["apply"])
         self.assertTrue(payload["hydrate_parameters"])
+        self.assertTrue(payload["analyze_parameters"])
         self.assertEqual(
             refresh_audit,
             payload["candidates"][0]["datasheet_parameter_refresh"],
         )
+        self.assertEqual(
+            {"planned": True, "input_parameter_count": 1, "input_complete": True},
+            payload["candidates"][0]["parameter_analysis"],
+        )
         hydrate.assert_called_once()
         wiki_client.assert_not_called()
+        model_client.assert_not_called()
         with state.StateStore(self.state_path) as store:
             self.assertEqual(0, store.get_product("P-42").content_schema_version)
             self.assertEqual([], store.content_refresh_event_history("P-42"))
@@ -671,6 +679,136 @@ class CLITests(unittest.TestCase):
         self.assertEqual(1, len(events))
         self.assertEqual("updated", events[0].wiki_action)
 
+    def test_parameter_analysis_is_persisted_and_reused_after_wiki_failure(self) -> None:
+        self.record_synced_page()
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+                "WIKIJS_LOCALE": "zh-cn",
+            }
+        )
+        parameter = {
+            "name": "Rated Power [W]",
+            "section": "Output (AC)",
+            "subsection": "Performance",
+            "value": "42",
+            "unit": "W",
+            "confidence": 1.0,
+            "evidence_urls": ["https://acme.example/pv-42.pdf"],
+            "evidence_quotes": [
+                {
+                    "url": "https://acme.example/pv-42.pdf",
+                    "model_quote": "Type\tPV-40\tPV-42",
+                    "quote": "Rated Power [W]\t40\t42",
+                }
+            ],
+        }
+        enrichment = {
+            "translations": [
+                {
+                    "parameter_id": "p001",
+                    "name_zh": "额定功率 [W]",
+                    "section_zh": "交流输出（AC）",
+                    "subsection_zh": "性能参数",
+                    "value_zh": "",
+                }
+            ],
+            "sections": [
+                {
+                    "section_code": "product_positioning",
+                    "paragraphs": [
+                        {
+                            "analysis_kind": "engineering_interpretation",
+                            "basis_parameter_ids": ["p001"],
+                            "analysis_zh": (
+                                "额定功率参数为42，这是该产品功率配置的直接依据；"
+                                "项目应用仍需结合并网条件、负载边界和现场约束进行核对。"
+                            ),
+                            "conditions_zh": ["应先核对项目侧的实际设计输入。"],
+                            "limitations_zh": ["参数表不能替代完整的系统设计。"],
+                        }
+                    ],
+                }
+            ],
+            "overall_limitations_zh": [
+                "以上内容仅解释已核验参数，不替代厂家确认或现场校核。"
+            ],
+        }
+        refresh_audit = {
+            "url": "https://acme.example/pv-42.pdf",
+            "pdf_sha256": "a" * 64,
+            "page_count": 2,
+            "extracted_pages": 2,
+            "parsed_parameter_count": 1,
+            "retained_parameter_count": 1,
+        }
+
+        def hydrate(_product_id: str, _payload: dict, stored: dict):
+            return ({**stored, "datasheet_parameters": [parameter]}, refresh_audit)
+
+        model_client = mock.Mock()
+        model_client.analyze_parameters.return_value = enrichment
+        model_client.last_parameter_analysis_provider_requests = 1
+        model_client.last_response_metadata = ()
+        wiki_client = mock.Mock()
+        wiki_client.update_existing_page.side_effect = [
+            cli.WikiJSError("temporary Wiki failure"),
+            {"action": "updated", "page": {"id": 42}},
+        ]
+        model_settings = ai.AISettings(
+            base_url="https://llm.example/v1",
+            api_key="secret",
+            model="analysis-model",
+            max_evidence_chars=12_000,
+        )
+        arguments = (
+            "refresh-content",
+            "--apply",
+            "--product-id",
+            "P-42",
+            "--hydrate-parameters",
+            "--analyze-parameters",
+        )
+        with (
+            mock.patch.object(cli, "WikiJSClient", return_value=wiki_client),
+            mock.patch.object(cli, "AISettings") as settings_type,
+            mock.patch.object(
+                cli, "OpenAICompatibleClient", return_value=model_client
+            ),
+            mock.patch.object(
+                cli,
+                "_refresh_decision_parameters_from_primary_pdf",
+                side_effect=hydrate,
+            ),
+        ):
+            settings_type.from_env.return_value = model_settings
+            first_code, first_payload, first_error = self.run_cli(*arguments)
+            second_code, second_payload, second_error = self.run_cli(*arguments)
+
+        self.assertEqual(1, first_code, first_error)
+        self.assertFalse(first_payload["ok"])
+        self.assertEqual(0, second_code, second_error)
+        self.assertTrue(second_payload["ok"])
+        self.assertEqual(1, model_client.analyze_parameters.call_count)
+        enrichment_audit = second_payload["refreshed"][0]["parameter_enrichment"]
+        self.assertTrue(enrichment_audit["analysis_reused"])
+        self.assertEqual(0, enrichment_audit["provider_requests"])
+        managed = wiki_client.update_existing_page.call_args.args[4]
+        self.assertIn("| 英文原文参数 | 专业中文参数 | 值 |", managed)
+        self.assertIn("| Rated Power \\[W\\] | 额定功率 \\[W\\] | 42 W |", managed)
+        self.assertIn("### 产品定位与功率配置", managed)
+        self.assertIn("额定功率参数为42", managed)
+        with state.StateStore(self.state_path) as store:
+            sets = store.verified_parameter_set_history("P-42")
+            runs = store.parameter_analysis_run_history(sets[0].parameter_set_id)
+            events = store.content_refresh_event_history("P-42")
+        self.assertEqual(1, len(sets))
+        self.assertEqual(1, len(runs))
+        self.assertEqual("completed", runs[0].status)
+        self.assertEqual(sets[0].parameter_set_id, events[0].parameter_set_id)
+        self.assertEqual(runs[0].analysis_run_id, events[0].analysis_run_id)
+
     def test_refresh_content_rechecks_candidate_before_wiki_mutation(self) -> None:
         self.record_synced_page()
         os.environ.update(
@@ -724,6 +862,19 @@ class CLITests(unittest.TestCase):
         self.assertEqual(2, code, error)
         self.assertEqual({}, payload)
         self.assertIn("--refresh-home requires --apply", error)
+
+    def test_refresh_content_analysis_requires_hydration(self) -> None:
+        code, payload, error = self.run_cli(
+            "refresh-content",
+            "--analyze-parameters",
+        )
+
+        self.assertEqual(2, code, error)
+        self.assertEqual({}, payload)
+        self.assertIn(
+            "--analyze-parameters requires --hydrate-parameters",
+            error,
+        )
 
     def test_search_uses_leased_snapshot_and_bounded_client(self) -> None:
         token = self.claim()
@@ -1176,6 +1327,8 @@ class CLITests(unittest.TestCase):
                 "value": "42",
                 "unit": "W",
                 "section": "Output",
+                "table_title": "",
+                "value_state": "explicit",
                 "page": 1,
                 "order": 1,
                 "model_quote": "Type\tPV-40\tPV-42",

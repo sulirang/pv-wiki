@@ -176,7 +176,7 @@
     },
     "datasheet_parameters": {
       "type": "array",
-      "maxItems": 30,
+      "maxItems": 200,
       "items": {
         "allOf": [
           {"$ref": "#/$defs/groundedEvidence"},
@@ -192,8 +192,13 @@
             ],
             "properties": {
               "name": true,
+              "name_zh": {"type": "string", "maxLength": 200},
               "section": {"type": "string", "maxLength": 100},
+              "section_zh": {"type": "string", "maxLength": 100},
+              "subsection": {"type": "string", "maxLength": 100},
+              "subsection_zh": {"type": "string", "maxLength": 100},
               "value": true,
+              "value_zh": {"type": "string", "maxLength": 200},
               "unit": true,
               "confidence": true,
               "evidence_urls": true,

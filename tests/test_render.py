@@ -12,6 +12,7 @@ SCRIPTS = (
     / "wikijs-sync-products"
     / "scripts"
 )
+PRODUCT_TEMPLATE = SCRIPTS.parent / "templates" / "product-page.md"
 sys.path.insert(0, str(SCRIPTS))
 
 from pv_wiki import render  # noqa: E402
@@ -58,6 +59,10 @@ class UrlAndEscapingTests(unittest.TestCase):
         self.assertEqual(
             r"PV\|42 &lt;script&gt;",
             render.escape_table_cell("PV|42 <script>"),
+        )
+        self.assertEqual(
+            r"\[x\]\(javascript:bad\) \`code\` \*em\*",
+            render.escape_table_cell("[x](javascript:bad) `code` *em*"),
         )
         link = render.markdown_link(
             "Official ](bad)",
@@ -297,8 +302,32 @@ class RenderTests(unittest.TestCase):
             {
                 "product_description_zh": "10kW 三相太阳能逆变器，双 MPPT",
                 "datasheet_parameters": [
-                    {"section": "DC Input", "name": "Max. DC voltage", "value": 1000, "unit": "V"},
-                    {"section": "AC Output", "name": "Rated output power", "value": 10, "unit": "kW"},
+                    {
+                        "section": "DC Input",
+                        "section_zh": "直流输入",
+                        "subsection": "PV input",
+                        "subsection_zh": "光伏输入",
+                        "name": "Max. DC voltage",
+                        "name_zh": "最大直流电压",
+                        "value": 1000,
+                        "unit": "V",
+                    },
+                    {
+                        "section": "AC Output",
+                        "section_zh": "交流输出",
+                        "name": "Rated output power",
+                        "name_zh": "额定输出功率",
+                        "value": 10,
+                        "unit": "kW",
+                    },
+                    {
+                        "section": "DC Input",
+                        "section_zh": "直流输入",
+                        "name": "Start voltage",
+                        "name_zh": "启动电压",
+                        "value": 160,
+                        "unit": "V",
+                    },
                 ],
                 "facts": [],
                 "derived_insights": [
@@ -324,12 +353,284 @@ class RenderTests(unittest.TestCase):
             rendered.index("Max. DC voltage"),
             rendered.index("Rated output power"),
         )
-        self.assertIn("| DC Input | Max. DC voltage | 1000 V |", rendered)
+        self.assertLess(
+            rendered.index("Rated output power"),
+            rendered.index("Start voltage"),
+        )
+        self.assertEqual(2, rendered.count("#### DC Input｜直流输入"))
+        self.assertIn("#### DC Input｜直流输入", rendered)
+        self.assertIn("##### PV input｜光伏输入", rendered)
+        self.assertIn(
+            "| 英文原文参数 | 专业中文参数 | 值 |",
+            rendered,
+        )
+        self.assertIn(
+            "| Max. DC voltage | 最大直流电压 | 1000 V |",
+            rendered,
+        )
+        self.assertIn(
+            "| Rated output power | 额定输出功率 | 10 kW |",
+            rendered,
+        )
+        self.assertNotIn("| 数据表章节 | 参数 | 值 |", rendered)
         self.assertIn("### AI 参数对照（需复核）", rendered)
         self.assertIn("1000 ÷ 10", rendered)
         self.assertIn("Max. DC voltage、Rated output power", rendered)
         self.assertIn("仅复核二元算术", rendered)
         self.assertIn("不验证工程含义、量纲兼容性或单位换算", rendered)
+
+    def test_datasheet_parameter_groups_escape_titles_and_preserve_empty_values(
+        self,
+    ) -> None:
+        rendered = render.render_product_page(
+            {"product_id": "SAFE-1", "product_name": "Safe rendering"},
+            {
+                "datasheet_parameters": [
+                    {
+                        "section": "DC\n## Injected <script> *unsafe*",
+                        "section_zh": "直流|输入",
+                        "subsection": "MPPT [A]",
+                        "subsection_zh": "跟踪器\nA",
+                        "name": "Max|voltage <x>",
+                        "name_zh": "最大电压",
+                        "value": 0,
+                        "unit": "V|dc",
+                    },
+                    {
+                        "section": "DC\n## Injected <script> *unsafe*",
+                        "section_zh": "直流|输入",
+                        "subsection": "MPPT [A]",
+                        "subsection_zh": "跟踪器\nA",
+                        "name": "Enabled",
+                        "value": False,
+                    },
+                    {
+                        "section": "DC\n## Injected <script> *unsafe*",
+                        "section_zh": "直流|输入",
+                        "name": "Blank value",
+                        "name_zh": "空值",
+                        "value": "",
+                        "unit": "V",
+                    },
+                    {
+                        "name": "Ungrouped",
+                        "name_zh": "未分组参数",
+                        "value": 1,
+                    },
+                ]
+            },
+        )
+
+        self.assertIn(
+            r"#### DC ## Injected &lt;script&gt; \*unsafe\*｜直流|输入",
+            rendered,
+        )
+        self.assertIn(r"##### MPPT \[A\]｜跟踪器 A", rendered)
+        self.assertNotIn("\n## Injected", rendered)
+        self.assertNotIn("<script>", rendered)
+        self.assertIn(
+            r"| Max\|voltage &lt;x&gt; | 最大电压 | 0 V\|dc |",
+            rendered,
+        )
+        self.assertIn("| Enabled | — | false |", rendered)
+        self.assertIn("| Blank value | 空值 |  |", rendered)
+        self.assertNotIn("| Blank value | 空值 | V |", rendered)
+        self.assertIn("##### 未分组", rendered)
+        self.assertIn("#### 未分组", rendered)
+        self.assertEqual(
+            3,
+            rendered.count("| 英文原文参数 | 专业中文参数 | 值 |"),
+        )
+        self.assertLess(rendered.index("Max\\|voltage"), rendered.index("Enabled"))
+        self.assertLess(rendered.index("Enabled"), rendered.index("Blank value"))
+        self.assertLess(rendered.index("Blank value"), rendered.index("Ungrouped"))
+
+    def test_professional_analysis_resolves_parameter_ids_and_escapes_content(
+        self,
+    ) -> None:
+        section_titles = {
+            "product_positioning": "产品定位与功率配置",
+            "dc_input": "直流输入与 MPPT",
+            "ac_output": "交流输出与电网侧",
+            "efficiency": "效率表现",
+            "protection": "保护功能与电气安全",
+            "installation": "安装、环境与运维",
+            "limitations": "数据边界与选型注意事项",
+        }
+        rendered = render.render_product_page(
+            {"product_id": "ANALYSIS-1", "product_name": "Analysis product"},
+            {
+                "summary": "This legacy summary must not be duplicated.",
+                "datasheet_parameters": [
+                    {
+                        "section": "Input",
+                        "name": "Max. DC voltage",
+                        "name_zh": "最大直流电压",
+                        "value": 1000,
+                        "unit": "V",
+                    },
+                    {
+                        "section": "Output",
+                        "name": "Rated output power",
+                        "name_zh": "额定输出功率",
+                        "value": 10,
+                        "unit": "kW",
+                    },
+                ],
+                "professional_analysis": {
+                    "input_parameter_count": 2,
+                    "input_complete": True,
+                    "sections": [
+                        {
+                            "section_code": code,
+                            "paragraphs": [
+                                {
+                                    "analysis_kind": "parameter_interpretation",
+                                    "analysis_zh": (
+                                        f"{title}结论 [需复核] <script>。"
+                                    ),
+                                    "basis_parameter_ids": [
+                                        "p001",
+                                        "p002",
+                                        "p001",
+                                        "unknown\n## Injected",
+                                    ],
+                                    "conditions_zh": ["在 `额定` 条件下。"],
+                                    "limitations_zh": [
+                                        "不代表 *系统兼容性*。"
+                                    ],
+                                }
+                            ],
+                        }
+                        for code, title in section_titles.items()
+                    ]
+                    + [
+                        {
+                            "section_code": "unknown\n## Injected",
+                            "paragraphs": [
+                                {
+                                    "analysis_kind": "unsafe",
+                                    "analysis_zh": "不应显示",
+                                    "basis_parameter_ids": ["p001"],
+                                }
+                            ],
+                        }
+                    ],
+                    "overall_limitations_zh": [
+                        "仍需核对 [项目现场] <script> 条件。"
+                    ],
+                },
+            },
+        )
+
+        self.assertLess(
+            rendered.index("| Rated output power |"),
+            rendered.index("## 产品分析"),
+        )
+        self.assertIn(
+            "系统向模型提供了本页全部 2 项已核验参数。",
+            rendered,
+        )
+        self.assertNotIn("逐项审阅", rendered)
+        for title in section_titles.values():
+            self.assertIn(f"### {title}", rendered)
+        self.assertEqual(
+            7,
+            rendered.count(
+                "- **依据参数：** p001 Max. DC voltage = 1000 V；"
+                "p002 Rated output power = 10 kW"
+            ),
+        )
+        self.assertIn(r"\[需复核\] &lt;script&gt;。", rendered)
+        self.assertIn(r"- **适用条件：** 在 \`额定\` 条件下。", rendered)
+        self.assertIn(r"- **注意事项：** 不代表 \*系统兼容性\*。", rendered)
+        self.assertIn(
+            r"- 仍需核对 \[项目现场\] &lt;script&gt; 条件。",
+            rendered,
+        )
+        self.assertEqual(
+            1,
+            rendered.count("### 数据边界与选型注意事项"),
+        )
+        self.assertNotIn("<script>", rendered)
+        self.assertNotIn("\n## Injected", rendered)
+        self.assertNotIn("不应显示", rendered)
+        self.assertNotIn("This legacy summary must not be duplicated.", rendered)
+
+    def test_overall_limitations_create_the_fixed_section_when_missing(
+        self,
+    ) -> None:
+        rendered = render.render_product_page(
+            {"product_id": "LIMIT-1", "product_name": "Limited product"},
+            {
+                "datasheet_parameters": [
+                    {
+                        "name": "Rated power",
+                        "name_zh": "额定功率",
+                        "value": 10,
+                        "unit": "kW",
+                    }
+                ],
+                "professional_analysis": {
+                    "input_parameter_count": 1,
+                    "input_complete": True,
+                    "sections": [
+                        {
+                            "section_code": "product_positioning",
+                            "paragraphs": [
+                                {
+                                    "analysis_kind": "engineering_interpretation",
+                                    "analysis_zh": "该参数可用于描述产品的额定功率边界。",
+                                    "basis_parameter_ids": ["p001"],
+                                    "conditions_zh": [],
+                                    "limitations_zh": [],
+                                }
+                            ],
+                        }
+                    ],
+                    "overall_limitations_zh": [
+                        "仍需结合项目条件完成选型。"
+                    ],
+                },
+            },
+        )
+
+        self.assertEqual(
+            1,
+            rendered.count("### 数据边界与选型注意事项"),
+        )
+        self.assertIn("- 仍需结合项目条件完成选型。", rendered)
+
+    def test_legacy_summary_falls_back_to_product_analysis_after_parameters(
+        self,
+    ) -> None:
+        rendered = render.render_product_page(
+            {"product_id": "LEGACY-1", "product_name": "Legacy product"},
+            {"summary": "Legacy [summary] remains available."},
+        )
+
+        self.assertIn("## 产品分析", rendered)
+        self.assertIn(r"Legacy \[summary\] remains available.", rendered)
+        self.assertLess(rendered.index("## 产品参数"), rendered.index("## 产品分析"))
+        self.assertEqual(
+            1,
+            rendered.count(r"Legacy \[summary\] remains available."),
+        )
+
+    def test_product_template_documents_nested_parameter_groups_and_analysis(
+        self,
+    ) -> None:
+        template = PRODUCT_TEMPLATE.read_text(encoding="utf-8")
+
+        self.assertIn("## 产品参数", template)
+        self.assertIn("### 数据表参数", template)
+        self.assertIn("#### {{ bilingual_section }}", template)
+        self.assertIn("##### {{ bilingual_subsection }}", template)
+        self.assertIn("| 英文原文参数 | 专业中文参数 | 值 |", template)
+        self.assertNotIn("| 数据表章节 | 参数 | 值 |", template)
+        self.assertIn("## 产品分析", template)
+        self.assertIn("{{ professional_analysis_or_product_summary }}", template)
+        self.assertLess(template.index("## 产品参数"), template.index("## 产品分析"))
 
     def test_legacy_description_removes_brand_model_and_series_prefixes(
         self,

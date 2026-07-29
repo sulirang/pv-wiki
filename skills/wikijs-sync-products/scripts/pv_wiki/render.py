@@ -220,7 +220,8 @@ def escape_table_cell(value: Any) -> str:
 
     text = _plain_text(value)
     text = html.escape(text, quote=False)
-    return text.replace("\\", "\\\\").replace("|", "\\|")
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    return re.sub(r"([\[\]()*_`])", r"\\\1", text)
 
 
 def _escape_markdown_text(value: Any) -> str:
@@ -343,27 +344,38 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
     )
 
 
-def _datasheet_parameters(decision: Any) -> list[tuple[str, str, Any]]:
-    """Return source-ordered datasheet parameters without sorting or regrouping."""
+def _datasheet_parameters(decision: Any) -> list[dict[str, str]]:
+    """Return display-ready datasheet parameters in their exact source order."""
 
-    parameters: list[tuple[str, str, Any]] = []
+    parameters: list[dict[str, str]] = []
     for item in _as_items(_get(decision, "datasheet_parameters")):
         if not isinstance(item, Mapping):
             continue
         name = _first(item, ("name", "key", "label", "parameter"))
-        value = _first(item, ("value", "content", "text"))
-        if name is None or value is None:
+        value_present = False
+        value: Any = None
+        for key in ("value", "content", "text"):
+            if key in item:
+                value = item[key]
+                value_present = True
+                break
+        if name is None or not value_present or value is None:
             continue
         unit = _first(item, ("unit", "units"))
         rendered_value = _plain_text(value)
-        if unit is not None and _plain_text(unit):
+        if rendered_value and unit is not None and _plain_text(unit):
             rendered_value = f"{rendered_value} {_plain_text(unit)}"
         parameters.append(
-            (
-                _plain_text(_get(item, "section")),
-                _plain_text(name),
-                rendered_value,
-            )
+            {
+                "id": f"p{len(parameters) + 1:03d}",
+                "section": _plain_text(_get(item, "section")),
+                "section_zh": _plain_text(_get(item, "section_zh")),
+                "subsection": _plain_text(_get(item, "subsection")),
+                "subsection_zh": _plain_text(_get(item, "subsection_zh")),
+                "name": _plain_text(name),
+                "name_zh": _plain_text(_get(item, "name_zh")),
+                "value": rendered_value,
+            }
         )
     return parameters
 
@@ -400,6 +412,190 @@ def _derived_insights(decision: Any) -> list[dict[str, Any]]:
 def _display_identity_key(value: Any) -> str:
     normalized = unicodedata.normalize("NFKC", _plain_text(value)).casefold()
     return "".join(character for character in normalized if character.isalnum())
+
+
+def _bilingual_heading(
+    source: Any,
+    localized: Any,
+    *,
+    fallback: str,
+) -> str:
+    source_text = _plain_text(source)
+    localized_text = _plain_text(localized)
+    if source_text and localized_text:
+        if _display_identity_key(source_text) == _display_identity_key(localized_text):
+            return source_text
+        return f"{source_text}｜{localized_text}"
+    return source_text or localized_text or fallback
+
+
+_PROFESSIONAL_ANALYSIS_SECTION_TITLES = {
+    "product_positioning": "产品定位与功率配置",
+    "dc_input": "直流输入与 MPPT",
+    "ac_output": "交流输出与电网侧",
+    "efficiency": "效率表现",
+    "protection": "保护功能与电气安全",
+    "installation": "安装、环境与运维",
+    "limitations": "数据边界与选型注意事项",
+}
+
+
+def _professional_analysis_lines(
+    decision: Any,
+    datasheet_parameters: Sequence[Mapping[str, str]],
+) -> list[str]:
+    """Render grounded structured analysis, or the legacy summary as fallback."""
+
+    raw_analysis = _get(decision, "professional_analysis")
+    overall_limitations = [
+        text
+        for item in _as_items(
+            _get(raw_analysis, "overall_limitations_zh")
+            if isinstance(raw_analysis, Mapping)
+            else None
+        )
+        if (text := _plain_text(item))
+    ]
+    parameter_by_id = {
+        parameter["id"]: parameter
+        for parameter in datasheet_parameters
+        if parameter.get("id")
+    }
+    section_lines: list[str] = []
+    rendered_limitations_section = False
+    if isinstance(raw_analysis, Mapping):
+        for section in _as_items(_get(raw_analysis, "sections")):
+            if not isinstance(section, Mapping):
+                continue
+            section_code = _plain_text(_get(section, "section_code"))
+            section_title = _PROFESSIONAL_ANALYSIS_SECTION_TITLES.get(section_code)
+            if section_title is None:
+                continue
+
+            paragraph_lines: list[str] = []
+            for paragraph in _as_items(_get(section, "paragraphs")):
+                if not isinstance(paragraph, Mapping):
+                    continue
+                analysis_text = _plain_text(_get(paragraph, "analysis_zh"))
+                if not analysis_text:
+                    continue
+
+                resolved_basis: list[str] = []
+                seen_basis_ids: set[str] = set()
+                for raw_parameter_id in _as_items(
+                    _get(paragraph, "basis_parameter_ids")
+                ):
+                    parameter_id = _plain_text(raw_parameter_id)
+                    if parameter_id in seen_basis_ids:
+                        continue
+                    parameter = parameter_by_id.get(parameter_id)
+                    if parameter is None:
+                        continue
+                    seen_basis_ids.add(parameter_id)
+                    resolved_basis.append(
+                        f"{parameter_id} "
+                        f"{_escape_markdown_text(parameter['name'])} = "
+                        f"{_escape_markdown_text(parameter['value'])}"
+                    )
+
+                if paragraph_lines:
+                    paragraph_lines.append("")
+                paragraph_lines.append(_escape_markdown_text(analysis_text))
+                paragraph_lines.extend(
+                    [
+                        "",
+                        (
+                            "- **依据参数：** "
+                            + (
+                                "；".join(resolved_basis)
+                                if resolved_basis
+                                else "—"
+                            )
+                        ),
+                    ]
+                )
+                conditions = [
+                    text
+                    for item in _as_items(_get(paragraph, "conditions_zh"))
+                    if (text := _plain_text(item))
+                ]
+                if conditions:
+                    paragraph_lines.append(
+                        "- **适用条件：** "
+                        + "；".join(
+                            _escape_markdown_text(item) for item in conditions
+                        )
+                    )
+                limitations = [
+                    text
+                    for item in _as_items(_get(paragraph, "limitations_zh"))
+                    if (text := _plain_text(item))
+                ]
+                if limitations:
+                    paragraph_lines.append(
+                        "- **注意事项：** "
+                        + "；".join(
+                            _escape_markdown_text(item) for item in limitations
+                        )
+                    )
+
+            if section_code == "limitations":
+                rendered_limitations_section = True
+                if overall_limitations:
+                    if paragraph_lines:
+                        paragraph_lines.append("")
+                    paragraph_lines.extend(["**总体注意事项：**", ""])
+                    paragraph_lines.extend(
+                        f"- {_escape_markdown_text(item)}"
+                        for item in overall_limitations
+                    )
+            if paragraph_lines:
+                section_lines.extend(
+                    ["", f"### {section_title}", "", *paragraph_lines]
+                )
+
+    if overall_limitations and not rendered_limitations_section:
+        section_lines.extend(
+            [
+                "",
+                "### 数据边界与选型注意事项",
+                "",
+                "**总体注意事项：**",
+                "",
+                *(
+                    f"- {_escape_markdown_text(item)}"
+                    for item in overall_limitations
+                ),
+            ]
+        )
+
+    if section_lines:
+        lines = ["", "## 产品分析", ""]
+        if isinstance(raw_analysis, Mapping) and _get(
+            raw_analysis, "input_complete"
+        ) is True:
+            lines.append(
+                "系统向模型提供了本页全部 "
+                f"{len(datasheet_parameters)} 项已核验参数。"
+            )
+        elif isinstance(raw_analysis, Mapping):
+            supplied_count = _get(raw_analysis, "input_parameter_count")
+            if (
+                isinstance(supplied_count, int)
+                and not isinstance(supplied_count, bool)
+                and 0 <= supplied_count <= len(datasheet_parameters)
+            ):
+                lines.append(
+                    f"系统向模型提供了 {supplied_count} 项已核验参数；"
+                    f"本页展示 {len(datasheet_parameters)} 项，分析输入并不完整。"
+                )
+        lines.extend(section_lines)
+        return lines
+
+    summary = _get(decision, "summary")
+    if summary is not None and _plain_text(summary):
+        return ["", "## 产品分析", "", _escape_markdown_text(summary)]
+    return []
 
 
 def product_page_title(product: Any) -> str:
@@ -940,10 +1136,6 @@ def render_product_page(
     else:  # pragma: no cover - title guarantees a useful row for normal inputs
         lines.append("| 产品 | 未提供 |")
 
-    summary = _get(decision, "summary")
-    if summary is not None and _plain_text(summary):
-        lines.extend(["", _escape_markdown_text(summary)])
-
     review_summary = _get(decision, "review_summary")
     if review_summary is not None and _plain_text(review_summary):
         lines.extend(
@@ -960,24 +1152,60 @@ def render_product_page(
     if datasheet_parameters:
         lines.append(
             f"**参数完整性：** 已安全提取 {len(datasheet_parameters)} 项数据表参数，"
-            "按原数据表顺序和章节展示；此数量不代表数据表的全部字段。"
+            "按原数据表顺序和层级展示；此数量不代表数据表的全部字段。"
         )
         lines.extend(
             [
                 "",
                 "### 数据表参数",
-                "",
-                "| 数据表章节 | 参数 | 值 |",
-                "| --- | --- | --- |",
             ]
         )
-        lines.extend(
-            (
-                f"| {escape_table_cell(section or '未分组')} | "
-                f"{escape_table_cell(name)} | {escape_table_cell(value)} |"
+        previous_section: tuple[str, str] | None = None
+        previous_subsection: tuple[str, str] | None = None
+        for parameter in datasheet_parameters:
+            section = (parameter["section"], parameter["section_zh"])
+            subsection = (
+                parameter["subsection"],
+                parameter["subsection_zh"],
             )
-            for section, name, value in datasheet_parameters
-        )
+            section_changed = section != previous_section
+            subsection_changed = section_changed or subsection != previous_subsection
+            if section_changed:
+                section_title = _bilingual_heading(
+                    *section,
+                    fallback="未分组",
+                )
+                lines.extend(
+                    ["", f"#### {_escape_markdown_text(section_title)}"]
+                )
+            if subsection_changed:
+                subsection_title = _bilingual_heading(
+                    *subsection,
+                    fallback="",
+                )
+                if subsection_title:
+                    lines.extend(
+                        [
+                            "",
+                            f"##### {_escape_markdown_text(subsection_title)}",
+                        ]
+                    )
+                elif not section_changed:
+                    lines.extend(["", "##### 未分组"])
+                lines.extend(
+                    [
+                        "",
+                        "| 英文原文参数 | 专业中文参数 | 值 |",
+                        "| --- | --- | --- |",
+                    ]
+                )
+            lines.append(
+                f"| {escape_table_cell(parameter['name'])} | "
+                f"{escape_table_cell(parameter['name_zh'] or '—')} | "
+                f"{escape_table_cell(parameter['value'])} |"
+            )
+            previous_section = section
+            previous_subsection = subsection
     else:
         lines.append(
             "**参数完整性：** 暂未提取到可安全归属该型号的数据表参数；"
@@ -1030,6 +1258,8 @@ def render_product_page(
             )
             for item in derived_insights
         )
+
+    lines.extend(_professional_analysis_lines(decision, datasheet_parameters))
 
     sources = _collect_sources(decision)
 

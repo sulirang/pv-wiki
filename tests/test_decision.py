@@ -1306,8 +1306,8 @@ class DecisionTests(unittest.TestCase):
             result["derived_insights"][0]["value"],
         )
 
-        item["datasheet_parameters"] = [{} for _ in range(31)]
-        with self.assertRaisesRegex(DecisionError, "at most 30"):
+        item["datasheet_parameters"] = [{} for _ in range(201)]
+        with self.assertRaisesRegex(DecisionError, "at most 200"):
             validate_decision(
                 item,
                 expected_product_id="P-42",
@@ -1324,6 +1324,249 @@ class DecisionTests(unittest.TestCase):
                 expected_product_id="P-42",
                 expected_lease_token="1234567890abcdef",
             )
+
+    def test_datasheet_parameter_translations_and_hierarchy_are_normalized(
+        self,
+    ) -> None:
+        item = valid_decision()
+        item["facts"] = []
+        source_parameter = {
+            key: value
+            for key, value in valid_decision()["facts"][0].items()
+            if key != "category"
+        }
+        item["datasheet_parameters"] = [
+            {
+                **source_parameter,
+                "name_zh": "额定功率",
+                "section": "Electrical Data",
+                "section_zh": "电气参数",
+                "subsection": subsection,
+                "subsection_zh": subsection_zh,
+                "value_zh": "额定值 42 W",
+            }
+            for subsection, subsection_zh in (
+                ("Rated values", "额定值"),
+                ("Operating limits", "运行限值"),
+            )
+        ]
+
+        result = validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+        )
+
+        self.assertEqual(
+            [
+                {
+                    "name_zh": "额定功率",
+                    "section": "Electrical Data",
+                    "section_zh": "电气参数",
+                    "subsection": "Rated values",
+                    "subsection_zh": "额定值",
+                    "value_zh": "额定值 42 W",
+                },
+                {
+                    "name_zh": "额定功率",
+                    "section": "Electrical Data",
+                    "section_zh": "电气参数",
+                    "subsection": "Operating limits",
+                    "subsection_zh": "运行限值",
+                    "value_zh": "额定值 42 W",
+                },
+            ],
+            [
+                {
+                    key: parameter[key]
+                    for key in (
+                        "name_zh",
+                        "section",
+                        "section_zh",
+                        "subsection",
+                        "subsection_zh",
+                        "value_zh",
+                    )
+                }
+                for parameter in result["datasheet_parameters"]
+            ],
+        )
+
+        duplicate = copy.deepcopy(item)
+        duplicate["datasheet_parameters"][1]["subsection"] = "Rated values"
+        with self.assertRaisesRegex(
+            DecisionError,
+            "unique within each section and subsection",
+        ):
+            validate_decision(
+                duplicate,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+    def test_datasheet_translation_fields_are_closed_and_require_chinese(
+        self,
+    ) -> None:
+        source_parameter = {
+            key: value
+            for key, value in valid_decision()["facts"][0].items()
+            if key != "category"
+        }
+
+        unknown = valid_decision()
+        unknown["facts"] = []
+        unknown["datasheet_parameters"] = [
+            {**source_parameter, "unexpected_translation": "功率"}
+        ]
+        with self.assertRaisesRegex(
+            DecisionError,
+            r"datasheet_parameters\[0\] has unknown fields",
+        ):
+            validate_decision(
+                unknown,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+        fact_with_translation = valid_decision()
+        fact_with_translation["facts"][0]["name_zh"] = "额定功率"
+        with self.assertRaisesRegex(
+            DecisionError,
+            r"facts\[0\] has unknown fields",
+        ):
+            validate_decision(
+                fact_with_translation,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+        for field, value in (
+            ("name_zh", "Rated power"),
+            ("section_zh", "Electrical data"),
+            ("subsection_zh", "Rated values"),
+            ("value_zh", "42 W"),
+        ):
+            with self.subTest(field=field):
+                invalid = valid_decision()
+                invalid["facts"] = []
+                invalid["datasheet_parameters"] = [
+                    {
+                        **source_parameter,
+                        "section": "Electrical Data",
+                        "subsection": "Rated values",
+                        field: value,
+                    }
+                ]
+                with self.assertRaisesRegex(
+                    DecisionError,
+                    rf"datasheet_parameters\[0\]\.{field} must contain "
+                    "Simplified Chinese",
+                ):
+                    validate_decision(
+                        invalid,
+                        expected_product_id="P-42",
+                        expected_lease_token="1234567890abcdef",
+                    )
+
+    def test_datasheet_translation_fields_enforce_bounded_lengths(self) -> None:
+        source_parameter = {
+            key: value
+            for key, value in valid_decision()["facts"][0].items()
+            if key != "category"
+        }
+        for field, value, limit in (
+            ("name_zh", "参" * 201, 200),
+            ("value_zh", "值" * 201, 200),
+            ("section_zh", "节" * 101, 100),
+            ("subsection_zh", "组" * 101, 100),
+            ("subsection", "x" * 101, 100),
+        ):
+            with self.subTest(field=field):
+                invalid = valid_decision()
+                invalid["facts"] = []
+                invalid["datasheet_parameters"] = [
+                    {**source_parameter, field: value}
+                ]
+                with self.assertRaisesRegex(
+                    DecisionError,
+                    rf"datasheet_parameters\[0\]\.{field} exceeds {limit} "
+                    "characters",
+                ):
+                    validate_decision(
+                        invalid,
+                        expected_product_id="P-42",
+                        expected_lease_token="1234567890abcdef",
+                    )
+
+    def test_datasheet_parameter_limit_accepts_200_grounded_rows(self) -> None:
+        item = valid_decision()
+        item["facts"] = []
+        parameters = []
+        quotes = []
+        for index in range(200):
+            suffix = f"{chr(65 + index // 26)}{chr(65 + index % 26)}"
+            name = f"Parameter {suffix}"
+            quote = f"PV-42 {name} documented"
+            quotes.append(quote)
+            parameters.append(
+                {
+                    "name": name,
+                    "value": "documented",
+                    "confidence": 0.95,
+                    "evidence_urls": ["https://acme.example/PV-42.pdf"],
+                    "evidence_quotes": [
+                        {
+                            "url": "https://acme.example/PV-42.pdf",
+                            "quote": quote,
+                        }
+                    ],
+                }
+            )
+        item["datasheet_parameters"] = parameters
+
+        result = validate_decision(
+            item,
+            expected_product_id="P-42",
+            expected_lease_token="1234567890abcdef",
+            evidence_text_by_url={
+                "https://acme.example/PV-42.pdf": "\n".join(quotes)
+            },
+        )
+        self.assertEqual(200, len(result["datasheet_parameters"]))
+
+        item["datasheet_parameters"].append({})
+        with self.assertRaisesRegex(DecisionError, "at most 200"):
+            validate_decision(
+                item,
+                expected_product_id="P-42",
+                expected_lease_token="1234567890abcdef",
+            )
+
+    def test_datasheet_display_fields_do_not_weaken_source_grounding(self) -> None:
+        source_parameter = {
+            key: value
+            for key, value in valid_decision()["facts"][0].items()
+            if key != "category"
+        }
+        for replacement in (
+            {"name": "Translated power", "name_zh": "额定功率"},
+            {"value": "", "value_zh": ""},
+        ):
+            with self.subTest(replacement=replacement):
+                item = valid_decision()
+                item["facts"] = []
+                item["datasheet_parameters"] = [
+                    {**source_parameter, **replacement}
+                ]
+                with self.assertRaisesRegex(
+                    DecisionError,
+                    "exact supporting extract span",
+                ):
+                    validate_decision(
+                        item,
+                        expected_product_id="P-42",
+                        expected_lease_token="1234567890abcdef",
+                    )
 
     def test_derived_insights_require_recomputable_binary_arithmetic(self) -> None:
         base = valid_decision()
@@ -1420,7 +1663,7 @@ class DecisionTests(unittest.TestCase):
             <= set(schema["required"])
         )
         self.assertEqual(
-            30,
+            200,
             schema["properties"]["datasheet_parameters"]["maxItems"],
         )
         insight_schema = schema["properties"]["derived_insights"]

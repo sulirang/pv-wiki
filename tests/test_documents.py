@@ -182,6 +182,59 @@ def r5_fixed_width_layout(*, tail_chars: int = 0) -> str:
     return "\n".join(lines)
 
 
+def r5_continuation_layout_pages() -> tuple[str, str, str]:
+    """Representative adjacent R5 datasheet pages followed by ordinary prose."""
+
+    gap = " " * 12
+    page_20 = "\n".join(
+        (
+            "R5-8K/9K/10K/12K-T2-15",
+            gap.join(
+                (
+                    "Type",
+                    "R5-8K-T2-15",
+                    "R5-9K-T2-15",
+                    "R5-10K-T2-15",
+                    "R5-12K-T2-15",
+                )
+            ),
+            "Protection",
+            "Internal Over-voltage Protection"
+            + (" " * 48)
+            + "Integrated",
+            "- 20 -",
+        )
+    )
+    page_21 = "\n".join(
+        (
+            "R5 Series User Manual",
+            "",
+            "Protection",
+            "Grid Monitoring" + (" " * 66) + "Integrated",
+            # An empty source row is not evidence for any target-model value.
+            "Reserved",
+            "Interface",
+            "Display"
+            + (" " * 74)
+            + "LED+(Bluetooth/Wi-Fi+APP)",
+            "General Data",
+            "Topology" + (" " * 72) + "Transformerless",
+            "Consumption at Night [W]" + (" " * 48) + "<0.6",
+            "- 21 -",
+        )
+    )
+    page_22 = "\n".join(
+        (
+            "R5 Series User Manual",
+            "4 Installation",
+            "Install the inverter in a dry and ventilated location.",
+            "Mount the inverter      on a solid wall.",
+            "This prose is not a continuation of the technical table.",
+        )
+    )
+    return page_20, page_21, page_22
+
+
 class FakeResponse:
     def __init__(
         self,
@@ -364,6 +417,18 @@ class PDFDocumentTests(unittest.TestCase):
         self.assertEqual("98.6", by_label["Max. Efficiency"].value)
         self.assertEqual("%", by_label["Max. Efficiency"].unit)
         self.assertEqual("IP65", by_label["Ingress Protection"].value)
+        self.assertEqual(
+            "R5-8K/9K/10K/12K-T2-15",
+            by_label["Rated AC Power [W]"].table_title,
+        )
+        self.assertEqual(
+            "explicit",
+            by_label["Rated AC Power [W]"].value_state,
+        )
+        self.assertEqual(
+            "merged_shared",
+            by_label["Max. DC Voltage [V]"].value_state,
+        )
         self.assertNotIn("European Efficiency", by_label)
         self.assertEqual(
             "Type\tR5-8K-T2-15\tR5-9K-T2-15\t"
@@ -385,6 +450,107 @@ class PDFDocumentTests(unittest.TestCase):
                 source_body=documents._page_text_with_derived_layout_tables(
                     source
                 ),
+            )
+        )
+
+    def test_r5_adjacent_pages_continue_sections_but_stop_before_prose(
+        self,
+    ) -> None:
+        page_20, page_21, page_22 = r5_continuation_layout_pages()
+
+        rows = documents.extract_model_parameter_rows(
+            (
+                (20, page_20),
+                (21, page_21),
+                (22, page_22),
+            ),
+            "R5-10K-T2-15",
+        )
+        by_label = {row.source_label: row for row in rows}
+
+        self.assertEqual(
+            {
+                "Internal Over-voltage Protection",
+                "Grid Monitoring",
+                "Display",
+                "Topology",
+                "Consumption at Night [W]",
+            },
+            set(by_label),
+        )
+        self.assertEqual("Protection", by_label["Grid Monitoring"].section)
+        self.assertEqual("Interface", by_label["Display"].section)
+        self.assertEqual("General Data", by_label["Topology"].section)
+        self.assertEqual(21, by_label["Grid Monitoring"].page)
+        self.assertEqual(
+            "R5-8K/9K/10K/12K-T2-15",
+            by_label["Topology"].table_title,
+        )
+        self.assertTrue(
+            all(row.value_state == "merged_shared" for row in rows)
+        )
+        self.assertNotIn("Reserved", by_label)
+        self.assertNotIn("Mount the inverter", by_label)
+
+    def test_r5_context_does_not_cross_a_missing_page(self) -> None:
+        page_20, page_21, _page_22 = r5_continuation_layout_pages()
+
+        rows = documents.extract_model_parameter_rows(
+            ((20, page_20), (22, page_21)),
+            "R5-10K-T2-15",
+        )
+
+        self.assertEqual(
+            ["Internal Over-voltage Protection"],
+            [row.source_label for row in rows],
+        )
+
+    def test_cross_page_rows_get_one_auditable_same_table_projection(
+        self,
+    ) -> None:
+        page_20, page_21, _page_22 = r5_continuation_layout_pages()
+        rows = documents.extract_model_parameter_rows(
+            ((20, page_20), (21, page_21)),
+            "R5-10K-T2-15",
+        )
+        layouts = [
+            documents._PDFPageLayoutText(
+                page_number=page_number,
+                raw_text=page_text,
+                derived_tables=documents._derived_layout_blocks(
+                    documents._derived_layout_table_text(page_text)
+                ),
+            )
+            for page_number, page_text in (
+                (20, page_20),
+                (21, page_21),
+            )
+        ]
+        audited = documents._with_cross_page_parameter_audits(
+            layouts,
+            rows,
+        )
+        text, _pages, _truncated = documents._assemble_pdf_page_texts(
+            audited,
+            page_count=21,
+            max_chars=30_000,
+            target_models=("R5-10K-T2-15",),
+        )
+        grid = next(
+            row for row in rows if row.source_label == "Grid Monitoring"
+        )
+
+        self.assertIn(grid.model_quote, text)
+        self.assertIn(grid.quote, text)
+        self.assertTrue(
+            decision._structured_table_quote_supports_fact(
+                model_quote=grid.model_quote,
+                fact_quote=grid.quote,
+                name=grid.source_label,
+                value=grid.value,
+                unit=grid.unit,
+                expected_product_name=grid.model,
+                source_body=text,
             )
         )
 

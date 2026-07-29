@@ -63,6 +63,77 @@ def settings(**overrides: object) -> ai.AISettings:
     return ai.AISettings(**values)
 
 
+def analysis_parameters() -> list[dict[str, str]]:
+    return [
+        {
+            "section": "Input (DC)",
+            "name": "Max. DC Voltage [V]",
+            "value": "1100",
+            "unit": "",
+        },
+        {
+            "section": "Output (AC)",
+            "name": "Rated Power [W]",
+            "value": "10000",
+            "unit": "",
+        },
+        {
+            "section": "Efficiency",
+            "name": "Max. Efficiency [%]",
+            "value": "98.6",
+            "unit": "",
+        },
+    ]
+
+
+def valid_parameter_enrichment() -> dict:
+    return {
+        "translations": [
+            {
+                "parameter_id": "p001",
+                "name_zh": "最大直流电压 [V]",
+                "section_zh": "直流输入（DC）",
+                "subsection_zh": "",
+                "value_zh": "",
+            },
+            {
+                "parameter_id": "p002",
+                "name_zh": "额定功率 [W]",
+                "section_zh": "交流输出（AC）",
+                "subsection_zh": "",
+                "value_zh": "",
+            },
+            {
+                "parameter_id": "p003",
+                "name_zh": "最大效率 [%]",
+                "section_zh": "效率",
+                "subsection_zh": "",
+                "value_zh": "",
+            },
+        ],
+        "sections": [
+            {
+                "section_code": "product_positioning",
+                "paragraphs": [
+                    {
+                        "analysis_kind": "engineering_interpretation",
+                        "basis_parameter_ids": ["p002"],
+                        "analysis_zh": (
+                            "额定功率参数为10000，这是产品功率配置的直接依据；"
+                            "实际系统设计仍需结合并网条件、负载边界和项目约束进行核对。"
+                        ),
+                        "conditions_zh": [],
+                        "limitations_zh": ["参数表本身未提供项目侧设计输入。"],
+                    }
+                ],
+            }
+        ],
+        "overall_limitations_zh": [
+            "以上内容仅解释已核验参数，不替代项目设计、厂家确认或现场校核。"
+        ],
+    }
+
+
 def blocking_provider_worker(
     _send_connection: object,
     _endpoint: str,
@@ -389,6 +460,8 @@ class PromptTests(unittest.TestCase):
                 "value": "42",
                 "unit": "W",
                 "section": "Output",
+                "table_title": "",
+                "value_state": "",
                 "page": 3,
                 "order": 1,
                 "model_quote": model_quote,
@@ -593,6 +666,70 @@ class PromptTests(unittest.TestCase):
                 )
         with self.assertRaises(TypeError):
             ai.build_research_messages(product=[])  # type: ignore[arg-type]
+
+    def test_parameter_analysis_prompt_contains_every_verified_row(self) -> None:
+        messages = ai.build_parameter_analysis_messages(
+            product={
+                "name": "R5-10K-T2-15",
+                "product_id": "private-db-id",
+                "family_code": "internal-family",
+            },
+            parameters=analysis_parameters(),
+            max_evidence_chars=12_000,
+        )
+
+        self.assertEqual(["system", "user"], [item["role"] for item in messages])
+        prompt = json.loads(messages[1]["content"])
+        self.assertEqual(
+            "translate_and_analyze_complete_verified_parameter_set",
+            prompt["task"],
+        )
+        self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
+        self.assertTrue(
+            prompt["input_guarantees"]["complete_within_runtime_budget"]
+        )
+        self.assertEqual(
+            ["p001", "p002", "p003"],
+            [
+                item["parameter_id"]
+                for item in prompt["verified_parameters"]
+            ],
+        )
+        self.assertEqual(
+            analysis_parameters(),
+            [
+                {
+                    key: item[key]
+                    for key in ("section", "name", "value", "unit")
+                }
+                for item in prompt["verified_parameters"]
+            ],
+        )
+        self.assertNotIn("product_id", prompt["product"])
+        self.assertNotIn("family_code", prompt["product"])
+        self.assertIn(
+            "Never alter, convert, infer, or manufacture",
+            messages[0]["content"],
+        )
+        self.assertIn(
+            "Return every translation",
+            " ".join(prompt["analysis_policy"]),
+        )
+        self.assertEqual(
+            "直流输入（DC）",
+            prompt["controlled_section_translations"]["input (dc)"],
+        )
+
+    def test_parameter_analysis_prompt_refuses_truncated_input(self) -> None:
+        with self.assertRaisesRegex(
+            ai.ParameterAnalysisError,
+            "complete parameter analysis request",
+        ):
+            ai.build_parameter_analysis_messages(
+                product={"name": "R5-10K-T2-15"},
+                parameters=analysis_parameters(),
+                max_evidence_chars=1000,
+            )
 
 
 class ParsingTests(unittest.TestCase):
@@ -1023,6 +1160,53 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertNotIn("response_format", payload)
         self.assertNotIn("thinking", payload)
         self.assertNotIn("reasoning_effort", payload)
+
+    def test_parameter_analysis_is_validated_and_repaired_once(self) -> None:
+        calls: list[dict] = []
+        responses = [
+            {"translations": [], "sections": [], "overall_limitations_zh": []},
+            valid_parameter_enrichment(),
+        ]
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            result = responses[len(calls) - 1]
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps(result)},
+                        }
+                    ],
+                    "usage": {"total_tokens": 321},
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(
+                max_response_bytes=20_000,
+                max_evidence_chars=12_000,
+            ),
+            opener=fake_open,
+        )
+        result = client.analyze_parameters(
+            product={"name": "R5-10K-T2-15"},
+            parameters=analysis_parameters(),
+        )
+
+        self.assertEqual(2, client.last_parameter_analysis_provider_requests)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(3, result["input_parameter_count"])
+        self.assertTrue(result["input_complete"])
+        self.assertEqual(
+            ["p001", "p002", "p003"],
+            [item["parameter_id"] for item in result["translations"]],
+        )
+        repair_content = calls[1]["messages"][-1]["content"]
+        self.assertIn("Retry once", repair_content)
+        self.assertIn("every input parameter", repair_content)
 
     def test_optional_thinking_controls_are_sent_as_provider_extensions(
         self,

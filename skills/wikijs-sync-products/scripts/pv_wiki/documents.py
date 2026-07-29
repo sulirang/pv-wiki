@@ -29,7 +29,7 @@ from typing import Any
 from .render import validate_public_http_url
 
 
-PDF_EXTRACTION_CONTRACT_VERSION = "2026-07-29.1"
+PDF_EXTRACTION_CONTRACT_VERSION = "2026-07-29.2"
 PDF_MAGIC = b"%PDF-"
 PDF_CONTENT_TYPES = frozenset({"application/pdf", "application/x-pdf"})
 PDF_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -49,6 +49,8 @@ MAX_MODEL_PARAMETER_ROWS = 500
 MAX_MODEL_PARAMETER_PAGES = 500
 MAX_MODEL_PARAMETER_PAGE_CHARS = 200_000
 MAX_LAYOUT_TABLE_MISSES = 12
+MAX_LAYOUT_CONTINUATION_MISSES = 3
+MAX_LAYOUT_CONTINUATION_HEADERS = 3
 
 
 class PDFDocumentError(RuntimeError):
@@ -85,6 +87,8 @@ class PDFParameterRow:
     order: int
     model_quote: str
     quote: str
+    table_title: str = ""
+    value_state: str = "explicit"
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +382,17 @@ class _LayoutHeader:
     column_count: int
     normalized_row: str
     models: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ParameterTableContext:
+    """One target-bound table that may continue onto the adjacent PDF page."""
+
+    header: _LayoutHeader
+    model_indexes: tuple[tuple[str, int], ...]
+    table_title: str
+    section: str
+    page: int
 
 
 def _collapsed_layout_cell(value: str) -> str:
@@ -720,6 +735,109 @@ def _text_contains_complete_model(value: str, model: str) -> bool:
     return re.search(pattern, normalized, flags=re.IGNORECASE) is not None
 
 
+def _compact_title_contains_target_model(value: str, model: str) -> bool:
+    """Recognize a bounded series shorthand immediately above a model header.
+
+    A title such as ``R5-8K/9K/10K/12K-T2-15`` does not spell every complete
+    model, but it contains the target's bounded model fragments in order. This
+    fallback is used only for display metadata, never to bind a value column.
+    """
+
+    candidate = _collapsed_layout_cell(value)
+    if (
+        not candidate
+        or len(candidate) > 200
+        or len(candidate.split()) > 6
+        or re.fullmatch(r"[A-Za-z0-9_.+/\- ]+", candidate) is None
+        or "/" not in candidate
+    ):
+        return False
+    tokens = re.findall(
+        r"[A-Za-z]+\d*|\d+[A-Za-z]*",
+        unicodedata.normalize("NFKC", model),
+    )
+    if len(tokens) < 3:
+        return False
+    offset = 0
+    normalized_candidate = unicodedata.normalize("NFKC", candidate)
+    for token in tokens:
+        match = re.search(
+            r"(?<![A-Za-z0-9])"
+            + re.escape(token)
+            + r"(?![A-Za-z0-9])",
+            normalized_candidate[offset:],
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return False
+        offset += match.end()
+    return True
+
+
+def _layout_table_title(
+    lines: Sequence[str],
+    header_line_index: int,
+    model_indexes: Sequence[tuple[str, int]],
+) -> str:
+    """Return one nearby target-bearing table title, never remote page prose."""
+
+    previous: list[str] = []
+    scan_index = header_line_index - 1
+    while scan_index >= 0 and len(previous) < 3:
+        value = _collapsed_layout_cell(lines[scan_index])
+        if value:
+            previous.append(value)
+        scan_index -= 1
+    for candidate in previous:
+        if (
+            len(candidate) <= 200
+            and _layout_section_heading(candidate) is None
+            and any(
+                _text_contains_complete_model(candidate, model)
+                or _compact_title_contains_target_model(candidate, model)
+                for model, _index in model_indexes
+            )
+        ):
+            return candidate
+    return ""
+
+
+def _continuation_page_header(
+    line: str,
+    context: _ParameterTableContext,
+) -> bool:
+    """Allow only a few recognizable page-header lines before a continuation."""
+
+    value = _collapsed_layout_cell(line)
+    if not value or len(value) > 160:
+        return False
+    key = value.casefold()
+    if re.fullmatch(
+        r"(?:page\s*)?[-–—]?\s*\d{1,4}\s*[-–—]?",
+        key,
+    ):
+        return True
+    if any(
+        phrase in key
+        for phrase in (
+            "user manual",
+            "technical manual",
+            "datasheet",
+            "data sheet",
+            "product manual",
+            " series",
+        )
+    ):
+        return True
+    return (
+        bool(context.table_title)
+        and value == context.table_title
+    ) or any(
+        _text_contains_complete_model(value, model)
+        for model, _index in context.model_indexes
+    )
+
+
 def _shared_layout_data_row(
     line: str,
     *,
@@ -932,15 +1050,200 @@ def _model_indexes_for_header(
     )
 
 
-def _page_model_parameter_rows(
+def _parameter_layout_row(
+    line: str,
+    *,
+    column_count: int,
+) -> tuple[str, str] | None:
+    """Return one auditable row and whether its value cells were explicit."""
+
+    normalized = _normalized_layout_data_row(
+        line,
+        column_count=column_count,
+    )
+    value_state = "explicit"
+    if normalized is None:
+        normalized = _shared_layout_data_row(
+            line,
+            column_count=column_count,
+        )
+        value_state = "merged_shared"
+    if normalized is None:
+        return None
+    return _auditable_layout_data_row(normalized), value_state
+
+
+def _parameter_rows_from_layout_line(
+    line: str,
+    *,
+    page: int,
+    context: _ParameterTableContext,
+) -> list[PDFParameterRow]:
+    parsed = _parameter_layout_row(
+        line,
+        column_count=context.header.column_count,
+    )
+    if parsed is None:
+        return []
+    normalized_row, value_state = parsed
+    cells = normalized_row.split("\t")
+    source_label = cells[0]
+    rows: list[PDFParameterRow] = []
+    for model, model_index in context.model_indexes:
+        value, unit = _parameter_value_and_unit(
+            source_label,
+            cells[model_index + 1],
+        )
+        # Empty target cells can mean N/A, a visual span, or failed extraction.
+        # Never choose among those meanings without an explicit safe value.
+        if not value:
+            continue
+        rows.append(
+            PDFParameterRow(
+                model=model,
+                source_label=source_label,
+                value=value,
+                unit=unit,
+                section=context.section,
+                page=page,
+                order=0,
+                model_quote=context.header.normalized_row,
+                quote=normalized_row,
+                table_title=context.table_title,
+                value_state=value_state,
+            )
+        )
+    return rows
+
+
+def _scan_parameter_table(
+    lines: Sequence[str],
+    *,
+    start_index: int,
+    page: int,
+    context: _ParameterTableContext,
+    continuation: bool,
+) -> tuple[list[PDFParameterRow], int, _ParameterTableContext | None]:
+    """Scan one bounded table, optionally inherited from the adjacent page."""
+
+    rows: list[PDFParameterRow] = []
+    scan_index = start_index
+    section = context.section
+    misses = 0
+    header_lines = 0
+    started = not continuation
+    activity = not continuation
+    miss_limit = (
+        MAX_LAYOUT_CONTINUATION_MISSES
+        if continuation
+        else MAX_LAYOUT_TABLE_MISSES
+    )
+    while scan_index < len(lines) and len(rows) < MAX_MODEL_PARAMETER_ROWS:
+        if _layout_header(lines, scan_index) is not None:
+            return rows, scan_index, None
+        stripped = lines[scan_index].strip()
+        if not stripped:
+            scan_index += 1
+            continue
+        if stripped.startswith("*"):
+            return rows, scan_index, None
+
+        section_heading = _layout_section_heading(stripped)
+        if section_heading is not None:
+            section = section_heading
+            context = _ParameterTableContext(
+                header=context.header,
+                model_indexes=context.model_indexes,
+                table_title=context.table_title,
+                section=section,
+                page=page,
+            )
+            started = True
+            activity = True
+            misses = 0
+            scan_index += 1
+            continue
+
+        if continuation and not started and (
+            header_lines < MAX_LAYOUT_CONTINUATION_HEADERS
+            and _continuation_page_header(stripped, context)
+        ):
+            header_lines += 1
+            scan_index += 1
+            continue
+
+        active_context = _ParameterTableContext(
+            header=context.header,
+            model_indexes=context.model_indexes,
+            table_title=context.table_title,
+            section=section,
+            page=page,
+        )
+        line_rows = _parameter_rows_from_layout_line(
+            lines[scan_index],
+            page=page,
+            context=active_context,
+        )
+        if line_rows:
+            rows.extend(line_rows)
+            started = True
+            activity = True
+            misses = 0
+            scan_index += 1
+            continue
+
+        # Before the first continuation row, only known page headers, blank
+        # lines, a known section, or a table-shaped row are accepted.
+        if continuation and not started:
+            return rows, scan_index, None
+        misses += 1
+        if misses >= miss_limit:
+            return rows, scan_index, None
+        scan_index += 1
+
+    outgoing = (
+        _ParameterTableContext(
+            header=context.header,
+            model_indexes=context.model_indexes,
+            table_title=context.table_title,
+            section=section,
+            page=page,
+        )
+        if scan_index >= len(lines) and activity
+        else None
+    )
+    return rows, scan_index, outgoing
+
+
+def _scan_page_model_parameter_rows(
     page_text: str,
     *,
     page: int,
     target_models: Sequence[str],
-) -> list[PDFParameterRow]:
+    incoming_context: _ParameterTableContext | None = None,
+) -> tuple[list[PDFParameterRow], _ParameterTableContext | None]:
     lines = page_text.splitlines()[:MAX_LAYOUT_SCAN_LINES]
     rows: list[PDFParameterRow] = []
     line_index = 0
+    outgoing_context: _ParameterTableContext | None = None
+
+    if (
+        incoming_context is not None
+        and page == incoming_context.page + 1
+    ):
+        continuation_rows, line_index, outgoing_context = (
+            _scan_parameter_table(
+                lines,
+                start_index=0,
+                page=page,
+                context=incoming_context,
+                continuation=True,
+            )
+        )
+        rows.extend(continuation_rows)
+        if outgoing_context is not None:
+            return rows, outgoing_context
+
     while line_index < len(lines) and len(rows) < MAX_MODEL_PARAMETER_ROWS:
         header = _layout_header(lines, line_index)
         if header is None:
@@ -952,64 +1255,44 @@ def _page_model_parameter_rows(
             line_index = scan_index
             continue
 
-        section = ""
-        misses = 0
-        while (
-            scan_index < len(lines)
-            and len(rows) < MAX_MODEL_PARAMETER_ROWS
-        ):
-            if _layout_header(lines, scan_index) is not None:
-                break
-            stripped = lines[scan_index].strip()
-            if stripped.startswith("*"):
-                break
-            section_heading = _layout_section_heading(stripped)
-            if section_heading is not None:
-                section = section_heading
-                misses = 0
-                scan_index += 1
-                continue
-
-            normalized_row = _normalized_layout_data_row(
-                lines[scan_index],
-                column_count=header.column_count,
-            )
-            if normalized_row is None:
-                normalized_row = _shared_layout_data_row(
-                    lines[scan_index],
-                    column_count=header.column_count,
-                )
-            if normalized_row is not None:
-                normalized_row = _auditable_layout_data_row(normalized_row)
-                cells = normalized_row.split("\t")
-                source_label = cells[0]
-                for model, model_index in model_indexes:
-                    value, unit = _parameter_value_and_unit(
-                        source_label,
-                        cells[model_index + 1],
-                    )
-                    rows.append(
-                        PDFParameterRow(
-                            model=model,
-                            source_label=source_label,
-                            value=value,
-                            unit=unit,
-                            section=section,
-                            page=page,
-                            order=0,
-                            model_quote=header.normalized_row,
-                            quote=normalized_row,
-                        )
-                    )
-                    if len(rows) >= MAX_MODEL_PARAMETER_ROWS:
-                        break
-                misses = 0
-            elif stripped:
-                misses += 1
-                if misses >= MAX_LAYOUT_TABLE_MISSES:
-                    break
-            scan_index += 1
+        context = _ParameterTableContext(
+            header=header,
+            model_indexes=model_indexes,
+            table_title=_layout_table_title(
+                lines,
+                line_index,
+                model_indexes,
+            ),
+            section="",
+            page=page,
+        )
+        table_rows, scan_index, table_outgoing = _scan_parameter_table(
+            lines,
+            start_index=scan_index,
+            page=page,
+            context=context,
+            continuation=False,
+        )
+        rows.extend(table_rows)
+        if table_outgoing is not None:
+            outgoing_context = table_outgoing
         line_index = max(scan_index, header.end_line_index + 1)
+    return rows, outgoing_context
+
+
+def _page_model_parameter_rows(
+    page_text: str,
+    *,
+    page: int,
+    target_models: Sequence[str],
+) -> list[PDFParameterRow]:
+    """Backward-compatible single-page wrapper around the stateful scanner."""
+
+    rows, _context = _scan_page_model_parameter_rows(
+        page_text,
+        page=page,
+        target_models=target_models,
+    )
     return rows
 
 
@@ -1030,14 +1313,19 @@ def extract_model_parameter_rows(
         return []
     pages = _parameter_input_pages(pages_or_text)
     candidates: list[PDFParameterRow] = []
+    context: _ParameterTableContext | None = None
+    previous_page: int | None = None
     for page, page_text in pages:
-        candidates.extend(
-            _page_model_parameter_rows(
-                page_text,
-                page=page,
-                target_models=models,
-            )
+        if previous_page is None or page != previous_page + 1:
+            context = None
+        page_rows, context = _scan_page_model_parameter_rows(
+            page_text,
+            page=page,
+            target_models=models,
+            incoming_context=context,
         )
+        candidates.extend(page_rows)
+        previous_page = page
         if len(candidates) >= MAX_MODEL_PARAMETER_ROWS:
             break
 
@@ -1066,6 +1354,8 @@ def extract_model_parameter_rows(
                 order=len(result) + 1,
                 model_quote=candidate.model_quote,
                 quote=candidate.quote,
+                table_title=candidate.table_title,
+                value_state=candidate.value_state,
             )
         )
         if len(result) >= MAX_MODEL_PARAMETER_ROWS:
@@ -1093,6 +1383,72 @@ class _PDFPageLayoutText:
     raw_text: str
     derived_tables: tuple[str, ...]
     raw_truncated: bool = False
+
+
+def _parameter_audit_blocks_for_page(
+    page: _PDFPageLayoutText,
+    rows: Sequence[PDFParameterRow],
+) -> tuple[str, ...]:
+    """Build bounded TSV evidence for rows whose header came from a prior page."""
+
+    grouped: dict[str, list[str]] = {}
+    for row in rows:
+        if (
+            row.page != page.page_number
+            or not row.model_quote
+            or not row.quote
+            or any(
+                row.model_quote in table and row.quote in table
+                for table in page.derived_tables
+            )
+        ):
+            continue
+        quotes = grouped.setdefault(row.model_quote, [])
+        if row.quote not in quotes:
+            quotes.append(row.quote)
+
+    blocks: list[str] = []
+    for model_quote, quotes in grouped.items():
+        remaining = list(quotes)
+        while remaining and len(blocks) < MAX_DERIVED_LAYOUT_TABLES:
+            marker = 900_000 + page.page_number * 10 + len(blocks)
+            prefix = f"[Derived PDF layout table {marker}]"
+            suffix = f"[End derived PDF layout table {marker}]"
+            body = [model_quote]
+            while (
+                remaining
+                and len(body) < MAX_DERIVED_LAYOUT_ROWS
+            ):
+                candidate = "\n".join(
+                    (prefix, *body, remaining[0], suffix)
+                )
+                if len(candidate) > MAX_DERIVED_LAYOUT_CHARS:
+                    break
+                body.append(remaining.pop(0))
+            if len(body) == 1:
+                break
+            blocks.append("\n".join((prefix, *body, suffix)))
+    return tuple(blocks)
+
+
+def _with_cross_page_parameter_audits(
+    pages: Sequence[_PDFPageLayoutText],
+    rows: Sequence[PDFParameterRow],
+) -> list[_PDFPageLayoutText]:
+    """Attach only locally derived, target-bound continuation projections."""
+
+    result: list[_PDFPageLayoutText] = []
+    for page in pages:
+        audits = _parameter_audit_blocks_for_page(page, rows)
+        result.append(
+            _PDFPageLayoutText(
+                page_number=page.page_number,
+                raw_text=page.raw_text,
+                derived_tables=(*page.derived_tables, *audits),
+                raw_truncated=page.raw_truncated,
+            )
+        )
+    return result
 
 
 def _derived_layout_blocks(value: str) -> tuple[str, ...]:
@@ -1461,6 +1817,10 @@ def _parse_pdf_in_child(
             ),
             target_models,
         )
+        page_layouts = _with_cross_page_parameter_audits(
+            page_layouts,
+            parameter_rows,
+        )
         text, extracted_pages, truncated = _assemble_pdf_page_texts(
             page_layouts,
             page_count=page_count,
@@ -1487,6 +1847,8 @@ def _parse_pdf_in_child(
                         "order": row.order,
                         "model_quote": row.model_quote,
                         "quote": row.quote,
+                        "table_title": row.table_title,
+                        "value_state": row.value_state,
                     }
                     for row in parameter_rows
                 ],

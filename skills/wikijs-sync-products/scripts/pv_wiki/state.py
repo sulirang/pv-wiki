@@ -33,7 +33,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 _POSTGRES_ADVISORY_LOCK = 8_604_293_015
 _POSTGRES_PUBLICATION_LOCK = 8_604_293_016
 _MEMORY_PUBLICATION_LOCK = threading.Lock()
@@ -170,6 +170,14 @@ FACT_DIAGNOSTIC_REASON_CODES = frozenset(
     }
 )
 MAX_FACT_DIAGNOSTIC_COUNT = 10_000
+PARAMETER_ANALYSIS_STATUSES = ("started", "completed", "failed")
+MAX_VERIFIED_PARAMETER_COUNT = 10_000
+MAX_VERIFIED_PARAMETERS_JSON_BYTES = 4 * 1024 * 1024
+MAX_PARAMETER_ANALYSIS_JSON_BYTES = 512 * 1024
+MAX_PARAMETER_ANALYSIS_USAGE_JSON_BYTES = 32 * 1024
+MAX_PARAMETER_VERSION_LENGTH = 200
+MAX_PARAMETER_ANALYSIS_MODEL_LENGTH = 300
+MAX_PARAMETER_ANALYSIS_ERROR_LENGTH = 2_000
 
 _CREATE_SCHEMA = (
     """
@@ -321,6 +329,218 @@ _CREATE_CONTENT_REFRESH_EVENT_SCHEMA = (
     """,
 )
 
+_CREATE_PARAMETER_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS verified_parameter_sets (
+        parameter_set_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id TEXT NOT NULL
+            REFERENCES products(product_id) ON DELETE CASCADE,
+        source_attempt_id INTEGER NOT NULL
+            REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+        source_hash TEXT NOT NULL,
+        pdf_url TEXT NOT NULL,
+        pdf_sha256 TEXT NOT NULL
+            CHECK (
+                length(pdf_sha256) = 64
+                AND pdf_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+        parameters_json TEXT NOT NULL,
+        parameter_count INTEGER NOT NULL CHECK (parameter_count >= 0),
+        parameter_set_sha256 TEXT NOT NULL
+            CHECK (
+                length(parameter_set_sha256) = 64
+                AND parameter_set_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+        extractor_version TEXT NOT NULL
+            CHECK (length(extractor_version) BETWEEN 1 AND 200),
+        validation_policy_fingerprint TEXT NOT NULL
+            CHECK (
+                length(validation_policy_fingerprint) = 64
+                AND validation_policy_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+        created_at TEXT NOT NULL,
+        UNIQUE (
+            product_id,
+            source_attempt_id,
+            source_hash,
+            pdf_url,
+            pdf_sha256,
+            parameter_set_sha256,
+            extractor_version,
+            validation_policy_fingerprint
+        )
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS verified_parameter_sets_product_idx
+        ON verified_parameter_sets(product_id, source_attempt_id, parameter_set_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS parameter_analysis_runs (
+        analysis_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        parameter_set_id INTEGER NOT NULL
+            REFERENCES verified_parameter_sets(parameter_set_id) ON DELETE CASCADE,
+        request_fingerprint TEXT NOT NULL
+            CHECK (
+                length(request_fingerprint) = 64
+                AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+        attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
+        status TEXT NOT NULL
+            CHECK (status IN ('started', 'completed', 'failed')),
+        prompt_version TEXT NOT NULL
+            CHECK (length(prompt_version) BETWEEN 1 AND 200),
+        glossary_version TEXT NOT NULL
+            CHECK (length(glossary_version) BETWEEN 1 AND 200),
+        model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 300),
+        analysis_json TEXT,
+        usage_json TEXT,
+        error TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        CHECK (
+            (
+                status = 'started'
+                AND analysis_json IS NULL
+                AND usage_json IS NULL
+                AND error IS NULL
+                AND finished_at IS NULL
+            )
+            OR
+            (
+                status = 'completed'
+                AND analysis_json IS NOT NULL
+                AND usage_json IS NOT NULL
+                AND error IS NULL
+                AND finished_at IS NOT NULL
+            )
+            OR
+            (
+                status = 'failed'
+                AND analysis_json IS NULL
+                AND error IS NOT NULL
+                AND finished_at IS NOT NULL
+            )
+        ),
+        UNIQUE (parameter_set_id, request_fingerprint, attempt_number)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS parameter_analysis_runs_set_idx
+        ON parameter_analysis_runs(parameter_set_id, analysis_run_id)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS parameter_analysis_runs_started_idx
+        ON parameter_analysis_runs(parameter_set_id, request_fingerprint)
+        WHERE status = 'started'
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS parameter_analysis_runs_completed_idx
+        ON parameter_analysis_runs(parameter_set_id, request_fingerprint)
+        WHERE status = 'completed'
+    """,
+)
+
+_CREATE_POSTGRES_PARAMETER_SCHEMA = (
+    """
+    CREATE TABLE IF NOT EXISTS verified_parameter_sets (
+        parameter_set_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        product_id TEXT NOT NULL
+            REFERENCES products(product_id) ON DELETE CASCADE,
+        source_attempt_id BIGINT NOT NULL
+            REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+        source_hash TEXT NOT NULL,
+        pdf_url TEXT NOT NULL,
+        pdf_sha256 TEXT NOT NULL
+            CHECK (pdf_sha256 ~ '^[0-9a-f]{64}$'),
+        parameters_json TEXT NOT NULL,
+        parameter_count INTEGER NOT NULL CHECK (parameter_count >= 0),
+        parameter_set_sha256 TEXT NOT NULL
+            CHECK (parameter_set_sha256 ~ '^[0-9a-f]{64}$'),
+        extractor_version TEXT NOT NULL
+            CHECK (length(extractor_version) BETWEEN 1 AND 200),
+        validation_policy_fingerprint TEXT NOT NULL
+            CHECK (validation_policy_fingerprint ~ '^[0-9a-f]{64}$'),
+        created_at TIMESTAMPTZ NOT NULL,
+        UNIQUE (
+            product_id,
+            source_attempt_id,
+            source_hash,
+            pdf_url,
+            pdf_sha256,
+            parameter_set_sha256,
+            extractor_version,
+            validation_policy_fingerprint
+        )
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS verified_parameter_sets_product_idx
+        ON verified_parameter_sets(product_id, source_attempt_id, parameter_set_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS parameter_analysis_runs (
+        analysis_run_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+        parameter_set_id BIGINT NOT NULL
+            REFERENCES verified_parameter_sets(parameter_set_id) ON DELETE CASCADE,
+        request_fingerprint TEXT NOT NULL
+            CHECK (request_fingerprint ~ '^[0-9a-f]{64}$'),
+        attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
+        status TEXT NOT NULL
+            CHECK (status IN ('started', 'completed', 'failed')),
+        prompt_version TEXT NOT NULL
+            CHECK (length(prompt_version) BETWEEN 1 AND 200),
+        glossary_version TEXT NOT NULL
+            CHECK (length(glossary_version) BETWEEN 1 AND 200),
+        model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 300),
+        analysis_json TEXT,
+        usage_json TEXT,
+        error TEXT,
+        started_at TIMESTAMPTZ NOT NULL,
+        finished_at TIMESTAMPTZ,
+        CHECK (
+            (
+                status = 'started'
+                AND analysis_json IS NULL
+                AND usage_json IS NULL
+                AND error IS NULL
+                AND finished_at IS NULL
+            )
+            OR
+            (
+                status = 'completed'
+                AND analysis_json IS NOT NULL
+                AND usage_json IS NOT NULL
+                AND error IS NULL
+                AND finished_at IS NOT NULL
+            )
+            OR
+            (
+                status = 'failed'
+                AND analysis_json IS NULL
+                AND error IS NOT NULL
+                AND finished_at IS NOT NULL
+            )
+        ),
+        UNIQUE (parameter_set_id, request_fingerprint, attempt_number)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS parameter_analysis_runs_set_idx
+        ON parameter_analysis_runs(parameter_set_id, analysis_run_id)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS parameter_analysis_runs_started_idx
+        ON parameter_analysis_runs(parameter_set_id, request_fingerprint)
+        WHERE status = 'started'
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS parameter_analysis_runs_completed_idx
+        ON parameter_analysis_runs(parameter_set_id, request_fingerprint)
+        WHERE status = 'completed'
+    """,
+)
+
 _CREATE_POSTGRES_SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS products (
@@ -461,6 +681,7 @@ _CREATE_POSTGRES_SCHEMA = (
     CREATE INDEX IF NOT EXISTS requeue_events_product_idx
         ON requeue_events(product_id, event_id)
     """,
+    *_CREATE_POSTGRES_PARAMETER_SCHEMA,
     """
     CREATE TABLE IF NOT EXISTS content_refresh_events (
         event_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
@@ -474,6 +695,10 @@ _CREATE_POSTGRES_SCHEMA = (
         wiki_action TEXT NOT NULL
             CHECK (wiki_action IN ('unchanged', 'updated')),
         fact_diagnostics_json TEXT NOT NULL,
+        parameter_set_id BIGINT
+            REFERENCES verified_parameter_sets(parameter_set_id),
+        analysis_run_id BIGINT
+            REFERENCES parameter_analysis_runs(analysis_run_id),
         refreshed_at TIMESTAMPTZ NOT NULL,
         UNIQUE (product_id, source_attempt_id, content_schema_version)
     )
@@ -821,6 +1046,51 @@ class ContentRefreshCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class VerifiedParameterSetRecord:
+    """One immutable, source-bound datasheet parameter extraction."""
+
+    parameter_set_id: int
+    product_id: str
+    source_attempt_id: int
+    source_hash: str
+    pdf_url: str
+    pdf_sha256: str
+    parameters: list[Any]
+    parameter_count: int
+    parameter_set_sha256: str
+    extractor_version: str
+    validation_policy_fingerprint: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterAnalysisRunRecord:
+    """One append-only AI analysis attempt for a verified parameter set."""
+
+    analysis_run_id: int
+    parameter_set_id: int
+    request_fingerprint: str
+    attempt_number: int
+    status: str
+    prompt_version: str
+    glossary_version: str
+    model: str
+    analysis: dict[str, Any] | None
+    usage: dict[str, Any] | None
+    error: str | None
+    started_at: datetime
+    finished_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ParameterAnalysisRunStartResult:
+    """Return an analysis record and whether the caller may invoke the model."""
+
+    record: ParameterAnalysisRunRecord
+    should_execute: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ContentRefreshEventRecord:
     """One successful existing-page-only managed-content refresh."""
 
@@ -831,6 +1101,8 @@ class ContentRefreshEventRecord:
     content_schema_version: int
     wiki_action: str
     fact_diagnostics: dict[str, Any]
+    parameter_set_id: int | None
+    analysis_run_id: int | None
     refreshed_at: datetime
 
 
@@ -1093,6 +1365,95 @@ def _canonical_json(value: Any) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _sha256_hex(value: Any, *, name: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    digest = value.strip().casefold()
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError(f"{name} must be a SHA-256 hex digest")
+    return digest
+
+
+def _bounded_parameter_text(
+    value: Any,
+    *,
+    name: str,
+    max_length: int,
+) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    normalized = " ".join(value.split())
+    if not normalized:
+        raise ValueError(f"{name} must be non-empty")
+    if len(normalized) > max_length:
+        raise ValueError(f"{name} exceeds {max_length} characters")
+    return normalized
+
+
+def _verified_parameters(
+    value: Any,
+) -> tuple[list[Any], str, str]:
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
+        value,
+        Sequence,
+    ):
+        raise TypeError("parameters must be a sequence")
+    if len(value) > MAX_VERIFIED_PARAMETER_COUNT:
+        raise ValueError(
+            "parameters may contain at most "
+            f"{MAX_VERIFIED_PARAMETER_COUNT} entries"
+        )
+    serialized = _canonical_json(list(value))
+    if len(serialized.encode("utf-8")) > MAX_VERIFIED_PARAMETERS_JSON_BYTES:
+        raise ValueError(
+            "canonical parameters exceed "
+            f"{MAX_VERIFIED_PARAMETERS_JSON_BYTES} bytes"
+        )
+    normalized = json.loads(serialized)
+    return (
+        normalized,
+        serialized,
+        hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    )
+
+
+def _parameter_analysis_mapping(
+    value: Any,
+    *,
+    name: str,
+    max_bytes: int,
+) -> tuple[dict[str, Any], str]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{name} must be a mapping")
+    serialized = _canonical_json(value)
+    if len(serialized.encode("utf-8")) > max_bytes:
+        raise ValueError(f"canonical {name} exceeds {max_bytes} bytes")
+    normalized = json.loads(serialized)
+    return normalized, serialized
+
+
+def _parameter_analysis_error(value: Any) -> str:
+    if not isinstance(value, str):
+        raise TypeError("parameter analysis error must be a string")
+    error = " ".join(value.split())
+    if not error:
+        raise ValueError("failed parameter analysis runs need an error")
+    if len(error) > MAX_PARAMETER_ANALYSIS_ERROR_LENGTH:
+        raise ValueError(
+            "parameter analysis error exceeds "
+            f"{MAX_PARAMETER_ANALYSIS_ERROR_LENGTH} characters"
+        )
+    return error
+
+
+def _positive_record_id(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer")
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
 
 
 def _research_action_name(value: Any) -> str:
@@ -2111,6 +2472,28 @@ class StateStore:
                     connection.execute(statement)
                 connection.execute("PRAGMA user_version = 10")
                 current = 10
+            if current < 11:
+                # Datasheet-derived parameters and their AI interpretation are
+                # append-only evidence. Refresh events hold nullable references
+                # so pre-v11 audit rows remain valid.
+                for statement in _CREATE_PARAMETER_SCHEMA:
+                    connection.execute(statement)
+                connection.execute(
+                    """
+                    ALTER TABLE content_refresh_events
+                    ADD COLUMN parameter_set_id INTEGER
+                        REFERENCES verified_parameter_sets(parameter_set_id)
+                    """
+                )
+                connection.execute(
+                    """
+                    ALTER TABLE content_refresh_events
+                    ADD COLUMN analysis_run_id INTEGER
+                        REFERENCES parameter_analysis_runs(analysis_run_id)
+                    """
+                )
+                connection.execute("PRAGMA user_version = 11")
+                current = 11
         return current
 
     def _migrate_postgresql(self) -> int:
@@ -2139,7 +2522,7 @@ class StateStore:
                 if current > SCHEMA_VERSION or current < 9:
                     return self._validate_postgresql_schema_version(current)
 
-        if current == 9:
+        if current in {9, 10}:
             with self._write_transaction() as connection:
                 # Another initializer may have completed this migration after
                 # the unlocked discovery read above. Recheck while holding the
@@ -2158,55 +2541,85 @@ class StateStore:
                 locked_current = int(row["schema_version"])
                 if locked_current == SCHEMA_VERSION:
                     return locked_current
-                if locked_current != 9:
+                if locked_current not in {9, 10}:
                     return self._validate_postgresql_schema_version(
                         locked_current
                     )
-                connection.execute(
-                    """
-                    ALTER TABLE products
-                    ADD COLUMN content_schema_version
-                        INTEGER NOT NULL DEFAULT 0
-                        CHECK (content_schema_version >= 0)
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE content_refresh_events (
-                        event_id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-                        product_id TEXT NOT NULL
-                            REFERENCES products(product_id) ON DELETE CASCADE,
-                        source_attempt_id BIGINT NOT NULL
-                            REFERENCES attempts(attempt_id),
-                        previous_content_schema_version INTEGER NOT NULL
-                            CHECK (previous_content_schema_version >= 0),
-                        content_schema_version INTEGER NOT NULL
-                            CHECK (content_schema_version >= 1),
-                        wiki_action TEXT NOT NULL
-                            CHECK (wiki_action IN ('unchanged', 'updated')),
-                        fact_diagnostics_json TEXT NOT NULL,
-                        refreshed_at TIMESTAMPTZ NOT NULL,
-                        UNIQUE (
-                            product_id,
-                            source_attempt_id,
-                            content_schema_version
-                        )
+                if locked_current == 9:
+                    connection.execute(
+                        """
+                        ALTER TABLE products
+                        ADD COLUMN content_schema_version
+                            INTEGER NOT NULL DEFAULT 0
+                            CHECK (content_schema_version >= 0)
+                        """
                     )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE INDEX content_refresh_events_product_idx
-                    ON content_refresh_events(product_id, event_id)
-                    """
-                )
+
+                for statement in _CREATE_POSTGRES_PARAMETER_SCHEMA:
+                    connection.execute(statement)
+
+                if locked_current == 9:
+                    connection.execute(
+                        """
+                        CREATE TABLE content_refresh_events (
+                            event_id BIGINT GENERATED BY DEFAULT AS IDENTITY
+                                PRIMARY KEY,
+                            product_id TEXT NOT NULL
+                                REFERENCES products(product_id) ON DELETE CASCADE,
+                            source_attempt_id BIGINT NOT NULL
+                                REFERENCES attempts(attempt_id),
+                            previous_content_schema_version INTEGER NOT NULL
+                                CHECK (previous_content_schema_version >= 0),
+                            content_schema_version INTEGER NOT NULL
+                                CHECK (content_schema_version >= 1),
+                            wiki_action TEXT NOT NULL
+                                CHECK (wiki_action IN ('unchanged', 'updated')),
+                            fact_diagnostics_json TEXT NOT NULL,
+                            parameter_set_id BIGINT
+                                REFERENCES verified_parameter_sets(
+                                    parameter_set_id
+                                ),
+                            analysis_run_id BIGINT
+                                REFERENCES parameter_analysis_runs(
+                                    analysis_run_id
+                                ),
+                            refreshed_at TIMESTAMPTZ NOT NULL,
+                            UNIQUE (
+                                product_id,
+                                source_attempt_id,
+                                content_schema_version
+                            )
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        CREATE INDEX content_refresh_events_product_idx
+                        ON content_refresh_events(product_id, event_id)
+                        """
+                    )
+                else:
+                    connection.execute(
+                        """
+                        ALTER TABLE content_refresh_events
+                        ADD COLUMN IF NOT EXISTS parameter_set_id BIGINT
+                            REFERENCES verified_parameter_sets(parameter_set_id)
+                        """
+                    )
+                    connection.execute(
+                        """
+                        ALTER TABLE content_refresh_events
+                        ADD COLUMN IF NOT EXISTS analysis_run_id BIGINT
+                            REFERENCES parameter_analysis_runs(analysis_run_id)
+                        """
+                    )
                 connection.execute(
                     """
                     UPDATE state_metadata
                     SET schema_version = ?, updated_at = now()
-                    WHERE singleton = TRUE AND schema_version = 9
+                    WHERE singleton = TRUE AND schema_version = ?
                     """,
-                    (SCHEMA_VERSION,),
+                    (SCHEMA_VERSION, locked_current),
                 )
             return SCHEMA_VERSION
 
@@ -5272,6 +5685,512 @@ class StateStore:
             )
         return candidates
 
+    def record_verified_parameter_set(
+        self,
+        candidate: ContentRefreshCandidate,
+        *,
+        pdf_url: str,
+        pdf_sha256: str,
+        parameters: Sequence[Any],
+        extractor_version: str,
+        validation_policy_fingerprint: str,
+        now: datetime | None = None,
+    ) -> VerifiedParameterSetRecord:
+        """Persist one canonical datasheet extraction, deduplicated by provenance."""
+
+        if not isinstance(candidate, ContentRefreshCandidate):
+            raise TypeError("candidate must be a ContentRefreshCandidate")
+        canonical_pdf_url = _canonical_url(pdf_url)
+        canonical_pdf_sha256 = _sha256_hex(pdf_sha256, name="pdf_sha256")
+        normalized_parameters, parameters_json, parameter_set_sha256 = (
+            _verified_parameters(parameters)
+        )
+        normalized_extractor_version = _bounded_parameter_text(
+            extractor_version,
+            name="extractor_version",
+            max_length=MAX_PARAMETER_VERSION_LENGTH,
+        )
+        normalized_policy_fingerprint = _sha256_hex(
+            validation_policy_fingerprint,
+            name="validation_policy_fingerprint",
+        )
+        timestamp = _utc(now)
+        created_at = _time_text(timestamp)
+
+        with self._write_transaction() as connection:
+            attempt = connection.execute(
+                """
+                SELECT product_id, source_hash, outcome, finished_at
+                FROM attempts
+                WHERE attempt_id = ?
+                """,
+                (candidate.source_attempt_id,),
+            ).fetchone()
+            if attempt is None:
+                raise StateError("refresh candidate source attempt does not exist")
+            if (
+                str(attempt["product_id"]) != candidate.product_id
+                or str(attempt["source_hash"]) != candidate.source_hash
+            ):
+                raise StateError(
+                    "refresh candidate does not match its source attempt"
+                )
+            if (
+                attempt["outcome"] != "synced"
+                or attempt["finished_at"] is None
+            ):
+                raise StateError(
+                    "verified parameters require a completed synced attempt"
+                )
+
+            provenance = (
+                candidate.product_id,
+                candidate.source_attempt_id,
+                candidate.source_hash,
+                canonical_pdf_url,
+                canonical_pdf_sha256,
+                parameter_set_sha256,
+                normalized_extractor_version,
+                normalized_policy_fingerprint,
+            )
+            row = connection.execute(
+                """
+                SELECT *
+                FROM verified_parameter_sets
+                WHERE product_id = ?
+                  AND source_attempt_id = ?
+                  AND source_hash = ?
+                  AND pdf_url = ?
+                  AND pdf_sha256 = ?
+                  AND parameter_set_sha256 = ?
+                  AND extractor_version = ?
+                  AND validation_policy_fingerprint = ?
+                """,
+                provenance,
+            ).fetchone()
+            if row is None:
+                inserted = connection.execute(
+                    """
+                    INSERT INTO verified_parameter_sets (
+                        product_id,
+                        source_attempt_id,
+                        source_hash,
+                        pdf_url,
+                        pdf_sha256,
+                        parameters_json,
+                        parameter_count,
+                        parameter_set_sha256,
+                        extractor_version,
+                        validation_policy_fingerprint,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING *
+                    """,
+                    (
+                        *provenance[:5],
+                        parameters_json,
+                        len(normalized_parameters),
+                        *provenance[5:],
+                        created_at,
+                    ),
+                )
+                row = inserted.fetchone()
+        if row is None:  # defensive boundary for non-conforming DB adapters
+            raise StateError("verified parameter set insert returned no row")
+        return self._verified_parameter_set_record(row)
+
+    def get_verified_parameter_set(
+        self,
+        parameter_set_id: int,
+    ) -> VerifiedParameterSetRecord | None:
+        """Return a verified parameter set by its durable identifier."""
+
+        normalized_id = _positive_record_id(
+            parameter_set_id,
+            name="parameter_set_id",
+        )
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM verified_parameter_sets
+                WHERE parameter_set_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        return (
+            self._verified_parameter_set_record(row)
+            if row is not None
+            else None
+        )
+
+    def verified_parameter_set_history(
+        self,
+        product_id: str | None = None,
+        *,
+        limit: int = 1000,
+    ) -> list[VerifiedParameterSetRecord]:
+        """Return append-only verified parameter sets in creation order."""
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 10_000
+        ):
+            raise ValueError("limit must be an integer between 1 and 10000")
+        query = "SELECT * FROM verified_parameter_sets"
+        if product_id is None:
+            parameters: tuple[Any, ...] = (limit,)
+        else:
+            normalized_product_id = str(product_id).strip()
+            if not normalized_product_id:
+                raise ValueError("product_id must be non-empty")
+            query += "\nWHERE product_id = ?"
+            parameters = (normalized_product_id, limit)
+        query += "\nORDER BY parameter_set_id\nLIMIT ?"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._verified_parameter_set_record(row) for row in rows]
+
+    def find_completed_parameter_analysis_run(
+        self,
+        parameter_set_id: int,
+        request_fingerprint: str,
+    ) -> ParameterAnalysisRunRecord | None:
+        """Find a reusable completed run; started/failed rows never qualify."""
+
+        normalized_set_id = _positive_record_id(
+            parameter_set_id,
+            name="parameter_set_id",
+        )
+        normalized_fingerprint = _sha256_hex(
+            request_fingerprint,
+            name="request_fingerprint",
+        )
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM parameter_analysis_runs
+                WHERE parameter_set_id = ?
+                  AND request_fingerprint = ?
+                  AND status = 'completed'
+                ORDER BY attempt_number DESC
+                LIMIT 1
+                """,
+                (normalized_set_id, normalized_fingerprint),
+            ).fetchone()
+        return (
+            self._parameter_analysis_run_record(row)
+            if row is not None
+            else None
+        )
+
+    def begin_parameter_analysis_run(
+        self,
+        parameter_set_id: int,
+        *,
+        request_fingerprint: str,
+        prompt_version: str,
+        glossary_version: str,
+        model: str,
+        now: datetime | None = None,
+    ) -> ParameterAnalysisRunStartResult:
+        """Begin one model attempt unless this exact request is already in flight."""
+
+        normalized_set_id = _positive_record_id(
+            parameter_set_id,
+            name="parameter_set_id",
+        )
+        normalized_fingerprint = _sha256_hex(
+            request_fingerprint,
+            name="request_fingerprint",
+        )
+        normalized_prompt = _bounded_parameter_text(
+            prompt_version,
+            name="prompt_version",
+            max_length=MAX_PARAMETER_VERSION_LENGTH,
+        )
+        normalized_glossary = _bounded_parameter_text(
+            glossary_version,
+            name="glossary_version",
+            max_length=MAX_PARAMETER_VERSION_LENGTH,
+        )
+        normalized_model = _bounded_parameter_text(
+            model,
+            name="model",
+            max_length=MAX_PARAMETER_ANALYSIS_MODEL_LENGTH,
+        )
+        started_at = _time_text(_utc(now))
+
+        with self._write_transaction() as connection:
+            parameter_set = connection.execute(
+                """
+                SELECT parameter_set_id
+                FROM verified_parameter_sets
+                WHERE parameter_set_id = ?
+                """,
+                (normalized_set_id,),
+            ).fetchone()
+            if parameter_set is None:
+                raise StateError(
+                    f"unknown verified parameter set: {normalized_set_id}"
+                )
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM parameter_analysis_runs
+                WHERE parameter_set_id = ?
+                  AND request_fingerprint = ?
+                ORDER BY attempt_number
+                """,
+                (normalized_set_id, normalized_fingerprint),
+            ).fetchall()
+            expected_identity = (
+                normalized_prompt,
+                normalized_glossary,
+                normalized_model,
+            )
+            for row in rows:
+                stored_identity = (
+                    str(row["prompt_version"]),
+                    str(row["glossary_version"]),
+                    str(row["model"]),
+                )
+                if stored_identity != expected_identity:
+                    raise StateError(
+                        "request_fingerprint was reused with different "
+                        "prompt, glossary, or model identity"
+                    )
+            for reusable_status in ("completed", "started"):
+                for row in reversed(rows):
+                    if row["status"] == reusable_status:
+                        return ParameterAnalysisRunStartResult(
+                            record=self._parameter_analysis_run_record(row),
+                            should_execute=False,
+                        )
+
+            attempt_number = (
+                max(int(row["attempt_number"]) for row in rows) + 1
+                if rows
+                else 1
+            )
+            inserted = connection.execute(
+                """
+                INSERT INTO parameter_analysis_runs (
+                    parameter_set_id,
+                    request_fingerprint,
+                    attempt_number,
+                    status,
+                    prompt_version,
+                    glossary_version,
+                    model,
+                    started_at
+                ) VALUES (?, ?, ?, 'started', ?, ?, ?, ?)
+                RETURNING *
+                """,
+                (
+                    normalized_set_id,
+                    normalized_fingerprint,
+                    attempt_number,
+                    normalized_prompt,
+                    normalized_glossary,
+                    normalized_model,
+                    started_at,
+                ),
+            )
+            row = inserted.fetchone()
+        if row is None:
+            raise StateError("parameter analysis insert returned no row")
+        return ParameterAnalysisRunStartResult(
+            record=self._parameter_analysis_run_record(row),
+            should_execute=True,
+        )
+
+    def complete_parameter_analysis_run(
+        self,
+        analysis_run_id: int,
+        *,
+        analysis: Mapping[str, Any],
+        usage: Mapping[str, Any],
+        now: datetime | None = None,
+    ) -> ParameterAnalysisRunRecord:
+        """Complete a started analysis run, with exact terminal replay support."""
+
+        normalized_id = _positive_record_id(
+            analysis_run_id,
+            name="analysis_run_id",
+        )
+        _, analysis_json = _parameter_analysis_mapping(
+            analysis,
+            name="analysis",
+            max_bytes=MAX_PARAMETER_ANALYSIS_JSON_BYTES,
+        )
+        _, usage_json = _parameter_analysis_mapping(
+            usage,
+            name="usage",
+            max_bytes=MAX_PARAMETER_ANALYSIS_USAGE_JSON_BYTES,
+        )
+        finished_at = _time_text(_utc(now))
+
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM parameter_analysis_runs
+                WHERE analysis_run_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise StateError(
+                    f"unknown parameter analysis run: {normalized_id}"
+                )
+            if row["status"] == "completed":
+                if (
+                    row["analysis_json"] == analysis_json
+                    and row["usage_json"] == usage_json
+                ):
+                    return self._parameter_analysis_run_record(row)
+                raise StateError(
+                    "completed parameter analysis replay has different results"
+                )
+            if row["status"] != "started":
+                raise StateError(
+                    "only a started parameter analysis run can complete"
+                )
+            connection.execute(
+                """
+                UPDATE parameter_analysis_runs
+                SET status = 'completed',
+                    analysis_json = ?,
+                    usage_json = ?,
+                    finished_at = ?
+                WHERE analysis_run_id = ? AND status = 'started'
+                """,
+                (analysis_json, usage_json, finished_at, normalized_id),
+            )
+            row = connection.execute(
+                """
+                SELECT *
+                FROM parameter_analysis_runs
+                WHERE analysis_run_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        if row is None:
+            raise StateError("completed parameter analysis run disappeared")
+        return self._parameter_analysis_run_record(row)
+
+    def fail_parameter_analysis_run(
+        self,
+        analysis_run_id: int,
+        *,
+        error: str,
+        usage: Mapping[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> ParameterAnalysisRunRecord:
+        """Fail a started analysis run while preserving an optional usage audit."""
+
+        normalized_id = _positive_record_id(
+            analysis_run_id,
+            name="analysis_run_id",
+        )
+        normalized_error = _parameter_analysis_error(error)
+        usage_json = None
+        if usage is not None:
+            _, usage_json = _parameter_analysis_mapping(
+                usage,
+                name="usage",
+                max_bytes=MAX_PARAMETER_ANALYSIS_USAGE_JSON_BYTES,
+            )
+        finished_at = _time_text(_utc(now))
+
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM parameter_analysis_runs
+                WHERE analysis_run_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise StateError(
+                    f"unknown parameter analysis run: {normalized_id}"
+                )
+            if row["status"] == "failed":
+                if (
+                    row["error"] == normalized_error
+                    and row["usage_json"] == usage_json
+                ):
+                    return self._parameter_analysis_run_record(row)
+                raise StateError(
+                    "failed parameter analysis replay has different results"
+                )
+            if row["status"] != "started":
+                raise StateError(
+                    "only a started parameter analysis run can fail"
+                )
+            connection.execute(
+                """
+                UPDATE parameter_analysis_runs
+                SET status = 'failed',
+                    usage_json = ?,
+                    error = ?,
+                    finished_at = ?
+                WHERE analysis_run_id = ? AND status = 'started'
+                """,
+                (
+                    usage_json,
+                    normalized_error,
+                    finished_at,
+                    normalized_id,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT *
+                FROM parameter_analysis_runs
+                WHERE analysis_run_id = ?
+                """,
+                (normalized_id,),
+            ).fetchone()
+        if row is None:
+            raise StateError("failed parameter analysis run disappeared")
+        return self._parameter_analysis_run_record(row)
+
+    def parameter_analysis_run_history(
+        self,
+        parameter_set_id: int,
+        *,
+        limit: int = 1000,
+    ) -> list[ParameterAnalysisRunRecord]:
+        """Return every analysis attempt for a verified parameter set."""
+
+        normalized_set_id = _positive_record_id(
+            parameter_set_id,
+            name="parameter_set_id",
+        )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 10_000
+        ):
+            raise ValueError("limit must be an integer between 1 and 10000")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM parameter_analysis_runs
+                WHERE parameter_set_id = ?
+                ORDER BY analysis_run_id
+                LIMIT ?
+                """,
+                (normalized_set_id, limit),
+            ).fetchall()
+        return [self._parameter_analysis_run_record(row) for row in rows]
+
     def record_content_refresh(
         self,
         candidate: ContentRefreshCandidate,
@@ -5279,6 +6198,8 @@ class StateStore:
         *,
         wiki_action: str,
         fact_diagnostics: Mapping[str, Any],
+        parameter_set_id: int | None = None,
+        analysis_run_id: int | None = None,
         now: datetime | None = None,
     ) -> ContentRefreshEventRecord:
         """Atomically mark one successful existing-page-only refresh."""
@@ -5295,6 +6216,29 @@ class StateStore:
                 "content refresh wiki_action must be unchanged or updated"
             )
         diagnostics = _fact_diagnostics(fact_diagnostics)
+        normalized_parameter_set_id = (
+            None
+            if parameter_set_id is None
+            else _positive_record_id(
+                parameter_set_id,
+                name="parameter_set_id",
+            )
+        )
+        normalized_analysis_run_id = (
+            None
+            if analysis_run_id is None
+            else _positive_record_id(
+                analysis_run_id,
+                name="analysis_run_id",
+            )
+        )
+        if (
+            normalized_analysis_run_id is not None
+            and normalized_parameter_set_id is None
+        ):
+            raise ValueError(
+                "analysis_run_id requires parameter_set_id"
+            )
         timestamp = _utc(now)
         refreshed_at = _time_text(timestamp)
 
@@ -5333,14 +6277,65 @@ class StateStore:
                     "a newer synced decision replaced the refresh candidate"
                 )
 
+            if normalized_parameter_set_id is not None:
+                parameter_set = connection.execute(
+                    """
+                    SELECT product_id, source_attempt_id, source_hash
+                    FROM verified_parameter_sets
+                    WHERE parameter_set_id = ?
+                    """,
+                    (normalized_parameter_set_id,),
+                ).fetchone()
+                if parameter_set is None:
+                    raise StateError(
+                        "content refresh parameter set does not exist"
+                    )
+                if (
+                    str(parameter_set["product_id"]) != candidate.product_id
+                    or int(parameter_set["source_attempt_id"])
+                    != candidate.source_attempt_id
+                    or str(parameter_set["source_hash"])
+                    != candidate.source_hash
+                ):
+                    raise StateError(
+                        "content refresh parameter set does not belong to "
+                        "the candidate"
+                    )
+            if normalized_analysis_run_id is not None:
+                analysis_run = connection.execute(
+                    """
+                    SELECT parameter_set_id, status
+                    FROM parameter_analysis_runs
+                    WHERE analysis_run_id = ?
+                    """,
+                    (normalized_analysis_run_id,),
+                ).fetchone()
+                if analysis_run is None:
+                    raise StateError(
+                        "content refresh analysis run does not exist"
+                    )
+                if (
+                    int(analysis_run["parameter_set_id"])
+                    != normalized_parameter_set_id
+                ):
+                    raise StateError(
+                        "content refresh analysis run does not belong to "
+                        "the parameter set"
+                    )
+                if analysis_run["status"] != "completed":
+                    raise StateError(
+                        "content refresh analysis run is not completed"
+                    )
+
             inserted = connection.execute(
                 """
                 INSERT INTO content_refresh_events (
                     product_id, source_attempt_id,
                     previous_content_schema_version,
                     content_schema_version, wiki_action,
-                    fact_diagnostics_json, refreshed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    fact_diagnostics_json, parameter_set_id,
+                    analysis_run_id, refreshed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING event_id
                 """,
                 (
@@ -5350,6 +6345,8 @@ class StateStore:
                     target_version,
                     action,
                     _canonical_json(diagnostics),
+                    normalized_parameter_set_id,
+                    normalized_analysis_run_id,
                     refreshed_at,
                 ),
             )
@@ -5375,6 +6372,8 @@ class StateStore:
             content_schema_version=target_version,
             wiki_action=action,
             fact_diagnostics=diagnostics,
+            parameter_set_id=normalized_parameter_set_id,
+            analysis_run_id=normalized_analysis_run_id,
             refreshed_at=timestamp,
         )
 
@@ -5414,10 +6413,132 @@ class StateStore:
                 fact_diagnostics=_fact_diagnostics(
                     json.loads(row["fact_diagnostics_json"])
                 ),
+                parameter_set_id=(
+                    int(row["parameter_set_id"])
+                    if row["parameter_set_id"] is not None
+                    else None
+                ),
+                analysis_run_id=(
+                    int(row["analysis_run_id"])
+                    if row["analysis_run_id"] is not None
+                    else None
+                ),
                 refreshed_at=_parse_time(row["refreshed_at"]),  # type: ignore[arg-type]
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _verified_parameter_set_record(
+        row: Any,
+    ) -> VerifiedParameterSetRecord:
+        try:
+            stored_parameters = json.loads(row["parameters_json"])
+            parameters, _, computed_sha256 = _verified_parameters(
+                stored_parameters
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StateError(
+                "stored verified parameter set contains invalid JSON"
+            ) from exc
+        parameter_count = int(row["parameter_count"])
+        parameter_set_sha256 = _sha256_hex(
+            row["parameter_set_sha256"],
+            name="stored parameter_set_sha256",
+        )
+        if (
+            parameter_count != len(parameters)
+            or parameter_set_sha256 != computed_sha256
+        ):
+            raise StateError(
+                "stored verified parameter set failed its canonical digest"
+            )
+        created_at = _parse_time(row["created_at"])
+        if created_at is None:
+            raise StateError(
+                "stored verified parameter set is missing created_at"
+            )
+        return VerifiedParameterSetRecord(
+            parameter_set_id=int(row["parameter_set_id"]),
+            product_id=str(row["product_id"]),
+            source_attempt_id=int(row["source_attempt_id"]),
+            source_hash=str(row["source_hash"]),
+            pdf_url=str(row["pdf_url"]),
+            pdf_sha256=_sha256_hex(
+                row["pdf_sha256"],
+                name="stored pdf_sha256",
+            ),
+            parameters=parameters,
+            parameter_count=parameter_count,
+            parameter_set_sha256=parameter_set_sha256,
+            extractor_version=str(row["extractor_version"]),
+            validation_policy_fingerprint=_sha256_hex(
+                row["validation_policy_fingerprint"],
+                name="stored validation_policy_fingerprint",
+            ),
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _parameter_analysis_run_record(
+        row: Any,
+    ) -> ParameterAnalysisRunRecord:
+        status = str(row["status"])
+        if status not in PARAMETER_ANALYSIS_STATUSES:
+            raise StateError(
+                f"stored parameter analysis has invalid status: {status}"
+            )
+        analysis = None
+        if row["analysis_json"] is not None:
+            try:
+                analysis, _ = _parameter_analysis_mapping(
+                    json.loads(row["analysis_json"]),
+                    name="stored analysis",
+                    max_bytes=MAX_PARAMETER_ANALYSIS_JSON_BYTES,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StateError(
+                    "stored parameter analysis contains invalid analysis JSON"
+                ) from exc
+        usage = None
+        if row["usage_json"] is not None:
+            try:
+                usage, _ = _parameter_analysis_mapping(
+                    json.loads(row["usage_json"]),
+                    name="stored usage",
+                    max_bytes=MAX_PARAMETER_ANALYSIS_USAGE_JSON_BYTES,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise StateError(
+                    "stored parameter analysis contains invalid usage JSON"
+                ) from exc
+        started_at = _parse_time(row["started_at"])
+        if started_at is None:
+            raise StateError(
+                "stored parameter analysis is missing started_at"
+            )
+        return ParameterAnalysisRunRecord(
+            analysis_run_id=int(row["analysis_run_id"]),
+            parameter_set_id=int(row["parameter_set_id"]),
+            request_fingerprint=_sha256_hex(
+                row["request_fingerprint"],
+                name="stored request_fingerprint",
+            ),
+            attempt_number=int(row["attempt_number"]),
+            status=status,
+            prompt_version=str(row["prompt_version"]),
+            glossary_version=str(row["glossary_version"]),
+            model=str(row["model"]),
+            analysis=analysis,
+            usage=usage,
+            error=(
+                str(row["error"])
+                if row["error"] is not None
+                else None
+            ),
+            started_at=started_at,
+            finished_at=_parse_time(row["finished_at"]),
+        )
 
     @staticmethod
     def _product_state(row: sqlite3.Row) -> ProductState:
