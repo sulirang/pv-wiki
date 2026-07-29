@@ -157,6 +157,66 @@ class ParameterAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ParameterAnalysisError, "does not match"):
             validate_parameter_enrichment(tampered, parameters())
 
+    def test_analysis_list_fields_report_actionable_shape_errors(self) -> None:
+        type_cases = (
+            (
+                "conditions_zh",
+                "应核对现场条件。",
+                "must be a JSON array of 0-2 strings; "
+                "use [] when empty; received string",
+            ),
+            (
+                "limitations_zh",
+                {"item": "资料存在边界。"},
+                "must be a JSON array of 0-2 strings; "
+                "use [] when empty; received object",
+            ),
+        )
+        for field, value, message in type_cases:
+            with self.subTest(field=field, value=value):
+                item = copy.deepcopy(enrichment())
+                item["sections"][0]["paragraphs"][0][field] = value
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    re.escape(message),
+                ):
+                    validate_parameter_enrichment(item, parameters())
+
+        oversized = copy.deepcopy(enrichment())
+        oversized["sections"][0]["paragraphs"][0]["conditions_zh"] = [
+            "第一项条件需要结合现场资料核对。",
+            "第二项条件需要结合现场资料核对。",
+            "第三项条件需要结合现场资料核对。",
+        ]
+        with self.assertRaisesRegex(
+            ParameterAnalysisError,
+            re.escape(
+                "conditions_zh must contain 0-2 strings; received 3 items"
+            ),
+        ):
+            validate_parameter_enrichment(oversized, parameters())
+
+        for value, message in (
+            (
+                None,
+                "overall_limitations_zh must be a JSON array of 1-5 strings; "
+                "received null",
+            ),
+            (
+                [],
+                "overall_limitations_zh must contain 1-5 strings; "
+                "received 0 items",
+            ),
+        ):
+            with self.subTest(overall_limitations_zh=value):
+                item = copy.deepcopy(enrichment())
+                item["overall_limitations_zh"] = value
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    re.escape(message),
+                ):
+                    validate_parameter_enrichment(item, parameters())
+
     def test_reports_exact_basis_parameter_id_errors(self) -> None:
         cases = (
             ("p001", "must be an array"),

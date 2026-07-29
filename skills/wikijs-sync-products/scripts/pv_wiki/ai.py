@@ -1556,39 +1556,51 @@ def build_parameter_analysis_messages(
                                 "only an exact technical-token list from one source row "
                                 "may share one label, preserving token order and multiplicity"
                             ),
-                            "conditions_zh": (
-                                "0-2 explicit conditions, each professional Chinese"
-                            ),
-                            "limitations_zh": (
-                                "0-2 explicit evidence limitations, each "
-                                "professional Chinese"
-                            ),
+                            "conditions_zh": {
+                                "type": "array",
+                                "minItems": 0,
+                                "maxItems": 2,
+                                "items": "distinct professional Chinese condition string",
+                                "empty_value": [],
+                            },
+                            "limitations_zh": {
+                                "type": "array",
+                                "minItems": 0,
+                                "maxItems": 2,
+                                "items": (
+                                    "distinct professional Chinese evidence-"
+                                    "limitation string"
+                                ),
+                                "empty_value": [],
+                            },
                         },
                     },
                 },
             },
-            "overall_limitations_zh": (
-                "1-5 professional Chinese limitations without unsupported "
-                "numbers, Markdown, suitability, compliance, certification, "
-                "safety-margin, yield, or purchasing claims"
-            ),
+            "overall_limitations_zh": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": (
+                    "professional Chinese limitation string without unsupported "
+                    "numbers, Markdown, suitability, compliance, certification, "
+                    "safety-margin, yield, or purchasing claims"
+                ),
+            },
         },
         "analysis_policy": [
-            "Use all relevant verified parameters across multiple sections; do "
-            "not merely rewrite a generic product introduction.",
-            "Never copy the product name, ID, model, series, or any fragment of "
-            "them into analysis paragraphs. The page heading already presents "
-            "identity, and digits embedded in identity are not parameter evidence.",
+            "Use relevant verified parameters across sections; do not rewrite a "
+            "generic product introduction.",
+            "Never copy the product name, ID, model, series, or their fragments into "
+            "analysis paragraphs; identity text and its digits are not parameter evidence.",
             "Separate source facts from engineering interpretation. Phrase "
             "interpretations conditionally and identify missing design inputs.",
-            "For inverters, cover product positioning, DC input and MPPT, AC "
-            "output and grid side, efficiency, protection, installation or "
-            "environment, and limitations whenever the supplied parameters "
-            "support those topics.",
-            "A listed standard means only that the datasheet lists the standard; "
-            "never say certified, compliant, approved, or suitable on that basis. "
-            "You may describe this generically, but do not repeat numeric standard "
-            "identifiers in narrative analysis; keep the exact list in the table.",
+            "For inverters, cover positioning, DC input/MPPT, AC output/grid, "
+            "efficiency, protection, installation/environment, and limitations "
+            "when supplied parameters support them.",
+            "A listed standard only means the datasheet lists it; never claim "
+            "certification, compliance, approval, or suitability; do not repeat "
+            "numeric standard identifiers in narrative analysis; keep them in the table.",
             "Follow each row's numeric_narrative mode. For complete_measurement, "
             "complete_unitless_expression, or complete_count_expression, preserve "
             "the whole source expression; a count may add only a professional "
@@ -2887,7 +2899,11 @@ class OpenAICompatibleClient:
                             "preserve it and translate the surrounding prose; preserve "
                             "every protected token and "
                             "controlled term; reference only supplied parameter IDs and "
-                            "cite every used complete parameter label; "
+                            "cite every used complete parameter label. Schema rule: "
+                            "conditions_zh and limitations_zh must each be a JSON array "
+                            "of 0-2 strings, using [] when empty; overall_limitations_zh "
+                            "must be a JSON array of 1-5 strings. Never return null, an "
+                            "object, or a bare string for these array fields. "
                             "Strict retry mode overrides every earlier conversion "
                             "allowance. For complete_measurement only, either omit the "
                             "numeric clause or write <complete name_zh narrative label "

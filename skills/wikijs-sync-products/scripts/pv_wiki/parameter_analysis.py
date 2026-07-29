@@ -14,7 +14,7 @@ from typing import Any
 
 
 PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v15"
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v16"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v6"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -1030,11 +1030,31 @@ def _string_list(
     value: Any,
     field: str,
     *,
+    minimum: int = 0,
     limit: int,
     item_limit: int,
 ) -> list[str]:
-    if not isinstance(value, list) or len(value) > limit:
-        raise ParameterAnalysisError(f"{field} must be an array of at most {limit}")
+    cardinality = f"{minimum}-{limit}"
+    if not isinstance(value, list):
+        received_type = (
+            "null"
+            if value is None
+            else "string"
+            if isinstance(value, str)
+            else "object"
+            if isinstance(value, Mapping)
+            else type(value).__name__
+        )
+        raise ParameterAnalysisError(
+            f"{field} must be a JSON array of {cardinality} strings; "
+            f"{'use [] when empty; ' if minimum == 0 else ''}"
+            f"received {received_type}"
+        )
+    if not minimum <= len(value) <= limit:
+        raise ParameterAnalysisError(
+            f"{field} must contain {cardinality} strings; "
+            f"received {len(value)} items"
+        )
     return [
         _clean_text(
             item,
@@ -2317,13 +2337,10 @@ def validate_parameter_enrichment(
     overall_limitations = _string_list(
         raw.get("overall_limitations_zh", []),
         "overall_limitations_zh",
+        minimum=1,
         limit=5,
         item_limit=300,
     )
-    if not overall_limitations:
-        raise ParameterAnalysisError(
-            "overall_limitations_zh must contain at least one limitation"
-        )
     _ground_numbers(overall_limitations, [], "overall_limitations_zh")
     return {
         **expected_metadata,

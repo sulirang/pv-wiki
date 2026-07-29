@@ -688,7 +688,7 @@ class PromptTests(unittest.TestCase):
             "translate_and_analyze_complete_verified_parameter_set",
             prompt["task"],
         )
-        self.assertEqual("pv-parameter-analysis-v15", prompt["prompt_version"])
+        self.assertEqual("pv-parameter-analysis-v16", prompt["prompt_version"])
         self.assertEqual("pv-zh-technical-v6", prompt["glossary_version"])
         self.assertEqual(3, prompt["input_guarantees"]["parameter_count"])
         self.assertTrue(
@@ -823,6 +823,35 @@ class PromptTests(unittest.TestCase):
             prompt["output_contract"]["sections"]["item"]["paragraphs"][
                 "item"
             ]["basis_parameter_ids"],
+        )
+        paragraph_contract = prompt["output_contract"]["sections"]["item"][
+            "paragraphs"
+        ]["item"]
+        self.assertEqual(
+            {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": 2,
+                "items": "distinct professional Chinese condition string",
+                "empty_value": [],
+            },
+            paragraph_contract["conditions_zh"],
+        )
+        self.assertEqual("array", paragraph_contract["limitations_zh"]["type"])
+        self.assertEqual(
+            2,
+            paragraph_contract["limitations_zh"]["maxItems"],
+        )
+        self.assertEqual(
+            {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+            },
+            {
+                key: prompt["output_contract"]["overall_limitations_zh"][key]
+                for key in ("type", "minItems", "maxItems")
+            },
         )
         self.assertEqual(
             2,
@@ -1367,6 +1396,19 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             repair_content,
         )
         self.assertIn(
+            "conditions_zh and limitations_zh must each be a JSON array "
+            "of 0-2 strings",
+            repair_content,
+        )
+        self.assertIn(
+            "overall_limitations_zh must be a JSON array of 1-5 strings",
+            repair_content,
+        )
+        self.assertIn(
+            "Never return null, an object, or a bare string",
+            repair_content,
+        )
+        self.assertIn(
             "between unsupported: and the next semicolon",
             repair_content,
         )
@@ -1446,6 +1488,49 @@ class OpenAICompatibleClientTests(unittest.TestCase):
             final_repair,
         )
         self.assertIn("numeric text", final_repair)
+
+    def test_parameter_analysis_repairs_scalar_conditions_as_an_array(self) -> None:
+        calls: list[dict] = []
+        invalid_shape = valid_parameter_enrichment()
+        invalid_shape["sections"][0]["paragraphs"][0]["conditions_zh"] = (
+            "应核对项目现场条件。"
+        )
+        responses = [invalid_shape, valid_parameter_enrichment()]
+
+        def fake_open(request: object, *, timeout: float) -> FakeResponse:
+            del timeout
+            calls.append(json.loads(request.data.decode("utf-8")))
+            result = responses[len(calls) - 1]
+            return FakeResponse(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps(result)},
+                        }
+                    ],
+                    "usage": {"total_tokens": 321},
+                }
+            )
+
+        client = ai.OpenAICompatibleClient(
+            settings(max_response_bytes=20_000, max_evidence_chars=12_000),
+            opener=fake_open,
+        )
+        result = client.analyze_parameters(
+            product={"name": "R5-10K-T2-15"},
+            parameters=analysis_parameters(),
+        )
+
+        self.assertTrue(result["input_complete"])
+        self.assertEqual(2, client.last_parameter_analysis_provider_requests)
+        repair_content = calls[1]["messages"][-1]["content"]
+        self.assertIn(
+            "conditions_zh must be a JSON array of 0-2 strings",
+            repair_content,
+        )
+        self.assertIn("received string", repair_content)
+        self.assertIn("use [] when empty", repair_content)
 
     def test_parameter_analysis_stops_after_three_invalid_outputs(self) -> None:
         calls: list[dict] = []
