@@ -11,8 +11,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-PARAMETER_ANALYSIS_SCHEMA_VERSION = 1
-PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v3"
+PARAMETER_ANALYSIS_SCHEMA_VERSION = 2
+PARAMETER_ANALYSIS_PROMPT_VERSION = "pv-parameter-analysis-v4"
 PARAMETER_GLOSSARY_VERSION = "pv-zh-technical-v1"
 MAX_ANALYSIS_PARAMETERS = 200
 MAX_ANALYSIS_INPUT_CHARS = 70_000
@@ -77,6 +77,20 @@ _PROTECTED_TOKEN_RE = re.compile(
     r")(?![A-Za-z0-9])"
     r"|(?<![A-Za-z0-9])\d+(?:\.\d+)?(?![A-Za-z0-9])"
 )
+_RESTORABLE_ABBREVIATION_RE = re.compile(
+    r"(?:MPPT|THD[iI]?|DCI|GFCI|AFCI|STC|NMOT|RS\d+|"
+    r"Wi-Fi|GPRS|[345]G|IP\d+)"
+)
+_UNIT_ATOM_PATTERN = (
+    r"(?:%|°[CF]|K|(?:p|n|u|µ|m|c|d|k|M|G)?(?:"
+    r"A(?:h|ac|dc)?|V(?:A|Ar|ac|dc)?|W(?:p|h)?|Hz|"
+    r"Ω|ohm|g|m(?:2|3)?|s(?:2)?|h|Pa|bar|dB(?:A)?|rpm"
+    r"))"
+)
+_BRACKETED_UNIT_CONTENT_RE = re.compile(
+    rf"{_UNIT_ATOM_PATTERN}(?:\s*[·*/]\s*{_UNIT_ATOM_PATTERN})*",
+    re.IGNORECASE,
+)
 _NUMBER_RE = re.compile(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?![A-Za-z0-9])")
 _HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _MARKDOWN_OR_HTML_RE = re.compile(
@@ -118,6 +132,7 @@ def _clean_text(
         raise ParameterAnalysisError(f"{field} cannot contain Markdown or HTML")
     return cleaned
 
+
 def _identifier_only_heading(value: str) -> bool:
     """Whether a heading is a model/code label with no prose to translate."""
 
@@ -152,9 +167,55 @@ def _heading_translation(
             return ""
         raise ParameterAnalysisError(
             f"{field} must contain professional Chinese"
-
         )
     return translated
+
+
+def _restore_name_tokens(
+    name_zh: str,
+    source_name: str,
+    prefix: str,
+) -> str:
+    """Append exact source abbreviations/units without inventing translation."""
+
+    def contains_exact_token(text: str, token: str) -> bool:
+        normalized_text = unicodedata.normalize("NFKC", text)
+        normalized_token = unicodedata.normalize("NFKC", token)
+        if normalized_token.startswith("[") and normalized_token.endswith("]"):
+            return normalized_token in normalized_text
+        if _NUMBER_RE.fullmatch(normalized_token):
+            return normalized_token in _NUMBER_RE.findall(normalized_text)
+        return (
+            re.search(
+                rf"(?<![A-Za-z0-9]){re.escape(normalized_token)}"
+                r"(?![A-Za-z0-9])",
+                normalized_text,
+            )
+            is not None
+        )
+
+    def is_bracketed_unit(token: str) -> bool:
+        if not token.startswith("[") or not token.endswith("]"):
+            return False
+        content = unicodedata.normalize("NFKC", token[1:-1]).strip()
+        return _BRACKETED_UNIT_CONTENT_RE.fullmatch(content) is not None
+
+    restored = name_zh
+    for token in dict.fromkeys(_PROTECTED_TOKEN_RE.findall(source_name)):
+        if contains_exact_token(restored, token):
+            continue
+        if is_bracketed_unit(token):
+            suffix = f" {token}"
+        elif _RESTORABLE_ABBREVIATION_RE.fullmatch(token):
+            suffix = f"（{token}）"
+        else:
+            raise ParameterAnalysisError(
+                f"{prefix}.name_zh must preserve protected token {token}"
+            )
+        if len(restored) + len(suffix) > 200:
+            raise ParameterAnalysisError(f"{prefix}.name_zh exceeds 200 characters")
+        restored += suffix
+    return restored
 
 
 def _as_parameter_rows(
@@ -281,11 +342,7 @@ def _validate_translation(
                 f"{prefix}.name_zh must preserve the controlled term "
                 f"{required_term}"
             )
-    for token in _PROTECTED_TOKEN_RE.findall(source_name):
-        if token not in name_zh:
-            raise ParameterAnalysisError(
-                f"{prefix}.name_zh must preserve protected token {token}"
-            )
+    name_zh = _restore_name_tokens(name_zh, source_name, prefix)
 
     source_section = str(source["section"])
     section_zh = _heading_translation(

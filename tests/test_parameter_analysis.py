@@ -162,17 +162,95 @@ class ParameterAnalysisTests(unittest.TestCase):
         with self.assertRaisesRegex(ParameterAnalysisError, "exactly one"):
             validate_parameter_enrichment(item, parameters())
 
-    def test_requires_controlled_terms_and_protected_tokens(self) -> None:
-        cases = (
-            ("最大光伏阵列功率（STC）", "protected token"),
-            ("光伏阵列功率 [Wp]（STC）", "controlled term"),
+    def test_restores_safe_source_tokens_and_requires_controlled_terms(self) -> None:
+        missing_unit = copy.deepcopy(enrichment())
+        missing_unit["translations"][0]["name_zh"] = "最大光伏阵列功率（STC）"
+        restored = validate_parameter_enrichment(missing_unit, parameters())
+        self.assertEqual(
+            "最大光伏阵列功率（STC） [Wp]",
+            restored["translations"][0]["name_zh"],
         )
-        for value, message in cases:
-            with self.subTest(value=value):
-                item = copy.deepcopy(enrichment())
-                item["translations"][0]["name_zh"] = value
-                with self.assertRaisesRegex(ParameterAnalysisError, message):
-                    validate_parameter_enrichment(item, parameters())
+
+        dci_source = parameters()
+        dci_source[0]["name"] = "DCI Monitoring"
+        dci_item = copy.deepcopy(enrichment())
+        dci_item["translations"][0]["name_zh"] = "直流分量监测"
+        restored = validate_parameter_enrichment(dci_item, dci_source)
+        self.assertEqual(
+            "直流分量监测（DCI）",
+            restored["translations"][0]["name_zh"],
+        )
+        self.assertEqual(
+            restored,
+            validate_parameter_enrichment(restored, dci_source),
+        )
+
+        substring_item = copy.deepcopy(enrichment())
+        substring_item["translations"][0]["name_zh"] = "GDCI 监测"
+        restored = validate_parameter_enrichment(substring_item, dci_source)
+        self.assertEqual(
+            "GDCI 监测（DCI）",
+            restored["translations"][0]["name_zh"],
+        )
+
+        compound_source = parameters()
+        compound_source[0]["name"] = "Power Density [W/m²]"
+        compound_item = copy.deepcopy(enrichment())
+        compound_item["translations"][0]["name_zh"] = "功率密度"
+        restored = validate_parameter_enrichment(compound_item, compound_source)
+        self.assertEqual(
+            "功率密度 [W/m²]",
+            restored["translations"][0]["name_zh"],
+        )
+
+        for source_name, name_zh in (
+            ("Input index [2]", "输入索引"),
+            ("Input option [Optional]", "输入选项"),
+        ):
+            with self.subTest(source_name=source_name):
+                unsafe_source = parameters()
+                unsafe_source[0]["name"] = source_name
+                unsafe_item = copy.deepcopy(enrichment())
+                unsafe_item["translations"][0]["name_zh"] = name_zh
+                with self.assertRaisesRegex(
+                    ParameterAnalysisError,
+                    "protected token",
+                ):
+                    validate_parameter_enrichment(unsafe_item, unsafe_source)
+
+        long_item = copy.deepcopy(enrichment())
+        long_item["translations"][0]["name_zh"] = "中" * 196
+        with self.assertRaisesRegex(ParameterAnalysisError, "exceeds 200"):
+            validate_parameter_enrichment(long_item, dci_source)
+
+        missing_controlled = copy.deepcopy(enrichment())
+        missing_controlled["translations"][0]["name_zh"] = "光伏阵列功率 [Wp]（STC）"
+        with self.assertRaisesRegex(ParameterAnalysisError, "controlled term"):
+            validate_parameter_enrichment(missing_controlled, parameters())
+
+        numeric_source = parameters()
+        numeric_source[0]["name"] = "Input 2 Power [Wp]"
+        numeric_item = copy.deepcopy(enrichment())
+        numeric_item["translations"][0]["name_zh"] = "输入功率 [Wp]"
+        with self.assertRaisesRegex(ParameterAnalysisError, "protected token 2"):
+            validate_parameter_enrichment(numeric_item, numeric_source)
+
+        numeric_item["translations"][0]["name_zh"] = "输入 12 功率 [Wp]"
+        with self.assertRaisesRegex(ParameterAnalysisError, "protected token 2"):
+            validate_parameter_enrichment(numeric_item, numeric_source)
+
+        numeric_item["translations"][0]["name_zh"] = "输入 2 功率 [Wp]"
+        validate_parameter_enrichment(numeric_item, numeric_source)
+
+        multi_source = parameters()
+        multi_source[0]["name"] = "Max. MPPT 2 Voltage [V]"
+        multi_item = copy.deepcopy(enrichment())
+        multi_item["translations"][0]["name_zh"] = "最大 2 电压"
+        restored = validate_parameter_enrichment(multi_item, multi_source)
+        self.assertEqual(
+            "最大 2 电压（MPPT） [V]",
+            restored["translations"][0]["name_zh"],
+        )
 
     def test_rejects_numeric_claim_not_present_in_basis(self) -> None:
         item = copy.deepcopy(enrichment())
