@@ -707,6 +707,35 @@ def _public_product(product: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_PARAMETER_ANALYSIS_PRODUCT_FIELDS = frozenset(
+    {
+        "manufacturer",
+        "brand",
+        "brand_name",
+        "vendor",
+        "maker",
+        "category",
+        "product_category",
+    }
+)
+
+
+def _parameter_analysis_product_context(
+    product: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep category context while excluding identity and power-class text."""
+
+    budget = _TextBudget(4_000)
+    return {
+        key: _json_safe(value, budget=budget)
+        for key, value in product.items()
+        if (
+            isinstance(key, str)
+            and key.casefold() in _PARAMETER_ANALYSIS_PRODUCT_FIELDS
+        )
+    }
+
+
 def _bounded_string(value: Any, limit: int) -> str:
     return value[:limit] if isinstance(value, str) else ""
 
@@ -1362,7 +1391,7 @@ def build_parameter_analysis_messages(
         "task": "translate_and_analyze_complete_verified_parameter_set",
         "prompt_version": PARAMETER_ANALYSIS_PROMPT_VERSION,
         "glossary_version": PARAMETER_GLOSSARY_VERSION,
-        "product": _public_product(product),
+        "product": _parameter_analysis_product_context(product),
         "verified_parameters": guided_rows,
         "input_guarantees": {
             "parameter_count": len(rows),
@@ -2861,10 +2890,18 @@ class OpenAICompatibleClient:
                             "every protected token and "
                             "controlled term; reference only supplied parameter IDs and "
                             "cite every used complete parameter label; "
-                            "follow every row's numeric_narrative mode; an exact source "
-                            "numeric expression is mandatory for every narrated number; "
-                            "only use exact W/kW or Wp/kWp conversions with the matching "
-                            "narrative label core immediately before the value; never "
+                            "Strict retry mode overrides every earlier conversion "
+                            "allowance. For complete_measurement only, either omit the "
+                            "numeric clause or write <complete name_zh narrative label "
+                            "core>为<verbatim row.value><verbatim row.unit><punctuation>. "
+                            "Do not convert, reformat, parenthesize, classify, or append "
+                            "suffix words. For every other numeric_narrative mode, omit "
+                            "numeric and technical-token claims during this repair. Only "
+                            "the comma-separated exact tokens between unsupported: and "
+                            "the next semicolon are forbidden in the indicated field; a "
+                            "shorter token does not forbid a longer value containing the "
+                            "same digits. Values after basis permits: remain allowed only "
+                            "under the complete_measurement template; never "
                             "calculate or state a numeric result across rows, including "
                             "ratios, multiples, percentages, sums, differences, products, "
                             "or quotients, even if the result equals another supplied "
@@ -2878,18 +2915,18 @@ class OpenAICompatibleClient:
                             "name_zh narrative label core; delete every clause that "
                             "copies the product name, ID, model, or series, or uses a "
                             "number plus power unit as a product class, level, model, "
-                            "product, or inverter phrase; never spell a count with "
-                            "Chinese-number words including 一, 二, 两, 三, or 双; use "
-                            "only professional Arabic count expressions copied from one "
-                            "cited row with an approved classifier; never use 双通道, "
+                            "product, or inverter phrase; in strict retry, omit all count "
+                            "claims; never spell a count with Chinese-number words "
+                            "including 一, 二, 两, 三, or 双, and never use 双通道, "
                             "两个独立跟踪通道, 一对跟踪器, 两只跟踪器, or formal "
                             "Chinese numerals; for a "
                             "no_numeric_restatement row such as Feed-in=3L+N+PE, never "
                             "write 3L, 3L+N+PE, 三相, 三线制, or a numeric translation; "
                             "discuss it qualitatively or omit it; every non-limitation "
-                            "paragraph must name a referenced label core; preserve "
-                            "technical-token source order and multiplicity; do not repeat "
-                            "numeric standard identifiers; include professional multi-"
+                            "paragraph must name a referenced label core; keep technical "
+                            "tokens only in translations and omit them from narrative "
+                            "repair; do not repeat numeric standard identifiers; include "
+                            "professional multi-"
                             "section Chinese analysis and at least one overall limitation. "
                             "Keep it compact: normally one 60-240 character paragraph "
                             "per section, a second only if essential, and no repeated "

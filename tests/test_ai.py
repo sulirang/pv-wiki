@@ -671,6 +671,10 @@ class PromptTests(unittest.TestCase):
         messages = ai.build_parameter_analysis_messages(
             product={
                 "name": "R5-10K-T2-15",
+                "model": "R5-10K-T2-15",
+                "description": "10kW Three phase solar inverter",
+                "manufacturer": "SAJ",
+                "category": "Inverter",
                 "product_id": "private-db-id",
                 "family_code": "internal-family",
             },
@@ -715,8 +719,12 @@ class PromptTests(unittest.TestCase):
                 for item in prompt["verified_parameters"]
             ],
         )
-        self.assertNotIn("product_id", prompt["product"])
-        self.assertNotIn("family_code", prompt["product"])
+        self.assertEqual(
+            {"manufacturer": "SAJ", "category": "Inverter"},
+            prompt["product"],
+        )
+        self.assertNotIn("R5-10K-T2-15", messages[1]["content"])
+        self.assertNotIn("10kW Three phase solar inverter", messages[1]["content"])
         self.assertIn(
             "only permitted conversion is exact W/kW or Wp/kWp",
             messages[0]["content"],
@@ -1314,11 +1322,26 @@ class OpenAICompatibleClientTests(unittest.TestCase):
         self.assertIn("Retry once", repair_content)
         self.assertIn("every input parameter", repair_content)
         self.assertIn("numeric_narrative mode", repair_content)
-        self.assertIn("exact W/kW or Wp/kWp conversions", repair_content)
-        self.assertIn("matching narrative label core", repair_content)
+        self.assertIn(
+            "Strict retry mode overrides every earlier conversion allowance",
+            repair_content,
+        )
+        self.assertIn("For complete_measurement only", repair_content)
+        self.assertIn(
+            "<verbatim row.value><verbatim row.unit><punctuation>",
+            repair_content,
+        )
+        self.assertIn("For every other numeric_narrative mode, omit", repair_content)
+        self.assertIn(
+            "between unsupported: and the next semicolon",
+            repair_content,
+        )
+        self.assertIn("shorter token does not forbid a longer value", repair_content)
+        self.assertIn("Values after basis permits: remain allowed", repair_content)
+        self.assertNotIn("exact W/kW or Wp/kWp conversions", repair_content)
         self.assertIn("do not repeat numeric standard identifiers", repair_content)
-        self.assertIn("technical-token source order and multiplicity", repair_content)
-        self.assertIn("professional Arabic count expressions", repair_content)
+        self.assertIn("omit all count claims", repair_content)
+        self.assertIn("omit them from narrative repair", repair_content)
         self.assertIn("ratios, multiples, percentages", repair_content)
         self.assertIn(
             "transliterating it into Chinese or English number words",
