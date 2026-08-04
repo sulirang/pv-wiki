@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -108,6 +108,7 @@ from .state import (
     ContentRefreshCandidate,
     Lease,
     LeaseLostError,
+    PageRetirementInput,
     StateError,
     StateStore,
     next_month_start,
@@ -142,6 +143,8 @@ SECRET_ENVIRONMENT = (
     "PV_WIKI_WORKER_TOKEN",
 )
 MAX_JSON_INPUT_BYTES = 1_000_000
+PAGE_RETIREMENT_BACKUP_FORMAT_VERSION = 1
+MAX_PAGE_RETIREMENT_RECORDS = 10_000
 INVALID_DECISION_CIRCUIT_THRESHOLD = 5
 INVALID_DECISION_CIRCUIT_WINDOW = timedelta(minutes=30)
 MAX_RESEARCH_EVIDENCE_URLS = 5
@@ -386,6 +389,277 @@ def _read_json(path_value: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise CLIError("JSON input must be an object")
     return value
+
+
+@dataclass(frozen=True, slots=True)
+class _PageRetirementCandidate:
+    """One deletion-audit record prepared for durable retirement."""
+
+    entry: PageRetirementInput
+    locale: str
+    content_schema_version: int
+
+
+def _retirement_backup_string(
+    value: Any,
+    *,
+    name: str,
+    max_length: int = 1000,
+) -> str:
+    if not isinstance(value, str):
+        raise CLIError(f"{name} must be a string")
+    candidate = value.strip()
+    if not candidate or candidate != value or len(candidate) > max_length:
+        raise CLIError(f"{name} must be a bounded, trimmed non-empty string")
+    return candidate
+
+
+def _retirement_backup_positive_integer(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise CLIError(f"{name} must be a positive integer")
+    return value
+
+
+def _read_page_retirement_backup(
+    path_value: str,
+    *,
+    expected_sha256: str,
+    expected_count: int,
+) -> tuple[str, list[_PageRetirementCandidate]]:
+    """Read and strictly validate one page-deletion backup artifact."""
+
+    if (
+        not isinstance(expected_sha256, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256) is None
+    ):
+        raise CLIError("--expected-sha256 must be exactly 64 hexadecimal characters")
+    if (
+        isinstance(expected_count, bool)
+        or not isinstance(expected_count, int)
+        or not 1 <= expected_count <= MAX_PAGE_RETIREMENT_RECORDS
+    ):
+        raise CLIError(
+            f"--expected-count must be between 1 and {MAX_PAGE_RETIREMENT_RECORDS}"
+        )
+
+    path = Path(path_value).expanduser()
+    try:
+        size = path.stat().st_size
+        if size > MAX_JSON_INPUT_BYTES:
+            raise CLIError(f"JSON file exceeds {MAX_JSON_INPUT_BYTES} bytes")
+        encoded = path.read_bytes()
+        if len(encoded) > MAX_JSON_INPUT_BYTES:
+            raise CLIError(f"JSON file exceeds {MAX_JSON_INPUT_BYTES} bytes")
+    except CLIError:
+        raise
+    except OSError as exc:
+        raise CLIError(f"cannot read page-retirement backup: {path}") from exc
+    actual_sha256 = hashlib.sha256(encoded).hexdigest()
+    if actual_sha256 != expected_sha256.casefold():
+        raise CLIError(
+            "page-retirement backup SHA-256 does not match --expected-sha256"
+        )
+    try:
+        value = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CLIError(f"invalid page-retirement backup JSON: {path}") from exc
+    if not isinstance(value, Mapping):
+        raise CLIError("page-retirement backup must be a JSON object")
+    format_version = value.get("format_version")
+    if (
+        isinstance(format_version, bool)
+        or not isinstance(format_version, int)
+        or format_version != PAGE_RETIREMENT_BACKUP_FORMAT_VERSION
+    ):
+        raise CLIError(
+            "page-retirement backup has an unsupported format_version"
+        )
+    root_locale = _retirement_backup_string(
+        value.get("locale"),
+        name="backup locale",
+        max_length=50,
+    )
+    records = value.get("records")
+    if (
+        not isinstance(records, Sequence)
+        or isinstance(records, (str, bytes, bytearray))
+        or len(records) > MAX_PAGE_RETIREMENT_RECORDS
+    ):
+        raise CLIError("page-retirement backup records must be a bounded array")
+
+    candidates: list[_PageRetirementCandidate] = []
+    product_ids: set[str] = set()
+    page_ids: set[int] = set()
+    paths: set[str] = set()
+    for record_index, record in enumerate(records):
+        if not isinstance(record, Mapping):
+            raise CLIError(f"backup record {record_index} must be an object")
+        audit = record.get("audit")
+        if not isinstance(audit, Mapping):
+            raise CLIError(f"backup record {record_index} is missing audit data")
+        if audit.get("delete_candidate") is not True:
+            continue
+        page = record.get("page")
+        product_state = record.get("state")
+        checks = audit.get("checks")
+        if not isinstance(page, Mapping) or not isinstance(product_state, Mapping):
+            raise CLIError(
+                f"delete candidate {record_index} is missing page or state data"
+            )
+        if not isinstance(checks, Mapping):
+            raise CLIError(f"delete candidate {record_index} is missing checks")
+        if audit.get("compliant") is not False or audit.get("page_found") is not True:
+            raise CLIError(
+                f"delete candidate {record_index} has an unsafe audit classification"
+            )
+        if (
+            checks.get("managed_markers") is not True
+            or checks.get("managed_tag") is not True
+            or checks.get("human_outside_auto") is not False
+        ):
+            raise CLIError(
+                f"delete candidate {record_index} is not a managed-only page"
+            )
+
+        product_id = _retirement_backup_string(
+            audit.get("product_id"),
+            name=f"delete candidate {record_index} product_id",
+            max_length=500,
+        )
+        state_product_id = _retirement_backup_string(
+            product_state.get("product_id"),
+            name=f"delete candidate {record_index} state product_id",
+            max_length=500,
+        )
+        if state_product_id != product_id:
+            raise CLIError(
+                f"delete candidate {record_index} product IDs do not match"
+            )
+        source_attempt_id = _retirement_backup_positive_integer(
+            audit.get("attempt_id"),
+            name=f"delete candidate {record_index} attempt_id",
+        )
+        audit_page_id = _retirement_backup_positive_integer(
+            audit.get("page_id"),
+            name=f"delete candidate {record_index} audit page_id",
+        )
+        wiki_page_id = _retirement_backup_positive_integer(
+            page.get("id"),
+            name=f"delete candidate {record_index} page id",
+        )
+        if audit_page_id != wiki_page_id:
+            raise CLIError(
+                f"delete candidate {record_index} page IDs do not match"
+            )
+        audit_path = _retirement_backup_string(
+            audit.get("path"),
+            name=f"delete candidate {record_index} audit path",
+            max_length=1000,
+        )
+        wiki_path = _retirement_backup_string(
+            page.get("path"),
+            name=f"delete candidate {record_index} page path",
+            max_length=1000,
+        )
+        if audit_path != wiki_path or wiki_path.strip("/") != wiki_path:
+            raise CLIError(
+                f"delete candidate {record_index} page paths do not match"
+            )
+        locale = _retirement_backup_string(
+            page.get("locale"),
+            name=f"delete candidate {record_index} locale",
+            max_length=50,
+        )
+        if locale != root_locale:
+            raise CLIError(
+                f"delete candidate {record_index} locale does not match backup"
+            )
+        if page.get("isPrivate") is not True or page.get("isPublished") is not False:
+            raise CLIError(
+                f"delete candidate {record_index} was not private and unpublished"
+            )
+        tags = page.get("tags")
+        if not isinstance(tags, Sequence) or isinstance(
+            tags, (str, bytes, bytearray)
+        ):
+            raise CLIError(f"delete candidate {record_index} has invalid tags")
+        tag_names = {
+            str(item.get("tag") or "").strip()
+            for item in tags
+            if isinstance(item, Mapping)
+        }
+        if "managed-by-pv-wiki" not in tag_names:
+            raise CLIError(
+                f"delete candidate {record_index} lacks the managed page tag"
+            )
+        content = page.get("content")
+        begin_marker = "<!-- PV-WIKI-AUTO:BEGIN -->"
+        end_marker = "<!-- PV-WIKI-AUTO:END -->"
+        if (
+            not isinstance(content, str)
+            or content.count(begin_marker) != 1
+            or content.count(end_marker) != 1
+            or content.index(begin_marker) >= content.index(end_marker)
+        ):
+            raise CLIError(
+                f"delete candidate {record_index} has invalid managed content markers"
+            )
+        managed_start = content.index(begin_marker)
+        managed_end = content.index(end_marker) + len(end_marker)
+        if content[:managed_start].strip() or content[managed_end:].strip():
+            raise CLIError(
+                f"delete candidate {record_index} contains human content "
+                "outside the managed block"
+            )
+        updated_at_value = page.get("updatedAt")
+        if not isinstance(updated_at_value, str):
+            raise CLIError(
+                f"delete candidate {record_index} lacks page updatedAt"
+            )
+        page_updated_at = _operator_datetime(
+            updated_at_value,
+            name=f"delete candidate {record_index} updatedAt",
+        )
+        if page_updated_at is None:  # guarded by the string check above
+            raise CLIError(
+                f"delete candidate {record_index} lacks page updatedAt"
+            )
+        content_schema_version = product_state.get("content_schema_version")
+        if (
+            isinstance(content_schema_version, bool)
+            or not isinstance(content_schema_version, int)
+            or content_schema_version < 0
+        ):
+            raise CLIError(
+                f"delete candidate {record_index} has invalid content schema"
+            )
+        if product_id in product_ids or wiki_page_id in page_ids or wiki_path in paths:
+            raise CLIError("page-retirement backup contains duplicate candidates")
+        product_ids.add(product_id)
+        page_ids.add(wiki_page_id)
+        paths.add(wiki_path)
+        candidates.append(
+            _PageRetirementCandidate(
+                entry=PageRetirementInput(
+                    product_id=product_id,
+                    source_attempt_id=source_attempt_id,
+                    wiki_path=wiki_path,
+                    wiki_page_id=wiki_page_id,
+                    page_content_sha256=hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest(),
+                    page_updated_at=page_updated_at,
+                ),
+                locale=locale,
+                content_schema_version=content_schema_version,
+            )
+        )
+
+    if len(candidates) != expected_count:
+        raise CLIError(
+            "page-retirement candidate count does not match --expected-count"
+        )
+    return actual_sha256, candidates
 
 
 def _read_evidence_texts(path_value: str) -> dict[str, str]:
@@ -4901,6 +5175,9 @@ def _cmd_status(args: argparse.Namespace) -> int:
         if args.product_id:
             product = store.get_product(args.product_id)
             result["product"] = product
+            result["active_page_retirement"] = store.active_page_retirement(
+                args.product_id
+            )
             result["attempts"] = store.attempt_history(args.product_id)[-20:]
             result["research_actions"] = store.research_action_history(
                 product_id=args.product_id,
@@ -4923,6 +5200,226 @@ def _operator_datetime(value: str | None, *, name: str) -> datetime | None:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise CLIError(f"{name} must include a timezone")
     return parsed.astimezone(timezone.utc)
+
+
+def _validate_page_retirement_state(
+    store: StateStore,
+    candidates: Sequence[_PageRetirementCandidate],
+    *,
+    backup_sha256: str,
+    backup_reference: str,
+    reason: str,
+) -> list[dict[str, Any]]:
+    """Bind each backup row to the latest durable synced publication."""
+
+    plan: list[dict[str, Any]] = []
+    for candidate in candidates:
+        entry = candidate.entry
+        product = store.get_product(entry.product_id)
+        if product is None:
+            raise CLIError(
+                f"page-retirement product is missing from state: {entry.product_id}"
+            )
+        if product.status == "leased":
+            raise CLIError(
+                f"page-retirement product has an active lease: {entry.product_id}"
+            )
+        if product.content_schema_version != candidate.content_schema_version:
+            raise CLIError(
+                "page-retirement content schema differs from the backup: "
+                f"{entry.product_id}"
+            )
+        synced_attempts = [
+            attempt
+            for attempt in store.attempt_history(entry.product_id)
+            if attempt.outcome == "synced" and attempt.finished_at is not None
+        ]
+        if not synced_attempts:
+            raise CLIError(
+                f"page-retirement product has no synced attempt: {entry.product_id}"
+            )
+        latest = synced_attempts[-1]
+        if latest.attempt_id != entry.source_attempt_id:
+            raise CLIError(
+                "page-retirement backup is not bound to the latest synced attempt: "
+                f"{entry.product_id}"
+            )
+        details = latest.details
+        latest_path = (
+            details.get("wiki_path") if isinstance(details, Mapping) else None
+        )
+        if latest_path != entry.wiki_path:
+            raise CLIError(
+                "page-retirement Wiki path differs from the latest synced attempt: "
+                f"{entry.product_id}"
+            )
+        active = store.active_page_retirement(entry.product_id)
+        if active is not None and (
+            active.source_attempt_id != entry.source_attempt_id
+            or active.wiki_path != entry.wiki_path
+            or active.wiki_page_id != entry.wiki_page_id
+            or active.page_content_sha256 != entry.page_content_sha256
+            or active.page_updated_at != entry.page_updated_at
+            or active.retired_content_schema_version
+            != candidate.content_schema_version
+            or active.backup_sha256 != backup_sha256
+            or active.backup_reference != backup_reference
+            or active.reason != reason
+        ):
+            raise CLIError(
+                "page-retirement backup conflicts with the active audit: "
+                f"{entry.product_id}"
+            )
+        plan.append(
+            {
+                "product_id": entry.product_id,
+                "source_attempt_id": entry.source_attempt_id,
+                "wiki_page_id": entry.wiki_page_id,
+                "wiki_path": entry.wiki_path,
+                "locale": candidate.locale,
+                "content_schema_version": candidate.content_schema_version,
+                "page_content_sha256": entry.page_content_sha256,
+                "already_retired": active is not None,
+            }
+        )
+    return plan
+
+
+def _validate_page_retirement_wiki_scope(
+    candidates: Sequence[_PageRetirementCandidate],
+    settings: WikiSettings,
+) -> None:
+    expected_prefix = f"{settings.path_prefix}/"
+    for candidate in candidates:
+        entry = candidate.entry
+        if candidate.locale != settings.locale:
+            raise CLIError(
+                "page-retirement backup locale differs from WIKIJS_LOCALE: "
+                f"{entry.product_id}"
+            )
+        if not entry.wiki_path.startswith(expected_prefix):
+            raise CLIError(
+                "page-retirement path is outside WIKIJS_PATH_PREFIX: "
+                f"{entry.wiki_path}"
+            )
+
+
+def _cmd_retire_pages(args: argparse.Namespace) -> int:
+    reason = " ".join(str(args.reason).split())
+    if not reason or len(reason) > 200:
+        raise CLIError("--reason must contain between 1 and 200 characters")
+    retired_at = _operator_datetime(args.retired_at, name="--retired-at")
+    backup_file = str(Path(args.backup_file).expanduser().resolve())
+    backup_reference = _retirement_backup_string(
+        (
+            args.backup_reference
+            if args.backup_reference is not None
+            else Path(args.backup_file).name
+        ),
+        name="--backup-reference",
+        max_length=1000,
+    )
+    backup_sha256, candidates = _read_page_retirement_backup(
+        args.backup_file,
+        expected_sha256=args.expected_sha256,
+        expected_count=args.expected_count,
+    )
+    if retired_at is not None and any(
+        candidate.entry.page_updated_at is not None
+        and candidate.entry.page_updated_at > retired_at
+        for candidate in candidates
+    ):
+        raise CLIError("--retired-at cannot precede a backed-up page update")
+    settings = WikiSettings.from_env()
+    _validate_page_retirement_wiki_scope(candidates, settings)
+
+    with _store() as store:
+        if not args.apply:
+            plan = _validate_page_retirement_state(
+                store,
+                candidates,
+                backup_sha256=backup_sha256,
+                backup_reference=backup_reference,
+                reason=reason,
+            )
+            _emit(
+                {
+                    "ok": True,
+                    "apply": False,
+                    "backup_file": backup_file,
+                    "backup_reference": backup_reference,
+                    "backup_sha256": backup_sha256,
+                    "expected_count": args.expected_count,
+                    "candidate_count": len(candidates),
+                    "already_retired_count": sum(
+                        bool(item["already_retired"]) for item in plan
+                    ),
+                    "created_count": 0,
+                    "reused_count": sum(
+                        bool(item["already_retired"]) for item in plan
+                    ),
+                    "retired_count": 0,
+                    "reason": reason,
+                    "retired_at": retired_at,
+                    "candidates": plan,
+                }
+            )
+            return 0
+
+        client = WikiJSClient(
+            settings.base_url,
+            settings.token,
+            timeout=settings.timeout,
+            new_page_private=settings.new_page_private,
+            new_page_published=settings.new_page_published,
+        )
+        with store.publication_fence():
+            plan = _validate_page_retirement_state(
+                store,
+                candidates,
+                backup_sha256=backup_sha256,
+                backup_reference=backup_reference,
+                reason=reason,
+            )
+            for candidate in candidates:
+                entry = candidate.entry
+                if client.get_page(entry.wiki_path, candidate.locale) is not None:
+                    raise CLIError(
+                        "cannot retire a Wiki page that still exists: "
+                        f"{entry.wiki_path} ({candidate.locale})"
+                    )
+            records = store.record_page_retirements(
+                [candidate.entry for candidate in candidates],
+                reason=reason,
+                backup_sha256=backup_sha256,
+                backup_reference=backup_reference,
+                retired_at=retired_at,
+            )
+
+    already_retired_count = sum(
+        bool(item["already_retired"]) for item in plan
+    )
+    created_count = len(records) - already_retired_count
+    _emit(
+        {
+            "ok": True,
+            "apply": True,
+            "backup_file": backup_file,
+            "backup_reference": backup_reference,
+            "backup_sha256": backup_sha256,
+            "expected_count": args.expected_count,
+            "candidate_count": len(candidates),
+            "already_retired_count": already_retired_count,
+            "created_count": created_count,
+            "reused_count": already_retired_count,
+            "retired_count": created_count,
+            "active_retirement_count": len(records),
+            "reason": reason,
+            "retired_at": records[0].retired_at,
+            "candidates": plan,
+        }
+    )
+    return 0
 
 
 def _cmd_requeue(args: argparse.Namespace) -> int:
@@ -5247,32 +5744,38 @@ def publish_home() -> dict[str, Any]:
 
     settings = WikiSettings.from_env()
     with _store() as store:
-        counts = store.status_counts()
-        due_now = len(store.list_due(limit=1_000_000))
-        published = store.published_products()
+        with store.publication_fence():
+            counts = store.status_counts()
+            due_now = len(store.list_due(limit=1_000_000))
+            published = store.published_products(
+                minimum_content_schema_version=CONTENT_SCHEMA_VERSION
+            )
 
-    managed = render_home_page(
-        [
-            _home_catalogue_product(item, path_prefix=settings.path_prefix)
-            for item in published
-        ],
-        title=settings.home_title,
-    )
-    client = WikiJSClient(
-        settings.base_url,
-        settings.token,
-        timeout=settings.timeout,
-        new_page_private=settings.new_page_private,
-        new_page_published=settings.new_page_published,
-    )
-    result = client.upsert_page(
-        settings.home_path,
-        settings.locale,
-        settings.home_title,
-        "按品牌、产品类别和最近更新浏览经过资料核验的产品百科。",
-        managed,
-        ["homepage", "managed-by-pv-wiki", "product-catalogue"],
-    )
+            managed = render_home_page(
+                [
+                    _home_catalogue_product(
+                        item,
+                        path_prefix=settings.path_prefix,
+                    )
+                    for item in published
+                ],
+                title=settings.home_title,
+            )
+            client = WikiJSClient(
+                settings.base_url,
+                settings.token,
+                timeout=settings.timeout,
+                new_page_private=settings.new_page_private,
+                new_page_published=settings.new_page_published,
+            )
+            result = client.upsert_page(
+                settings.home_path,
+                settings.locale,
+                settings.home_title,
+                "按品牌、产品类别和最近更新浏览经过资料核验的产品百科。",
+                managed,
+                ["homepage", "managed-by-pv-wiki", "product-catalogue"],
+            )
     page = result.get("page") if isinstance(result.get("page"), dict) else {}
     return {
         "ok": True,
@@ -5384,6 +5887,44 @@ def build_parser() -> argparse.ArgumentParser:
     requeue.add_argument("--attempted-before")
     requeue.add_argument("--limit", type=int, default=1000)
     requeue.set_defaults(func=_cmd_requeue)
+
+    retire_pages = subparsers.add_parser(
+        "retire-pages",
+        help=(
+            "audit and tombstone previously deleted managed pages from an "
+            "exact backup artifact"
+        ),
+    )
+    retire_pages.add_argument("--backup-file", required=True)
+    retire_pages.add_argument(
+        "--backup-reference",
+        help=(
+            "durable audit reference for the backup; defaults to the input "
+            "file basename"
+        ),
+    )
+    retire_pages.add_argument(
+        "--expected-sha256",
+        required=True,
+        help="required SHA-256 of the complete backup file",
+    )
+    retire_pages.add_argument(
+        "--expected-count",
+        required=True,
+        type=int,
+        help="required number of delete_candidate records",
+    )
+    retire_pages.add_argument("--reason", required=True)
+    retire_pages.add_argument(
+        "--retired-at",
+        help="actual deletion time as a timezone-aware ISO-8601 timestamp",
+    )
+    retire_pages.add_argument(
+        "--apply",
+        action="store_true",
+        help="record tombstones after confirming every Wiki path is absent",
+    )
+    retire_pages.set_defaults(func=_cmd_retire_pages)
 
     publish_home = subparsers.add_parser(
         "publish-home",

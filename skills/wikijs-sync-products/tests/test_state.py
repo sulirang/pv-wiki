@@ -211,6 +211,60 @@ class StateStoreTests(unittest.TestCase):
             [parameters for _, parameters in locked.calls],
         )
 
+    def test_postgres_v12_migrates_v11_page_retirement_ledger(self) -> None:
+        class Cursor:
+            def __init__(self, row=None):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class InitialConnection:
+            def execute(self, statement, _parameters=()):
+                if "to_regclass" in statement:
+                    return Cursor({"metadata_table": "state_metadata"})
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": 11})
+                raise AssertionError(f"unexpected initial SQL: {statement}")
+
+        class LockedConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, parameters=()):
+                self.calls.append((statement, tuple(parameters)))
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": 11})
+                return Cursor()
+
+        initial = InitialConnection()
+        locked = LockedConnection()
+
+        @contextmanager
+        def initial_scope():
+            yield initial
+
+        @contextmanager
+        def locked_scope():
+            yield locked
+
+        store = object.__new__(state.StateStore)
+        store.backend = "postgresql"
+        store._connection = initial_scope
+        store._write_transaction = locked_scope
+
+        self.assertEqual(state.SCHEMA_VERSION, store._migrate_postgresql())
+        statements = "\n".join(statement for statement, _ in locked.calls)
+        self.assertIn("CREATE TABLE IF NOT EXISTS page_retirements", statements)
+        self.assertIn("page_retirements_active_product_idx", statements)
+        self.assertIn("page_retirements_active_path_idx", statements)
+        self.assertIn("page_retirements_active_page_id_idx", statements)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS verified_parameter_sets", statements)
+        self.assertIn(
+            (state.SCHEMA_VERSION, 11),
+            [parameters for _, parameters in locked.calls],
+        )
+
     def test_creates_missing_parent_for_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             existing = Path(directory) / "existing"
@@ -273,6 +327,42 @@ class StateStoreTests(unittest.TestCase):
         )
         self.assertEqual(1, len(candidates))
         return candidates[0]
+
+    def _publish_page(
+        self,
+        product_id: str,
+        *,
+        content_schema_version: int = 3,
+        now: datetime = T0,
+    ):
+        self.store.upsert_product(product(product_id), now=now)
+        lease = self.store.lease_next(f"publisher-{product_id}", now=now)
+        self.assertIsNotNone(lease)
+        published_at = now + timedelta(seconds=1)
+        self.store.record_outcome(
+            lease,
+            "synced",
+            payload={
+                "decision": {
+                    "outcome": "publish",
+                    "manufacturer": "Acme Public",
+                    "model": product_id,
+                    "facts": [],
+                },
+                "validation_policy_fingerprint": "verified-policy",
+                "fact_diagnostics": {
+                    "complete": True,
+                    "proposed": 0,
+                    "retained": 0,
+                    "rejected": 0,
+                    "rejection_reasons": {},
+                },
+            },
+            wiki_path=f"products/{product_id.casefold()}",
+            content_schema_version=content_schema_version,
+            now=published_at,
+        )
+        return lease, published_at
 
     def test_schema_and_source_hash_upsert_are_idempotent(self):
         self.assertEqual(self.store.schema_version, state.SCHEMA_VERSION)
@@ -665,6 +755,287 @@ class StateStoreTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "positive integer"):
             self.store.published_products(limit=0)
+
+    def test_page_retirement_is_atomic_idempotent_and_suppresses_publication(self):
+        first_lease, first_published_at = self._publish_page("P-1")
+        second_lease, second_published_at = self._publish_page(
+            "P-2",
+            now=T0 + timedelta(minutes=1),
+        )
+        candidate = self.store.content_refresh_candidates(
+            4,
+            product_ids=["P-1"],
+        )[0]
+        entries = (
+            state.PageRetirementInput(
+                product_id="P-1",
+                source_attempt_id=first_lease.attempt_id,
+                wiki_path="/products/p-1/",
+                wiki_page_id=101,
+                page_content_sha256="a" * 64,
+                page_updated_at=first_published_at,
+            ),
+            state.PageRetirementInput(
+                product_id="P-2",
+                source_attempt_id=second_lease.attempt_id,
+                wiki_path="products/p-2",
+                wiki_page_id=102,
+                page_content_sha256="b" * 64,
+                page_updated_at=second_published_at,
+            ),
+        )
+        retired_at = T0 + timedelta(days=2)
+
+        retired = self.store.record_page_retirements(
+            entries,
+            reason="legacy-content-schema",
+            backup_sha256="c" * 64,
+            backup_reference="backups/pages.json",
+            retired_at=retired_at,
+        )
+        replay = self.store.record_page_retirements(
+            entries,
+            reason="legacy-content-schema",
+            backup_sha256="c" * 64,
+            backup_reference="backups/pages.json",
+            retired_at=retired_at + timedelta(hours=1),
+        )
+
+        self.assertEqual(retired, replay)
+        self.assertEqual(2, len(retired))
+        self.assertEqual(first_lease.source_hash, retired[0].source_hash)
+        self.assertEqual(3, retired[0].retired_content_schema_version)
+        self.assertEqual("products/p-1", retired[0].wiki_path)
+        self.assertEqual("backups/pages.json", retired[0].backup_reference)
+        self.assertEqual(retired_at, retired[0].retired_at)
+        self.assertEqual(retired[0], self.store.active_page_retirement("P-1"))
+        self.assertEqual(list(retired), self.store.page_retirement_history())
+        self.assertEqual(
+            {"due": 0, "leased": 0, "backoff": 0, "synced": 0, "retired": 2},
+            self.store.status_counts(now=retired_at),
+        )
+        refresh_at = second_published_at + timedelta(
+            days=state.SYNC_REFRESH_DAYS,
+        )
+        self.assertEqual(0, self.store.due_count(now=refresh_at))
+        self.assertEqual([], self.store.list_due(now=refresh_at))
+        self.assertIsNone(self.store.lease_next("blocked", now=refresh_at))
+        self.assertEqual(
+            "page_retired",
+            self.store.precheck("P-1", now=refresh_at).reason,
+        )
+        self.assertEqual([], self.store.published_products())
+        self.assertEqual(
+            [],
+            self.store.published_products(minimum_content_schema_version=3),
+        )
+        self.assertEqual([], self.store.content_refresh_candidates(4))
+        self.assertEqual(
+            0,
+            self.store.requeue_products(
+                ("synced",),
+                reason="must-remain-retired",
+                now=refresh_at,
+            ),
+        )
+        with self.assertRaisesRegex(state.StateError, "page is retired"):
+            self.store.record_content_refresh(
+                candidate,
+                4,
+                wiki_action="updated",
+                fact_diagnostics=candidate.fact_diagnostics,
+                now=refresh_at,
+            )
+
+        changed = self.store.upsert_product(
+            product(
+                "P-1",
+                name="Retired catalogue revision",
+                updated_at=refresh_at,
+            ),
+            now=refresh_at,
+        )
+        self.assertTrue(changed.changed)
+        self.assertFalse(changed.rescheduled)
+        self.assertEqual(0, self.store.due_count(now=refresh_at))
+
+        resolved = self.store.resolve_page_retirement(
+            "P-1",
+            reason="operator-approved-republication",
+            now=refresh_at,
+        )
+        self.assertEqual(refresh_at, resolved.resolved_at)
+        self.assertEqual(
+            "operator-approved-republication",
+            resolved.resolution_reason,
+        )
+        self.assertIsNone(self.store.active_page_retirement("P-1"))
+        self.assertEqual(1, self.store.due_count(now=refresh_at))
+        self.assertEqual(1, self.store.status_counts(now=refresh_at)["retired"])
+        self.assertEqual(
+            "P-1",
+            self.store.lease_next("republisher", now=refresh_at).product_id,
+        )
+
+    def test_page_retirement_batch_rolls_back_on_leased_product(self):
+        first_lease, first_published_at = self._publish_page("P-1")
+        second_lease, second_published_at = self._publish_page("P-2")
+        refresh_at = second_published_at + timedelta(
+            days=state.SYNC_REFRESH_DAYS,
+        )
+        active_refresh = self.store.lease_next(
+            "active-refresh",
+            lease_seconds=3600,
+            now=refresh_at,
+        )
+        self.assertIsNotNone(active_refresh)
+        self.assertEqual("P-1", active_refresh.product_id)
+
+        with self.assertRaisesRegex(state.StateError, "leased product"):
+            self.store.record_page_retirements(
+                (
+                    state.PageRetirementInput(
+                        "P-2",
+                        second_lease.attempt_id,
+                        "products/p-2",
+                        202,
+                        "d" * 64,
+                        second_published_at,
+                    ),
+                    state.PageRetirementInput(
+                        "P-1",
+                        first_lease.attempt_id,
+                        "products/p-1",
+                        201,
+                        "e" * 64,
+                        first_published_at,
+                    ),
+                ),
+                reason="legacy-content-schema",
+                backup_sha256="f" * 64,
+                retired_at=refresh_at,
+            )
+
+        self.assertEqual([], self.store.page_retirement_history())
+
+    def test_page_retirement_reclaims_expired_lease_using_current_time(self):
+        historical = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        lease, published_at = self._publish_page("P-1", now=historical)
+        refresh_at = published_at + timedelta(days=state.SYNC_REFRESH_DAYS)
+        expired_refresh = self.store.lease_next(
+            "expired-refresh",
+            lease_seconds=1,
+            now=refresh_at,
+        )
+        self.assertIsNotNone(expired_refresh)
+
+        retired = self.store.record_page_retirements(
+            (
+                state.PageRetirementInput(
+                    "P-1",
+                    lease.attempt_id,
+                    "products/p-1",
+                    301,
+                    "1" * 64,
+                    published_at,
+                ),
+            ),
+            reason="historical-import",
+            backup_sha256="2" * 64,
+            retired_at=refresh_at,
+        )
+
+        self.assertEqual(1, len(retired))
+        self.assertEqual(
+            "lease_expired",
+            self.store.attempt_history("P-1")[-1].outcome,
+        )
+
+    def test_retired_search_quota_wait_is_not_resumed(self):
+        lease, published_at = self._publish_page("P-1")
+        refresh_at = published_at + timedelta(days=state.SYNC_REFRESH_DAYS)
+        refresh = self.store.lease_next("quota-refresh", now=refresh_at)
+        self.store.record_outcome(
+            refresh,
+            "search_quota_exhausted",
+            now=refresh_at + timedelta(seconds=1),
+        )
+        self.store.record_page_retirements(
+            (
+                state.PageRetirementInput(
+                    "P-1",
+                    lease.attempt_id,
+                    "products/p-1",
+                    302,
+                    "6" * 64,
+                    published_at,
+                ),
+            ),
+            reason="legacy-content-schema",
+            backup_sha256="7" * 64,
+        )
+
+        self.assertEqual(
+            0,
+            self.store.resume_search_quota_waits(
+                now=refresh_at + timedelta(days=1),
+            ),
+        )
+        self.assertEqual("backoff", self.store.get_product("P-1").status)
+        self.assertEqual(0, self.store.due_count(now=refresh_at + timedelta(days=1)))
+
+    def test_page_retirement_rejects_duplicate_page_identity_and_conflicts(self):
+        lease, published_at = self._publish_page("P-1")
+        self._publish_page("P-2")
+        duplicate_entries = (
+            state.PageRetirementInput(
+                "P-1", lease.attempt_id, "products/p-1", 401, "3" * 64
+            ),
+            state.PageRetirementInput(
+                "P-2", 2, "products/p-2", 401, "4" * 64
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "wiki_page_id"):
+            self.store.record_page_retirements(
+                duplicate_entries,
+                reason="duplicate-input",
+                backup_sha256="5" * 64,
+            )
+
+        entry = state.PageRetirementInput(
+            "P-1",
+            lease.attempt_id,
+            "products/p-1",
+            401,
+            "3" * 64,
+            published_at,
+        )
+        self.store.record_page_retirements(
+            (entry,),
+            reason="first-retirement",
+            backup_sha256="5" * 64,
+        )
+        with self.assertRaisesRegex(state.StateError, "conflicting"):
+            self.store.record_page_retirements(
+                (entry,),
+                reason="different-reason",
+                backup_sha256="5" * 64,
+            )
+
+    def test_published_products_filters_minimum_content_schema_version(self):
+        self._publish_page("P-1", content_schema_version=1)
+        self._publish_page("P-3", content_schema_version=3)
+        self._publish_page("P-4", content_schema_version=4)
+
+        published = self.store.published_products(
+            minimum_content_schema_version=3,
+        )
+
+        self.assertEqual({"P-3", "P-4"}, {item.product_id for item in published})
+        with self.assertRaises(TypeError):
+            self.store.published_products(
+                minimum_content_schema_version=True,
+            )
 
     def test_content_refresh_uses_last_synced_snapshot_and_audits_counts(self):
         self.store.upsert_product(product(), now=T0)
@@ -3441,6 +3812,12 @@ class StateStoreTests(unittest.TestCase):
                         "PRAGMA index_list(parameter_analysis_runs)"
                     )
                 }
+                retirement_indexes = {
+                    row[1]
+                    for row in migrated_connection.execute(
+                        "PRAGMA index_list(page_retirements)"
+                    )
+                }
             finally:
                 migrated_connection.close()
             self.assertTrue(
@@ -3463,6 +3840,7 @@ class StateStoreTests(unittest.TestCase):
             self.assertIn("content_refresh_events", tables)
             self.assertIn("verified_parameter_sets", tables)
             self.assertIn("parameter_analysis_runs", tables)
+            self.assertIn("page_retirements", tables)
             self.assertIn(
                 "content_failure_cutoff_attempt_id",
                 product_columns,
@@ -3480,6 +3858,14 @@ class StateStoreTests(unittest.TestCase):
             self.assertIn(
                 "parameter_analysis_runs_completed_idx",
                 analysis_indexes,
+            )
+            self.assertTrue(
+                {
+                    "page_retirements_product_idx",
+                    "page_retirements_active_product_idx",
+                    "page_retirements_active_path_idx",
+                    "page_retirements_active_page_id_idx",
+                }.issubset(retirement_indexes)
             )
             legacy_product = migrated.get_product("LEGACY")
             self.assertEqual("due", legacy_product.leased_from_status)

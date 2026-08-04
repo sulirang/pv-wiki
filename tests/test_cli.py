@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -161,6 +162,357 @@ class CLITests(unittest.TestCase):
                 },
                 wiki_path="products/p-42-c8d5a4d2d3",
             )
+
+    def write_page_retirement_backup(
+        self,
+        *,
+        mutate: Any = None,
+    ) -> tuple[Path, str, int]:
+        self.record_synced_page()
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+            attempt = [
+                item
+                for item in store.attempt_history("P-42")
+                if item.outcome == "synced"
+            ][-1]
+        wiki_path = "products/p-42-c8d5a4d2d3"
+        page_content = (
+            "<!-- PV-WIKI-AUTO:BEGIN -->\n"
+            "# Legacy page\n"
+            "<!-- PV-WIKI-AUTO:END -->\n"
+        )
+        record = {
+            "audit": {
+                "attempt_id": attempt.attempt_id,
+                "checks": {
+                    "managed_markers": True,
+                    "managed_tag": True,
+                    "human_outside_auto": False,
+                },
+                "compliant": False,
+                "delete_candidate": True,
+                "page_found": True,
+                "page_id": 42,
+                "path": wiki_path,
+                "product_id": "P-42",
+            },
+            "page": {
+                "content": page_content,
+                "id": 42,
+                "isPrivate": True,
+                "isPublished": False,
+                "locale": "en",
+                "path": wiki_path,
+                "tags": [{"tag": "managed-by-pv-wiki"}],
+                "updatedAt": "2026-08-04T01:30:00Z",
+            },
+            "state": {
+                "content_schema_version": current.content_schema_version,
+                "product_id": "P-42",
+            },
+        }
+        if mutate is not None:
+            mutate(record)
+        backup = {
+            "format_version": 1,
+            "locale": "en",
+            "records": [record],
+        }
+        path = self.write_json("pages.json", backup)
+        sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        return path, sha256, attempt.attempt_id
+
+    def test_retire_pages_preview_is_strict_and_read_only(self) -> None:
+        path, sha256, attempt_id = self.write_page_retirement_backup()
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+
+        with mock.patch.object(cli, "WikiJSClient") as wiki_client:
+            code, payload, error = self.run_cli(
+                "retire-pages",
+                "--backup-file",
+                str(path),
+                "--expected-sha256",
+                sha256,
+                "--expected-count",
+                "1",
+                "--reason",
+                "legacy-format-removed-2026-08-04",
+                "--retired-at",
+                "2026-08-04T01:33:08Z",
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["apply"])
+        self.assertEqual(1, payload["candidate_count"])
+        self.assertEqual(0, payload["retired_count"])
+        self.assertEqual(attempt_id, payload["candidates"][0]["source_attempt_id"])
+        self.assertFalse(payload["candidates"][0]["already_retired"])
+        wiki_client.assert_not_called()
+        with state.StateStore(self.state_path) as store:
+            self.assertIsNone(store.active_page_retirement("P-42"))
+
+    def test_retire_pages_apply_confirms_absence_and_is_idempotent(self) -> None:
+        path, sha256, attempt_id = self.write_page_retirement_backup()
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+        client = mock.Mock()
+        client.get_page.return_value = None
+        arguments = (
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--backup-reference",
+            "/durable/pv-wiki/pages.json",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+            "--retired-at",
+            "2026-08-04T01:33:08Z",
+            "--apply",
+        )
+
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            first_code, first_payload, first_error = self.run_cli(*arguments)
+            second_code, second_payload, second_error = self.run_cli(*arguments)
+
+        self.assertEqual(0, first_code, first_error)
+        self.assertEqual(1, first_payload["retired_count"])
+        self.assertEqual(0, first_payload["already_retired_count"])
+        self.assertEqual(0, second_code, second_error)
+        self.assertEqual(0, second_payload["retired_count"])
+        self.assertEqual(1, second_payload["already_retired_count"])
+        self.assertEqual(
+            [mock.call("products/p-42-c8d5a4d2d3", "en")] * 2,
+            client.get_page.call_args_list,
+        )
+        with state.StateStore(self.state_path) as store:
+            active = store.active_page_retirement("P-42")
+            self.assertIsNotNone(active)
+            self.assertEqual(attempt_id, active.source_attempt_id)
+            self.assertEqual(42, active.wiki_page_id)
+            self.assertEqual(sha256, active.backup_sha256)
+            self.assertEqual(
+                "/durable/pv-wiki/pages.json",
+                active.backup_reference,
+            )
+
+        code, status_payload, error = self.run_cli(
+            "status",
+            "--product-id",
+            "P-42",
+        )
+        self.assertEqual(0, code, error)
+        self.assertEqual(
+            active.retirement_id,
+            status_payload["active_page_retirement"]["retirement_id"],
+        )
+
+    def test_retire_pages_apply_fails_closed_when_a_page_still_exists(self) -> None:
+        path, sha256, _ = self.write_page_retirement_backup()
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+        client = mock.Mock()
+        client.get_page.return_value = {"id": 42}
+
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            code, payload, error = self.run_cli(
+                "retire-pages",
+                "--backup-file",
+                str(path),
+                "--expected-sha256",
+                sha256,
+                "--expected-count",
+                "1",
+                "--reason",
+                "legacy-format-removed-2026-08-04",
+                "--apply",
+            )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("still exists", error)
+        with state.StateStore(self.state_path) as store:
+            self.assertIsNone(store.active_page_retirement("P-42"))
+
+    def test_retire_pages_rejects_backup_mismatch_before_state_change(self) -> None:
+        path, sha256, attempt_id = self.write_page_retirement_backup(
+            mutate=lambda record: record["audit"].__setitem__(
+                "attempt_id", 999999
+            )
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("latest synced attempt", error)
+        self.assertNotEqual(attempt_id, 999999)
+        with state.StateStore(self.state_path) as store:
+            self.assertIsNone(store.active_page_retirement("P-42"))
+
+    def test_retire_pages_requires_exact_backup_sha_and_count(self) -> None:
+        path, sha256, _ = self.write_page_retirement_backup()
+
+        code, _, sha_error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            "0" * 64,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+        )
+        count_code, _, count_error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "2",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+        )
+
+        self.assertEqual(2, code)
+        self.assertIn("SHA-256", sha_error)
+        self.assertEqual(2, count_code)
+        self.assertIn("candidate count", count_error)
+
+    def test_retire_pages_rejects_non_private_or_published_backup_page(self) -> None:
+        path, sha256, _ = self.write_page_retirement_backup(
+            mutate=lambda record: record["page"].__setitem__(
+                "isPrivate", False
+            )
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("private and unpublished", error)
+
+    def test_retire_pages_recomputes_managed_only_content_boundary(self) -> None:
+        path, sha256, _ = self.write_page_retirement_backup(
+            mutate=lambda record: record["page"].__setitem__(
+                "content",
+                "Operator note\n" + record["page"]["content"],
+            )
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("human content outside the managed block", error)
+
+    def test_retire_pages_rejects_inconsistent_page_identity(self) -> None:
+        path, sha256, _ = self.write_page_retirement_backup(
+            mutate=lambda record: record["page"].__setitem__("id", 43)
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("page IDs do not match", error)
+
+    def test_retire_pages_rejects_path_outside_configured_wiki_scope(self) -> None:
+        def move_page(record: dict) -> None:
+            record["audit"]["path"] = "archive/p-42"
+            record["page"]["path"] = "archive/p-42"
+
+        path, sha256, _ = self.write_page_retirement_backup(mutate=move_page)
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+                "WIKIJS_LOCALE": "en",
+                "WIKIJS_PATH_PREFIX": "products",
+            }
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-format-removed-2026-08-04",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("outside WIKIJS_PATH_PREFIX", error)
 
     def test_requeue_command_wakes_only_the_requested_cutover_outcome(
         self,
@@ -461,6 +813,7 @@ class CLITests(unittest.TestCase):
                     }
                 },
                 wiki_path="products/p-42-c8d5a4d2d3",
+                content_schema_version=cli.CONTENT_SCHEMA_VERSION,
                 now=datetime(2026, 7, 20, tzinfo=timezone.utc),
             )
         os.environ.update(
@@ -498,6 +851,86 @@ class CLITests(unittest.TestCase):
         self.assertIn("[热泵](/t/category-%E7%83%AD%E6%B3%B5)", arguments[4])
         self.assertIn("[Acme](/t/brand-acme)", arguments[4])
         self.assertIn("[P-42](/products/p-42-c8d5a4d2d3)", arguments[4])
+
+    def test_publish_home_excludes_pages_below_current_content_schema(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("legacy-homepage-test")
+            store.record_outcome(
+                lease,
+                "synced",
+                payload={
+                    "decision": {
+                        "manufacturer": "Acme",
+                        "model": "Legacy 42",
+                        "product_category": "逆变器",
+                    }
+                },
+                wiki_path="products/p-42-c8d5a4d2d3",
+            )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+                "WIKIJS_HOME_PATH": "home",
+            }
+        )
+        client = mock.Mock()
+        client.upsert_page.return_value = {
+            "action": "updated",
+            "page": {"id": 7},
+        }
+
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            code, payload, error = self.run_cli("publish-home")
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(0, payload["updated_products"])
+        managed = client.upsert_page.call_args.args[4]
+        self.assertNotIn("/products/p-42-c8d5a4d2d3", managed)
+
+    def test_publish_home_holds_publication_fence_through_wiki_update(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("fenced-homepage-test")
+            store.record_outcome(
+                lease,
+                "synced",
+                payload={"decision": {"manufacturer": "Acme", "model": "P-42"}},
+                wiki_path="products/p-42-c8d5a4d2d3",
+                content_schema_version=cli.CONTENT_SCHEMA_VERSION,
+            )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+        fence_active = False
+
+        @contextmanager
+        def publication_fence(_store):
+            nonlocal fence_active
+            self.assertFalse(fence_active)
+            fence_active = True
+            try:
+                yield
+            finally:
+                fence_active = False
+
+        client = mock.Mock()
+
+        def upsert_page(*_args, **_kwargs):
+            self.assertTrue(fence_active)
+            return {"action": "updated", "page": {"id": 7}}
+
+        client.upsert_page.side_effect = upsert_page
+        with (
+            mock.patch.object(cli.StateStore, "publication_fence", publication_fence),
+            mock.patch.object(cli, "WikiJSClient", return_value=client),
+        ):
+            code, _, error = self.run_cli("publish-home")
+
+        self.assertEqual(0, code, error)
+        self.assertFalse(fence_active)
 
     def test_parameter_hydration_revalidates_local_primary_pdf_rows(
         self,

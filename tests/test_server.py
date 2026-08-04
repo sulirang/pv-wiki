@@ -266,7 +266,13 @@ class WorkerHTTPTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["ready"])
         self.assertEqual(
-            {"due": 0, "leased": 0, "backoff": 0, "synced": 0},
+            {
+                "due": 0,
+                "leased": 0,
+                "backoff": 0,
+                "synced": 0,
+                "retired": 0,
+            },
             payload["queue"]["counts"],
         )
         self.assertEqual(0, payload["queue"]["due_now"])
