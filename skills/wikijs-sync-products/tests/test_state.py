@@ -265,6 +265,59 @@ class StateStoreTests(unittest.TestCase):
             [parameters for _, parameters in locked.calls],
         )
 
+    def test_postgres_v13_migrates_v12_retirement_basis(self) -> None:
+        class Cursor:
+            def __init__(self, row=None):
+                self.row = row
+
+            def fetchone(self):
+                return self.row
+
+        class InitialConnection:
+            def execute(self, statement, _parameters=()):
+                if "to_regclass" in statement:
+                    return Cursor({"metadata_table": "state_metadata"})
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": 12})
+                raise AssertionError(f"unexpected initial SQL: {statement}")
+
+        class LockedConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, parameters=()):
+                self.calls.append((statement, tuple(parameters)))
+                if "SELECT schema_version" in statement:
+                    return Cursor({"schema_version": 12})
+                return Cursor()
+
+        initial = InitialConnection()
+        locked = LockedConnection()
+
+        @contextmanager
+        def initial_scope():
+            yield initial
+
+        @contextmanager
+        def locked_scope():
+            yield locked
+
+        store = object.__new__(state.StateStore)
+        store.backend = "postgresql"
+        store._connection = initial_scope
+        store._write_transaction = locked_scope
+
+        self.assertEqual(state.SCHEMA_VERSION, store._migrate_postgresql())
+        statements = "\n".join(statement for statement, _ in locked.calls)
+        self.assertIn("ALTER TABLE page_retirements", statements)
+        self.assertIn("ADD COLUMN basis", statements)
+        self.assertIn("DEFAULT 'synced_publication'", statements)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS page_retirements", statements)
+        self.assertIn(
+            (state.SCHEMA_VERSION, 12),
+            [parameters for _, parameters in locked.calls],
+        )
+
     def test_creates_missing_parent_for_durable_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             existing = Path(directory) / "existing"
@@ -804,6 +857,7 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(retired, replay)
         self.assertEqual(2, len(retired))
         self.assertEqual(first_lease.source_hash, retired[0].source_hash)
+        self.assertEqual("synced_publication", retired[0].basis)
         self.assertEqual(3, retired[0].retired_content_schema_version)
         self.assertEqual("products/p-1", retired[0].wiki_path)
         self.assertEqual("backups/pages.json", retired[0].backup_reference)
@@ -1020,6 +1074,172 @@ class StateStoreTests(unittest.TestCase):
                 (entry,),
                 reason="different-reason",
                 backup_sha256="5" * 64,
+            )
+
+    def test_failed_publication_retirement_uses_latest_path_bearing_failure(self):
+        self.store.upsert_product(product("FAILED"), now=T0)
+        first = self.store.lease_next("failed-first", now=T0)
+        first_result = self.store.record_outcome(
+            first,
+            "wikijs_error",
+            wiki_path="products/failed",
+            error="write response was ambiguous",
+            now=T0 + timedelta(seconds=1),
+        )
+        no_path = self.store.lease_next(
+            "failed-no-path",
+            now=first_result.next_run_at,
+        )
+        self.store.record_outcome(
+            no_path,
+            "publish_error",
+            error="failed before selecting a path",
+            now=first_result.next_run_at + timedelta(seconds=1),
+        )
+
+        record = self.store.record_page_retirements(
+            (
+                state.PageRetirementInput(
+                    "FAILED",
+                    first.attempt_id,
+                    "products/failed",
+                    501,
+                    "8" * 64,
+                    basis="failed_publication",
+                ),
+            ),
+            reason="failed-publication-left-managed-page",
+            backup_sha256="9" * 64,
+        )[0]
+
+        self.assertEqual("failed_publication", record.basis)
+        self.assertEqual(first.attempt_id, record.source_attempt_id)
+
+        self.store.upsert_product(product("NEWER"), now=T0)
+        old = self.store.lease_next("newer-old", now=T0)
+        old_result = self.store.record_outcome(
+            old,
+            "wikijs_conflict",
+            wiki_path="products/newer",
+            now=T0 + timedelta(seconds=1),
+        )
+        newest = self.store.lease_next(
+            "newer-newest",
+            now=old_result.next_run_at,
+        )
+        self.store.record_outcome(
+            newest,
+            "publish_error",
+            wiki_path="products/newer",
+            now=old_result.next_run_at + timedelta(seconds=1),
+        )
+        with self.assertRaisesRegex(state.StateError, "latest path-bearing"):
+            self.store.record_page_retirements(
+                (
+                    state.PageRetirementInput(
+                        "NEWER",
+                        old.attempt_id,
+                        "products/newer",
+                        502,
+                        "a" * 64,
+                        basis="failed_publication",
+                    ),
+                ),
+                reason="stale-failure-anchor",
+                backup_sha256="b" * 64,
+            )
+
+    def test_failed_publication_basis_rejects_non_publication_failure(self):
+        self.store.upsert_product(product("NO-PDF"), now=T0)
+        lease = self.store.lease_next("no-pdf", now=T0)
+        self.store.record_outcome(
+            lease,
+            "no_datasheet",
+            wiki_path="products/no-pdf",
+            now=T0 + timedelta(seconds=1),
+        )
+
+        with self.assertRaisesRegex(
+            state.StateError,
+            "requires a Wiki publication failure",
+        ):
+            self.store.record_page_retirements(
+                (
+                    state.PageRetirementInput(
+                        "NO-PDF",
+                        lease.attempt_id,
+                        "products/no-pdf",
+                        503,
+                        "c" * 64,
+                        basis="failed_publication",
+                    ),
+                ),
+                reason="invalid-basis",
+                backup_sha256="d" * 64,
+            )
+
+    def test_legacy_managed_page_uses_latest_completed_attempt_without_path(self):
+        self.store.upsert_product(product("LEGACY"), now=T0)
+        old = self.store.lease_next("legacy-old", now=T0)
+        old_result = self.store.record_outcome(
+            old,
+            "no_datasheet",
+            now=T0 + timedelta(seconds=1),
+        )
+        latest = self.store.lease_next(
+            "legacy-latest",
+            now=old_result.next_run_at,
+        )
+        self.store.record_outcome(
+            latest,
+            "ambiguous",
+            now=old_result.next_run_at + timedelta(seconds=1),
+        )
+
+        with self.assertRaisesRegex(state.StateError, "latest completed"):
+            self.store.record_page_retirements(
+                (
+                    state.PageRetirementInput(
+                        "LEGACY",
+                        old.attempt_id,
+                        "products/legacy-import",
+                        504,
+                        "e" * 64,
+                        basis="legacy_managed_page",
+                    ),
+                ),
+                reason="stale-legacy-anchor",
+                backup_sha256="f" * 64,
+            )
+
+        record = self.store.record_page_retirements(
+            (
+                state.PageRetirementInput(
+                    "LEGACY",
+                    latest.attempt_id,
+                    "products/legacy-import",
+                    504,
+                    "e" * 64,
+                    basis="legacy_managed_page",
+                ),
+            ),
+            reason="legacy-managed-import",
+            backup_sha256="f" * 64,
+        )[0]
+        self.assertEqual("legacy_managed_page", record.basis)
+        self.assertEqual(latest.attempt_id, record.source_attempt_id)
+
+    def test_page_retirement_rejects_unknown_basis(self):
+        with self.assertRaisesRegex(ValueError, "basis must be one of"):
+            state._page_retirement_input(
+                {
+                    "product_id": "P-1",
+                    "source_attempt_id": 1,
+                    "wiki_path": "products/p-1",
+                    "wiki_page_id": 1,
+                    "page_content_sha256": "0" * 64,
+                    "basis": "invented",
+                }
             )
 
     def test_published_products_filters_minimum_content_schema_version(self):
@@ -3945,6 +4165,54 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(1, len(events))
             self.assertIsNone(events[0].parameter_set_id)
             self.assertIsNone(events[0].analysis_run_id)
+        finally:
+            migrated.close()
+
+    def test_migrates_v12_page_retirements_to_synced_basis(self):
+        legacy_path = Path(self.tempdir.name) / "legacy-v12.sqlite3"
+        timestamp = "2026-01-01T12:00:00.000000Z"
+        connection = sqlite3.connect(legacy_path)
+        for statement in state._CREATE_PAGE_RETIREMENT_SCHEMA:
+            connection.execute(statement)
+        connection.execute(
+            """
+            INSERT INTO page_retirements (
+                product_id, source_attempt_id, source_hash,
+                retired_content_schema_version, wiki_path, wiki_page_id,
+                page_content_sha256, backup_sha256, backup_reference,
+                reason, retired_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "LEGACY",
+                1,
+                "1" * 64,
+                3,
+                "products/legacy",
+                99,
+                "2" * 64,
+                "3" * 64,
+                "legacy-pages.json",
+                "pre-v13-retirement",
+                timestamp,
+            ),
+        )
+        connection.execute("PRAGMA user_version = 12")
+        connection.commit()
+        connection.close()
+
+        migrated = state.StateStore(legacy_path)
+        try:
+            self.assertEqual(state.SCHEMA_VERSION, migrated.schema_version)
+            with sqlite3.connect(legacy_path) as migrated_connection:
+                basis = migrated_connection.execute(
+                    "SELECT basis FROM page_retirements WHERE retirement_id = 1"
+                ).fetchone()[0]
+            self.assertEqual("synced_publication", basis)
+            self.assertEqual(
+                "synced_publication",
+                migrated.page_retirement_history()[0].basis,
+            )
         finally:
             migrated.close()
 

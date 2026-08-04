@@ -223,6 +223,86 @@ class CLITests(unittest.TestCase):
         sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
         return path, sha256, attempt.attempt_id
 
+    def write_v2_page_retirement_backup(
+        self,
+        *,
+        basis: str,
+        attempt_id: int,
+        wiki_path: str = "products/p-42-c8d5a4d2d3",
+        content: str | None = None,
+        tags: list[dict[str, str]] | None = None,
+        is_published: bool | None = None,
+        mutate: Any = None,
+    ) -> tuple[Path, str]:
+        with state.StateStore(self.state_path) as store:
+            current = store.get_product("P-42")
+        legacy = basis == "legacy_managed_page"
+        if content is None:
+            content = (
+                (
+                    "<!-- HERMES-AUTO:BEGIN -->\n"
+                    "# Legacy automated page\n"
+                    "<!-- HERMES-AUTO:END -->\n"
+                )
+                if legacy
+                else (
+                    "<!-- PV-WIKI-AUTO:BEGIN -->\n"
+                    "# Managed page\n"
+                    "<!-- PV-WIKI-AUTO:END -->\n"
+                )
+            )
+        if tags is None:
+            tags = [
+                {
+                    "tag": (
+                        "managed-by-hermes" if legacy else "managed-by-pv-wiki"
+                    )
+                }
+            ]
+        if is_published is None:
+            is_published = legacy
+        record = {
+            "audit": {
+                "attempt_id": attempt_id,
+                "automated_only": True,
+                "checks": {
+                    "managed_markers": True,
+                    "managed_tag": True,
+                    "human_outside_auto": False,
+                },
+                "compliant": False,
+                "delete_candidate": True,
+                "page_found": True,
+                "page_id": 42,
+                "path": wiki_path,
+                "product_id": "P-42",
+                "retirement_basis": basis,
+            },
+            "page": {
+                "content": content,
+                "id": 42,
+                "isPrivate": True,
+                "isPublished": is_published,
+                "locale": "en",
+                "path": wiki_path,
+                "tags": tags,
+                "updatedAt": "2026-08-04T01:30:00Z",
+            },
+            "state": {
+                "content_schema_version": current.content_schema_version,
+                "product_id": "P-42",
+            },
+        }
+        if mutate is not None:
+            mutate(record)
+        backup = {
+            "format_version": 2,
+            "locale": "en",
+            "records": [record],
+        }
+        path = self.write_json("pages-v2.json", backup)
+        return path, hashlib.sha256(path.read_bytes()).hexdigest()
+
     def test_retire_pages_preview_is_strict_and_read_only(self) -> None:
         path, sha256, attempt_id = self.write_page_retirement_backup()
         os.environ.update(
@@ -253,6 +333,10 @@ class CLITests(unittest.TestCase):
         self.assertEqual(1, payload["candidate_count"])
         self.assertEqual(0, payload["retired_count"])
         self.assertEqual(attempt_id, payload["candidates"][0]["source_attempt_id"])
+        self.assertEqual(
+            "synced_publication",
+            payload["candidates"][0]["retirement_basis"],
+        )
         self.assertFalse(payload["candidates"][0]["already_retired"])
         wiki_client.assert_not_called()
         with state.StateStore(self.state_path) as store:
@@ -436,7 +520,7 @@ class CLITests(unittest.TestCase):
 
         self.assertEqual(2, code)
         self.assertEqual({}, payload)
-        self.assertIn("private and unpublished", error)
+        self.assertIn("was not private", error)
 
     def test_retire_pages_recomputes_managed_only_content_boundary(self) -> None:
         path, sha256, _ = self.write_page_retirement_backup(
@@ -513,6 +597,401 @@ class CLITests(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertEqual({}, payload)
         self.assertIn("outside WIKIJS_PATH_PREFIX", error)
+
+    def _assert_failed_publication_basis_applies(self, outcome: str) -> None:
+        wiki_path = "products/p-42-c8d5a4d2d3"
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("failed-publication")
+            store.record_outcome(
+                lease,
+                outcome,
+                wiki_path=wiki_path,
+                error="page create response was lost",
+            )
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="failed_publication",
+            attempt_id=attempt_id,
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+        client = mock.Mock()
+        client.get_page.return_value = None
+
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            code, payload, error = self.run_cli(
+                "retire-pages",
+                "--backup-file",
+                str(path),
+                "--expected-sha256",
+                sha256,
+                "--expected-count",
+                "1",
+                "--reason",
+                "failed-managed-page-removed",
+                "--apply",
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(
+            "failed_publication",
+            payload["candidates"][0]["retirement_basis"],
+        )
+        with state.StateStore(self.state_path) as store:
+            active = store.active_page_retirement("P-42")
+        self.assertEqual("failed_publication", active.basis)
+        self.assertEqual(attempt_id, active.source_attempt_id)
+
+    def test_retire_pages_v2_failed_publication_binds_wikijs_error(self) -> None:
+        self._assert_failed_publication_basis_applies("wikijs_error")
+
+    def test_retire_pages_v2_failed_publication_binds_publish_error(self) -> None:
+        self._assert_failed_publication_basis_applies("publish_error")
+
+    def test_retire_pages_v2_failed_publication_binds_conflict(self) -> None:
+        self._assert_failed_publication_basis_applies("wikijs_conflict")
+
+    def test_retire_pages_v2_synced_publication_keeps_synced_rules(self) -> None:
+        self.record_synced_page()
+        with state.StateStore(self.state_path) as store:
+            attempt_id = [
+                item
+                for item in store.attempt_history("P-42")
+                if item.outcome == "synced"
+            ][-1].attempt_id
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="synced_publication",
+            attempt_id=attempt_id,
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-format-removed",
+        )
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(
+            "synced_publication",
+            payload["candidates"][0]["retirement_basis"],
+        )
+
+    def test_retire_pages_v2_failed_publication_rejects_human_bytes(self) -> None:
+        wiki_path = "products/p-42-c8d5a4d2d3"
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("failed-publication")
+            store.record_outcome(
+                lease,
+                "wikijs_error",
+                wiki_path=wiki_path,
+                error="Wiki unavailable",
+            )
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        content = (
+            "Human note\n"
+            "<!-- PV-WIKI-AUTO:BEGIN -->\n"
+            "# Managed page\n"
+            "<!-- PV-WIKI-AUTO:END -->\n"
+        )
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="failed_publication",
+            attempt_id=attempt_id,
+            content=content,
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "failed-managed-page-removed",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("unsafe managed content", error)
+
+    def test_retire_pages_v2_failed_basis_rejects_non_wiki_attempt(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("ordinary-failure")
+            store.record_outcome(lease, "no_datasheet")
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="failed_publication",
+            attempt_id=attempt_id,
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "failed-managed-page-removed",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("no latest failed publication attempt", error)
+
+    def test_retire_pages_v2_failed_basis_rejects_anchor_older_than_other_failure(
+        self,
+    ) -> None:
+        wiki_path = "products/p-42-c8d5a4d2d3"
+        with state.StateStore(self.state_path) as store:
+            first = store.lease_next("first-failed-publication")
+            store.record_outcome(
+                first,
+                "wikijs_error",
+                wiki_path=wiki_path,
+                error="first Wiki failure",
+            )
+            first_attempt_id = store.attempt_history("P-42")[-1].attempt_id
+            retry_at = store.get_product("P-42").next_run_at
+            second = store.lease_next(
+                "second-failed-publication",
+                now=retry_at,
+            )
+            store.record_outcome(
+                second,
+                "publish_error",
+                wiki_path="products/newer-path-bearing-failure",
+                error="newer publication failure",
+                now=retry_at,
+            )
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="failed_publication",
+            attempt_id=first_attempt_id,
+            wiki_path=wiki_path,
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "failed-managed-page-removed",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("not bound to the latest failed publication attempt", error)
+
+    def test_retire_pages_v2_legacy_allows_published_automated_page(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("legacy-state-boundary")
+            store.record_outcome(lease, "no_datasheet")
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="legacy_managed_page",
+            attempt_id=attempt_id,
+            is_published=True,
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+        client = mock.Mock()
+        client.get_page.return_value = None
+
+        with mock.patch.object(cli, "WikiJSClient", return_value=client):
+            code, payload, error = self.run_cli(
+                "retire-pages",
+                "--backup-file",
+                str(path),
+                "--expected-sha256",
+                sha256,
+                "--expected-count",
+                "1",
+                "--reason",
+                "legacy-hermes-page-removed",
+                "--apply",
+            )
+
+        self.assertEqual(0, code, error)
+        self.assertEqual(
+            "legacy_managed_page",
+            payload["candidates"][0]["retirement_basis"],
+        )
+        with state.StateStore(self.state_path) as store:
+            active = store.active_page_retirement("P-42")
+        self.assertEqual("legacy_managed_page", active.basis)
+
+    def test_retire_pages_v2_legacy_requires_explicit_automation_audit(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("legacy-state-boundary")
+            store.record_outcome(lease, "no_datasheet")
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="legacy_managed_page",
+            attempt_id=attempt_id,
+            mutate=lambda record: record["audit"].__setitem__(
+                "automated_only", False
+            ),
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-hermes-page-removed",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("automated-only audit", error)
+
+    def test_retire_pages_v2_legacy_requires_one_isolated_hermes_block(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("legacy-state-boundary")
+            store.record_outcome(lease, "no_datasheet")
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        valid = (
+            "<!-- HERMES-AUTO:BEGIN -->\n"
+            "# Legacy automated page\n"
+            "<!-- HERMES-AUTO:END -->\n"
+        )
+        unsafe_contents = {
+            "markerless": "# Legacy automated page\n",
+            "mixed": (
+                "<!-- HERMES-AUTO:BEGIN -->\n"
+                "# Legacy automated page\n"
+                "<!-- PV-WIKI-AUTO:END -->\n"
+            ),
+            "outside": "Operator note\n" + valid,
+            "duplicate": valid + valid,
+        }
+
+        for name, content in unsafe_contents.items():
+            with self.subTest(name=name):
+                path, sha256 = self.write_v2_page_retirement_backup(
+                    basis="legacy_managed_page",
+                    attempt_id=attempt_id,
+                    content=content,
+                )
+                code, payload, error = self.run_cli(
+                    "retire-pages",
+                    "--backup-file",
+                    str(path),
+                    "--expected-sha256",
+                    sha256,
+                    "--expected-count",
+                    "1",
+                    "--reason",
+                    "legacy-hermes-page-removed",
+                )
+
+                self.assertEqual(2, code)
+                self.assertEqual({}, payload)
+                self.assertIn("unsafe managed content", error)
+
+    def test_retire_pages_v2_legacy_requires_positive_marker_audit(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("legacy-state-boundary")
+            store.record_outcome(lease, "no_datasheet")
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="legacy_managed_page",
+            attempt_id=attempt_id,
+            mutate=lambda record: record["audit"]["checks"].__setitem__(
+                "managed_markers", False
+            ),
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-hermes-page-removed",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("not a managed-only page", error)
+
+    def test_retire_pages_v2_legacy_requires_current_stable_path(self) -> None:
+        with state.StateStore(self.state_path) as store:
+            lease = store.lease_next("legacy-state-boundary")
+            store.record_outcome(lease, "no_datasheet")
+            attempt_id = store.attempt_history("P-42")[-1].attempt_id
+        path, sha256 = self.write_v2_page_retirement_backup(
+            basis="legacy_managed_page",
+            attempt_id=attempt_id,
+            wiki_path="products/not-the-stable-product-path",
+        )
+        os.environ.update(
+            {
+                "WIKIJS_URL": "https://wiki.example.com",
+                "WIKIJS_TOKEN": "wiki-secret",
+            }
+        )
+
+        code, payload, error = self.run_cli(
+            "retire-pages",
+            "--backup-file",
+            str(path),
+            "--expected-sha256",
+            sha256,
+            "--expected-count",
+            "1",
+            "--reason",
+            "legacy-hermes-page-removed",
+        )
+
+        self.assertEqual(2, code)
+        self.assertEqual({}, payload)
+        self.assertIn("differs from current stable path", error)
 
     def test_requeue_command_wakes_only_the_requested_cutover_outcome(
         self,

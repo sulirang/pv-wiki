@@ -95,6 +95,10 @@ from .decision import (
     validate_decision,
 )
 from .render import (
+    AUTO_BEGIN,
+    AUTO_END,
+    LEGACY_AUTO_BEGIN,
+    LEGACY_AUTO_END,
     manufacturer_display_name,
     product_bilingual_description,
     render_home_page,
@@ -108,6 +112,7 @@ from .state import (
     ContentRefreshCandidate,
     Lease,
     LeaseLostError,
+    PAGE_RETIREMENT_FAILURE_OUTCOMES,
     PageRetirementInput,
     StateError,
     StateStore,
@@ -143,7 +148,10 @@ SECRET_ENVIRONMENT = (
     "PV_WIKI_WORKER_TOKEN",
 )
 MAX_JSON_INPUT_BYTES = 1_000_000
-PAGE_RETIREMENT_BACKUP_FORMAT_VERSION = 1
+PAGE_RETIREMENT_BACKUP_FORMAT_VERSIONS = frozenset({1, 2})
+PAGE_RETIREMENT_BASES = frozenset(
+    {"synced_publication", "failed_publication", "legacy_managed_page"}
+)
 MAX_PAGE_RETIREMENT_RECORDS = 10_000
 INVALID_DECISION_CIRCUIT_THRESHOLD = 5
 INVALID_DECISION_CIRCUIT_WINDOW = timedelta(minutes=30)
@@ -420,6 +428,30 @@ def _retirement_backup_positive_integer(value: Any, *, name: str) -> int:
     return value
 
 
+def _content_is_one_automation_block(
+    content: str,
+    *,
+    begin_marker: str,
+    end_marker: str,
+) -> bool:
+    if content.count(begin_marker) != 1 or content.count(end_marker) != 1:
+        return False
+    other_markers = {
+        AUTO_BEGIN,
+        AUTO_END,
+        LEGACY_AUTO_BEGIN,
+        LEGACY_AUTO_END,
+    } - {begin_marker, end_marker}
+    if any(marker in content for marker in other_markers):
+        return False
+    begin = content.find(begin_marker)
+    end = content.find(end_marker, begin + len(begin_marker))
+    if begin < 0 or end < begin:
+        return False
+    outside = content[:begin] + content[end + len(end_marker) :]
+    return not outside.strip()
+
+
 def _read_page_retirement_backup(
     path_value: str,
     *,
@@ -469,7 +501,7 @@ def _read_page_retirement_backup(
     if (
         isinstance(format_version, bool)
         or not isinstance(format_version, int)
-        or format_version != PAGE_RETIREMENT_BACKUP_FORMAT_VERSION
+        or format_version not in PAGE_RETIREMENT_BACKUP_FORMAT_VERSIONS
     ):
         raise CLIError(
             "page-retirement backup has an unsupported format_version"
@@ -512,6 +544,18 @@ def _read_page_retirement_backup(
             raise CLIError(
                 f"delete candidate {record_index} has an unsafe audit classification"
             )
+        if format_version == 1:
+            if "retirement_basis" in audit:
+                raise CLIError(
+                    f"delete candidate {record_index} adds a basis to v1"
+                )
+            basis = "synced_publication"
+        else:
+            basis = audit.get("retirement_basis")
+            if not isinstance(basis, str) or basis not in PAGE_RETIREMENT_BASES:
+                raise CLIError(
+                    f"delete candidate {record_index} has an invalid retirement basis"
+                )
         if (
             checks.get("managed_markers") is not True
             or checks.get("managed_tag") is not True
@@ -519,6 +563,12 @@ def _read_page_retirement_backup(
         ):
             raise CLIError(
                 f"delete candidate {record_index} is not a managed-only page"
+            )
+        if basis in {"failed_publication", "legacy_managed_page"} and (
+            audit.get("automated_only") is not True
+        ):
+            raise CLIError(
+                f"delete candidate {record_index} lacks automated-only audit"
             )
 
         product_id = _retirement_backup_string(
@@ -574,9 +624,16 @@ def _read_page_retirement_backup(
             raise CLIError(
                 f"delete candidate {record_index} locale does not match backup"
             )
-        if page.get("isPrivate") is not True or page.get("isPublished") is not False:
+        if page.get("isPrivate") is not True:
             raise CLIError(
-                f"delete candidate {record_index} was not private and unpublished"
+                f"delete candidate {record_index} was not private"
+            )
+        published = page.get("isPublished")
+        if not isinstance(published, bool) or (
+            basis != "legacy_managed_page" and published is not False
+        ):
+            raise CLIError(
+                f"delete candidate {record_index} has unsafe publication visibility"
             )
         tags = page.get("tags")
         if not isinstance(tags, Sequence) or isinstance(
@@ -588,28 +645,47 @@ def _read_page_retirement_backup(
             for item in tags
             if isinstance(item, Mapping)
         }
-        if "managed-by-pv-wiki" not in tag_names:
+        if basis == "legacy_managed_page":
+            owned = (
+                "managed-by-hermes" in tag_names
+                and "managed-by-pv-wiki" not in tag_names
+            )
+        else:
+            owned = (
+                "managed-by-pv-wiki" in tag_names
+                and "managed-by-hermes" not in tag_names
+            )
+        if not owned:
             raise CLIError(
-                f"delete candidate {record_index} lacks the managed page tag"
+                f"delete candidate {record_index} has the wrong managed page tag"
             )
         content = page.get("content")
-        begin_marker = "<!-- PV-WIKI-AUTO:BEGIN -->"
-        end_marker = "<!-- PV-WIKI-AUTO:END -->"
-        if (
-            not isinstance(content, str)
-            or content.count(begin_marker) != 1
-            or content.count(end_marker) != 1
-            or content.index(begin_marker) >= content.index(end_marker)
-        ):
+        if not isinstance(content, str):
             raise CLIError(
-                f"delete candidate {record_index} has invalid managed content markers"
+                f"delete candidate {record_index} has invalid page content"
             )
-        managed_start = content.index(begin_marker)
-        managed_end = content.index(end_marker) + len(end_marker)
-        if content[:managed_start].strip() or content[managed_end:].strip():
+        if basis == "failed_publication":
+            content_is_safe = _content_is_one_automation_block(
+                content,
+                begin_marker=AUTO_BEGIN,
+                end_marker=AUTO_END,
+            )
+        elif basis == "legacy_managed_page":
+            content_is_safe = _content_is_one_automation_block(
+                content,
+                begin_marker=LEGACY_AUTO_BEGIN,
+                end_marker=LEGACY_AUTO_END,
+            )
+        else:
+            content_is_safe = _content_is_one_automation_block(
+                content,
+                begin_marker=AUTO_BEGIN,
+                end_marker=AUTO_END,
+            )
+        if not content_is_safe:
             raise CLIError(
-                f"delete candidate {record_index} contains human content "
-                "outside the managed block"
+                f"delete candidate {record_index} has unsafe managed content or "
+                "human content outside the managed block"
             )
         updated_at_value = page.get("updatedAt")
         if not isinstance(updated_at_value, str):
@@ -649,6 +725,7 @@ def _read_page_retirement_backup(
                         content.encode("utf-8")
                     ).hexdigest(),
                     page_updated_at=page_updated_at,
+                    basis=basis,
                 ),
                 locale=locale,
                 content_schema_version=content_schema_version,
@@ -5209,8 +5286,9 @@ def _validate_page_retirement_state(
     backup_sha256: str,
     backup_reference: str,
     reason: str,
+    path_prefix: str,
 ) -> list[dict[str, Any]]:
-    """Bind each backup row to the latest durable synced publication."""
+    """Bind each backup row to the attempt required by its retirement basis."""
 
     plan: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -5229,33 +5307,62 @@ def _validate_page_retirement_state(
                 "page-retirement content schema differs from the backup: "
                 f"{entry.product_id}"
             )
-        synced_attempts = [
-            attempt
-            for attempt in store.attempt_history(entry.product_id)
-            if attempt.outcome == "synced" and attempt.finished_at is not None
-        ]
-        if not synced_attempts:
+        attempts = store.attempt_history(entry.product_id)
+        if entry.basis == "synced_publication":
+            eligible = [
+                attempt
+                for attempt in attempts
+                if attempt.outcome == "synced" and attempt.finished_at is not None
+            ]
+            evidence_name = "latest synced attempt"
+            require_attempt_path = True
+        elif entry.basis == "failed_publication":
+            eligible = [
+                attempt
+                for attempt in attempts
+                if attempt.outcome in PAGE_RETIREMENT_FAILURE_OUTCOMES
+                and attempt.finished_at is not None
+                and isinstance(attempt.details, Mapping)
+                and isinstance(attempt.details.get("wiki_path"), str)
+                and bool(attempt.details.get("wiki_path", "").strip("/"))
+            ]
+            evidence_name = "latest failed publication attempt"
+            require_attempt_path = True
+        else:
+            eligible = [
+                attempt for attempt in attempts if attempt.finished_at is not None
+            ]
+            evidence_name = "latest completed attempt"
+            require_attempt_path = False
+        if not eligible:
             raise CLIError(
-                f"page-retirement product has no synced attempt: {entry.product_id}"
+                f"page-retirement product has no {evidence_name}: {entry.product_id}"
             )
-        latest = synced_attempts[-1]
+        latest = eligible[-1]
         if latest.attempt_id != entry.source_attempt_id:
             raise CLIError(
-                "page-retirement backup is not bound to the latest synced attempt: "
+                f"page-retirement backup is not bound to the {evidence_name}: "
                 f"{entry.product_id}"
             )
-        details = latest.details
-        latest_path = (
-            details.get("wiki_path") if isinstance(details, Mapping) else None
-        )
-        if latest_path != entry.wiki_path:
+        if require_attempt_path:
+            details = latest.details
+            latest_path = (
+                details.get("wiki_path") if isinstance(details, Mapping) else None
+            )
+            if latest_path != entry.wiki_path:
+                raise CLIError(
+                    "page-retirement Wiki path differs from its attempt audit: "
+                    f"{entry.product_id}"
+                )
+        elif stable_path(product.payload, prefix=path_prefix) != entry.wiki_path:
             raise CLIError(
-                "page-retirement Wiki path differs from the latest synced attempt: "
+                "legacy page-retirement path differs from current stable path: "
                 f"{entry.product_id}"
             )
         active = store.active_page_retirement(entry.product_id)
         if active is not None and (
-            active.source_attempt_id != entry.source_attempt_id
+            active.basis != entry.basis
+            or active.source_attempt_id != entry.source_attempt_id
             or active.wiki_path != entry.wiki_path
             or active.wiki_page_id != entry.wiki_page_id
             or active.page_content_sha256 != entry.page_content_sha256
@@ -5273,6 +5380,7 @@ def _validate_page_retirement_state(
         plan.append(
             {
                 "product_id": entry.product_id,
+                "retirement_basis": entry.basis,
                 "source_attempt_id": entry.source_attempt_id,
                 "wiki_page_id": entry.wiki_page_id,
                 "wiki_path": entry.wiki_path,
@@ -5341,6 +5449,7 @@ def _cmd_retire_pages(args: argparse.Namespace) -> int:
                 backup_sha256=backup_sha256,
                 backup_reference=backup_reference,
                 reason=reason,
+                path_prefix=settings.path_prefix,
             )
             _emit(
                 {
@@ -5380,6 +5489,7 @@ def _cmd_retire_pages(args: argparse.Namespace) -> int:
                 backup_sha256=backup_sha256,
                 backup_reference=backup_reference,
                 reason=reason,
+                path_prefix=settings.path_prefix,
             )
             for candidate in candidates:
                 entry = candidate.entry
