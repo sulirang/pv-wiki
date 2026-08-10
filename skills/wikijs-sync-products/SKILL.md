@@ -1,374 +1,232 @@
 ---
 name: wikijs-sync-products
-description: Install, upgrade, repair, or remove the PV Wiki n8n automation on a user-authorized VPS. Discover an existing n8n or deploy a dedicated instance, deploy the internal PV Wiki worker, collect user-selected search/AI/Wiki/database settings, import inactive workflows, and run acceptance checks. Do not use this skill as the recurring product updater and do not create a Hermes cron job.
-version: 0.3.0
-author: sulirang
-license: MIT
-platforms:
-  - linux
-  - macos
-  - windows
-metadata:
-  hermes:
-    tags:
-      - installer
-      - n8n
-      - wikijs
-      - postgresql
-      - exa
-      - knowledge-base
-    requires_toolsets:
-      - terminal
+description: Install, upgrade, validate, repair, roll back, or remove the Hermes-scheduled PV Wiki product-research deployment on a user-authorized host. Use when configuring the rotating-key Exa MCP gateway, the PV Wiki research-state MCP, Hermes MCP tool allowlists and cron, the durable completion database, read-only catalogue access, or restricted Wiki.js publication; treat the bundled n8n worker as a legacy rollback path only.
 ---
 
-# Install PV Wiki automation
+# Install the Hermes PV Wiki automation
 
-This is an installation and lifecycle runbook. Hermes may discover, install,
-configure, validate, upgrade, repair, or remove the deployment. Once accepted,
-n8n owns recurring schedules and the PV Wiki worker owns product processing.
-Hermes must stop; it must not run the maintenance cycle itself.
+Deploy Hermes as the recurring research owner. Deploy the rotating-key Exa MCP
+as the only public-web boundary and the PV Wiki MCP as the catalogue,
+completion, and publication boundary. Do not deploy n8n for a new installation.
 
-Before changing a server, read:
+Read these resources before changing a host:
 
-- [the n8n deployment guide](../../deploy/n8n/README.md);
-- [Wiki.js setup](references/wikijs-setup.md);
+- [`deploy/hermes/README.md`](../../deploy/hermes/README.md) for the production
+  layout and Hermes cron configuration;
+- [`deploy/hermes/mcp-config.yaml.example`](../../deploy/hermes/mcp-config.yaml.example)
+  for the two MCP server definitions and tool allowlists;
+- [`skills/pv-wiki-research/SKILL.md`](../pv-wiki-research/SKILL.md) for the
+  recurring research procedure;
 - [database boundaries](references/database-schema.md);
-- [operations and rollback](references/operations.md).
+- [operations and rollback](references/operations.md);
+- [Wiki.js setup](references/wikijs-setup.md).
 
-## Non-negotiable boundaries
+## Preserve the security boundaries
 
-- Work only on the exact VPS and URL authorized by the user. Do not scan
-  unrelated hosts or address ranges.
-- Perform read-only discovery first. Do not install, restart, import, activate,
-  or overwrite anything until the target instance and ownership are clear.
-- Never create a Hermes cron, heartbeat, background loop, or recurring task.
-- Do not enable n8n Execute Command, mount the Docker socket, or expose an
-  arbitrary shell/API operation.
-- Do not put Exa, AI, PostgreSQL, Wiki.js, or worker secrets in workflow
-  JSON, Git, command-line arguments, or logs.
-- Do not make the source catalogue writable. n8n, Wiki.js, and the product
-  catalogue must not share application tables or database users.
-- Import workflows inactive. Only the user may approve publishing their
-  schedules after the acceptance run.
-- Do not delete volumes, state, workflows, Wiki.js pages, or credentials as an
-  implied part of rollback or uninstall.
+- Work only on the exact host, repository, databases, and Wiki.js prefix the
+  user authorized. Perform read-only discovery before mutation.
+- Keep the product catalogue account SELECT-only and require an explicit
+  `PGSSLMODE`. Prefer `verify-full` with a mounted CA.
+- Keep the PV Wiki state database, product catalogue, and Wiki.js application
+  database logically separate. Write Wiki.js only through its restricted API
+  token.
+- Put Exa credentials only in the mode-`0600` file named by
+  `EXA_API_KEYS_FILE`. Create a separate mode-`0600`, at-least-32-byte random
+  key named by `PV_WIKI_EVIDENCE_HMAC_KEY_FILE`; never reuse an Exa key. Put
+  only paths in MCP configuration. Never put raw keys in Hermes configuration,
+  prompts, skill files, command-line arguments, Git, or logs.
+- Treat the self-hosted Exa component as an MCP gateway. State clearly that
+  search and extraction still use Exa's cloud API.
+- Keep stdio as the default transport on the same host. If a split deployment
+  requires Streamable HTTP, bind to loopback or an authenticated private
+  network. Never expose either MCP endpoint publicly.
+- Do not enable Hermes native web, browser, terminal, delegation, or Exa
+  `agent_run` in the recurring job. Enable only `mcp-exa-pool` and
+  `mcp-pv-wiki` with their explicit tool allowlists.
+- Keep one serialized recurring job. Do not run the legacy n8n product cycle
+  concurrently.
+- Obtain explicit approval before activating a schedule, publishing public
+  pages, deleting a completion, deleting state, removing volumes, or revoking
+  external credentials.
 
-## 1. Establish scope
+## 1. Establish scope and discover read-only
 
-Collect these decisions without asking the user to paste long-lived secrets
-into chat:
+Collect the authorized host and directory, Hermes installation and owner,
+state-database location, read-only catalogue endpoint, Wiki.js URL and path
+prefix, secret installation method, backup location, and desired cron cadence.
+Do not ask the user to paste long-lived secrets into chat.
 
-- VPS SSH host, port, account, and the allowed directory/service boundary;
-- expected n8n URL, domain/DNS status, and whether an existing reverse proxy is
-  in scope;
-- whether n8n is shared or dedicated and who owns it;
-- final Wiki.js path prefix and private/unpublished acceptance visibility (or
-  an explicitly separate staging state volume);
-- backup location and retention;
-- user-selected OpenAI-compatible `AI_BASE_URL`, `AI_MODEL`, and a secure way
-  to install `AI_API_KEY`;
-- Exa keys, read-only catalogue settings, and restricted Wiki.js
-  API token.
+Inspect only the authorized host. Record:
 
-If the host, instance owner, or allowed deployment boundary is ambiguous, stop
-and ask. Never infer authority from the fact that SSH happens to work.
+- the exact PV Wiki commit and Python version;
+- the Hermes version, configuration path, service owner, and existing jobs;
+- whether an old PV Wiki n8n workflow or worker is active;
+- PostgreSQL reachability, TLS mode, role ownership, and backup status;
+- the current Wiki.js visibility policy and restricted token scope;
+- any existing MCP server names that would conflict with `exa-pool` or
+  `pv-wiki`.
 
-## 2. Discover n8n read-only
+Stop and ask when ownership, the deployment boundary, an existing schedule, or
+the active Wiki.js prefix is ambiguous. Stop the legacy n8n schedule before
+enabling Hermes, but preserve it inactive for rollback.
 
-Inspect only the authorized VPS. Typical read-only checks are:
+## 2. Install one pinned revision
+
+Check out the exact approved commit in a dedicated service directory. Create a
+Python 3.11+ virtual environment and install the project:
 
 ```bash
-docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}'
-docker compose ls
-systemctl status n8n --no-pager
-ss -ltnp
+python3 -m venv .venv
+.venv/bin/python -m pip install .
 ```
 
-Also inspect likely Compose/service definitions only when their paths were
-identified by the user or the preceding process listing. For a supplied n8n
-URL, check `/healthz/readiness`; this verifies database readiness rather than
-only process reachability.
+Record the commit and resolved dependency versions. Do not install from a
+moving branch in production. Install services under an unprivileged account
+and grant it only the secret-file and database access it needs.
 
-Record:
+## 3. Install secrets and application configuration
 
-- n8n version/image and URL;
-- Docker Compose project or systemd service;
-- PostgreSQL/storage and `/home/node/.n8n` persistence;
-- encryption-key backup status;
-- reverse proxy/TLS;
-- Docker network the worker could join;
-- existing workflows with the same PV Wiki names;
-- owner and whether the instance is shared.
-
-If multiple plausible instances exist, report them and ask the user to choose.
-If an existing instance is unhealthy, unowned, unsupported, or lacks a backup,
-do not modify it.
-
-## 3. Choose the deployment path
-
-### Reuse an existing n8n
-
-Before importing anything:
-
-1. Export/backup any workflow with a conflicting name.
-2. Confirm the existing n8n version can import the bundled node versions.
-3. Deploy only `pv-wiki-worker` and its persistent state on a network reachable
-   by that chosen n8n. For Docker n8n, use
-   `deploy/n8n/compose.existing-n8n.yaml` with the exact existing external
-   network. For host/systemd n8n, use `compose.systemd-n8n.yaml`, keep port
-   8080 on loopback, and change the three workflow URLs to
-   `http://127.0.0.1:8080/...`. Keep port 8080 unbound from public interfaces.
-4. Preserve the existing n8n database, encryption key, users, proxy, and
-   unrelated workflows.
-
-### Install a dedicated n8n
-
-Use the pinned Compose bundle under `deploy/n8n`. Ask for deployment approval
-after presenting the discovered “no usable instance” result. Then:
-
-1. Confirm Docker Engine, Compose v2, Git, DNS/proxy prerequisites, and an
-   exact checked-out PV Wiki revision. Record the revision. Create `.env` and
-   `worker.env` from their examples with mode `0600`.
-2. Generate separate random values for the n8n database password, n8n
-   encryption key, and worker bearer token.
-3. Keep n8n PostgreSQL, n8n data, and PV Wiki state in separate persistent
-   volumes.
-4. Start with `compose.bootstrap.yaml`, bind n8n to loopback, and have the user
-   create the owner account through an SSH tunnel before any public route is
-   enabled. Reuse the authorized HTTPS proxy, or use the Caddy overlay only
-   after confirming DNS and ports 80/443 are free.
-5. Keep `N8N_BLOCK_ENV_ACCESS_IN_NODE=true` and the risky Execute Command/local
-   file trigger nodes excluded.
-6. Start with the exact image versions recorded in the install manifest.
-
-Never launch a second n8n next to an existing one merely because its login is
-unknown.
-
-## 4. Configure the worker
-
-The user chooses every external provider. Install these values in
-`worker.env`, never in n8n workflow JSON:
+Create the Exa key file outside the repository, make it readable only by the
+Exa MCP service account, and set:
 
 ```dotenv
-EXA_API_KEYS=...
-AI_BASE_URL=https://provider.example/v1
-AI_API_KEY=...
-AI_MODEL=...
-WIKIJS_URL=https://wiki.example.com
-WIKIJS_TOKEN=...
+EXA_API_KEYS_FILE=/run/secrets/pv-wiki-exa-keys
+PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
+```
+
+Allow commas or whitespace between keys. Use keys from the same authorized Exa
+account or team. Use rotation for availability, not to evade provider limits.
+The implementation retains `EXA_API_KEYS` and `EXA_API_KEY` only as legacy
+compatibility inputs; do not use them in a new production deployment.
+
+Configure the PV Wiki MCP separately:
+
+```dotenv
+PV_WIKI_STATE_DATABASE_URL=postgresql://...
+PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
 PGHOST=...
+PGPORT=5432
 PGDATABASE=...
-PGUSER=...                # read-only
+PGUSER=...                 # SELECT-only catalogue role
 PGPASSWORD=...
 PGSSLMODE=verify-full
-PGSSLROOTCERT=/run/pv-wiki/catalogue-ca.pem
-PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON=  # optional override/fast path
-PV_WIKI_RESEARCH_MAX_ROUNDS=3
-PV_WIKI_RESEARCH_MAX_QUERIES=7
-PV_WIKI_RESEARCH_MAX_CREDITS=20
-PV_WIKI_RESEARCH_MAX_SECONDS=600
-PV_WIKI_WORKER_TOKEN=...  # separate 32+ character random value
+PGSSLROOTCERT=/run/secrets/catalogue-ca.pem
+WIKIJS_URL=https://wiki.example.com
+WIKIJS_TOKEN=...
 ```
 
-Prefer `PGSSLMODE=verify-full`. The worker also accepts the other standard
-libpq modes when selected explicitly. Use `disable`, `allow`, or `prefer` only
-when the catalogue server cannot use TLS and the user accepts that credentials
-and catalogue data may cross the network unencrypted. `PGSSLROOTCERT` is
-required for `verify-ca`/`verify-full`; non-verifying modes ignore the mounted
-path.
+Set the Wiki.js prefix, locale, timeout, and new-page visibility according to
+the accepted deployment policy. Keep new pages private and unpublished during
+acceptance. Do not install Exa keys in the PV Wiki MCP and do not install
+catalogue, state, or Wiki.js credentials in the Exa MCP.
 
-The supported AI protocol is OpenAI-compatible Chat Completions. The worker
-adds `/chat/completions` to `AI_BASE_URL`. HTTPS is mandatory by default.
-Loopback HTTP is accepted; another trusted private HTTP endpoint requires the
-operator to explicitly set `AI_ALLOW_INSECURE_HTTP=true`. The optional
-`AI_THINKING_MODE=enabled|disabled` sends the provider extension
-`"thinking":{"type":"..."}` only when configured; leave it empty for
-compatibility, or select `disabled` when a supported reasoning-by-default
-model would otherwise exhaust the bounded output allowance before returning
-JSON. Optional `AI_REASONING_EFFORT=high|max` is also sent only when
-configured; DeepSeek documents `high` as its shortest supported effort. The
-model receives
-bounded public identity, search discovery hints without result URLs, and
-extracted evidence; it
-does not receive product database IDs, family codes, lease tokens, or
-credentials by default. When a catalogue brand matches the operator-owned
-supplier registry, the research prompt also receives only its public
-manufacturer alias and bounded official hostnames so a configured exact-model
-manufacturer extract does not trigger redundant independent corroboration.
-Local validation, never AI output, still authorizes the source. An operator may
-explicitly enable
-`PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS` only when alphanumeric product IDs and
-brand codes are safe public search hints. It discovers manufacturer and product
-type and may classify
-matching generic hardware as out of scope. The local decision gate, not the model,
-controls Wiki.js writes. Within one `/run-one`, the model may request at most
-two supplemental passes using a fixed evidence-gap enum and locally validated
-queries bound to the exact product model. It cannot provide a domain allowlist,
-change the configured budgets, or call Wiki.js. `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` is an optional
-public-manufacturer alias override and verification fast path, not a complete
-registry that an operator must maintain. Without a match, the local gate may
-automatically verify only an HTTPS manufacturer host whose name is consistent
-with the AI-discovered manufacturer and whose bounded extract contains both the
-manufacturer and complete catalogue model. A second independent HTTPS extract
-must corroborate that identity, and every published fact needs exact quotes
-from both domains. Failure becomes
-`source_unverified`: it is audited and retried automatically, without creating
-a product issue or manual-review task. The model cannot grant trust by itself.
-For certificate-verifying PostgreSQL
-modes, mount the catalogue public/private CA from `CATALOGUE_CA_PATH`
-read-only as documented in the deployment guide.
-Only cited bounded extracts containing the catalogue-bound full model are
-eligible evidence; unrelated extracted discovery candidates are ignored by
-the publication identity check. The document may also cover sibling models in
-the same series. Each
-specification must include a short exact target-model-only extract span
-containing the model, source field label, and value, with no sibling model or
-revision inside that span. Record ambiguous multi-model table rows as a normal
-non-publish outcome and retry them automatically; do not open a review issue.
+Review the bundled supplier registry. For every deployment-specific catalogue
+brand that may publish, configure both an operator-approved public alias and
+its trusted manufacturer/regulatory/authorized domains through
+`PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` and
+`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`. Model output and independent unregistered
+domains cannot establish publication authority.
 
-Run `pv-wiki doctor` before any live probes, then `pv-wiki doctor --live`. The
-doctor validates AI and search-provider configuration but intentionally spends
-no AI or Exa credits.
+For stdio, both MCP subprocesses run as the Hermes user and may read the same
+owner-only receipt-key file. For separately supervised HTTP services, mount
+the same receipt secret into two different mode-`0600` files, each owned by its
+service account. The receipt is stateless; do not add a receipt table,
+timestamp, lease, retry, action ledger, or budget.
 
-## 5. Import n8n workflows inactive
+Configure the Hermes model through Hermes. Do not add the legacy worker's
+`AI_*`, research-round, query, URL, credit, wall-clock, global-budget, lease,
+or action-ledger settings to the new path.
 
-Import:
+## 4. Configure the MCP servers
 
-- `PV Wiki - Product Cycle`;
-- `PV Wiki - Homepage Refresh`.
-
-Do not add secrets to the exported JSON. In the n8n UI, have the user create a
-Header Auth credential named `PV Wiki Worker`:
+Use the bundled MCP example. Run both servers over stdio on the same host:
 
 ```text
-Header name: Authorization
-Header value: Bearer <PV_WIKI_WORKER_TOKEN>
+pv-wiki-exa-mcp
+pv-wiki-research-mcp
 ```
 
-Attach that credential to all four HTTP Request nodes. Configure the user's
-chosen n8n Error Workflow/notification channel only for systemic or batch-level
-failures. Normal product non-publish outcomes must not create alerts or issue
-tickets. Imports stay inactive until acceptance is complete.
+Allow exactly these Exa tools:
 
-The product workflow calls fixed internal endpoints:
+- `web_search_exa`
+- `web_search_advanced_exa`
+- `web_fetch_exa`
 
-```text
-Monthly/Manual Trigger
-  → POST /sync-catalogue
-  → POST /run-one
-  → IF processed=true, loop to POST /run-one
+Allow exactly these PV Wiki tools:
 
-Hourly Due Recovery
-  → POST /run-one
-  → IF processed=true, loop to POST /run-one
-Daily Catalogue Recovery
-  -> POST /refresh-catalogue
-  -> POST /run-one
-  -> IF processed=true, loop to POST /run-one
-```
+- `pv_pending_publication`
+- `pv_next_product`
+- `pv_save_research`
+- `pv_publish_result`
+- `pv_research_status`
 
-The monthly product trigger runs at 08:05 Asia/Shanghai (00:05 UTC) on day 1,
-preserving the first-day quota-reset cadence. A daily 03:17 refresh retries
-catalogue ingestion without waking quota-paused products. The hourly trigger
-resumes due and backoff work without rerunning the catalogue sync. The homepage workflow calls
-`POST /publish-home` daily at 02:35 Asia/Shanghai. Catalogue/home calls use
-bounded idempotent retries. `Run One Product` uses three retry-safe calls as a
-batch circuit breaker and a 45-minute timeout: leases, the product-operation lock, and the worker's
-per-action request ledger prevent duplicate mutation or blind paid-call
-replays, while consecutive provider/system failures stop one workflow batch.
-If the hourly trigger overlaps a still-running batch, `/run-one` returns the
-clean stop reason `worker_busy` instead of creating a false workflow failure.
-Catalogue sync has a separate serialized lock, so the monthly refresh can
-overlap a product batch; a source change invalidates and reschedules the active
-lease. Catalogue writes and the final source-check/Wiki-mutation/outcome
-sequence share a publication fence, so a locally applied source revision cannot
-be inserted midway through publication. Homepage publication also has its own
-serialized lock and targets a different Wiki path. This is a single-process
-fence: keep exactly one worker replica and do not run mutating CLI commands
-concurrently with the scheduled HTTP worker.
-The queue loops only when the response says `processed=true`. A no-due result
-or exhaustion of every configured selected-provider key ends the loop. There is no shell
-node and no arbitrary request body.
+Do not enable MCP prompts or resources. Keep parallel tool calls disabled until
+the deployment has demonstrated that its Hermes job is serialized.
 
-Legal non-publish results, including `no_datasheet`, `ambiguous`,
-`insufficient_identity`, `out_of_scope`, and runtime `source_unverified`, are
-silently stored in the audit and retried by the queue. They do not require a
-person to review one issue per product. Provider, configuration, database, or
-service failures that stop the workflow remain batch-level alerts.
+Starting the PV Wiki MCP creates `product_research_completions` when needed and
+backfills legacy `products.last_success_at` publications with `ON CONFLICT DO
+NOTHING`. Inspect aggregate status after initialization and confirm that old
+successful products count as completed and published.
 
-When the user adds or replaces an Exa key, update `EXA_API_KEYS`, recreate the
-worker so it receives the new
-environment, then run
-`Manual / New Key Start` once to wake quota-paused products immediately and
-validate the key. Otherwise their first-of-next-UTC-month wake time remains.
-HTTP 429 is a transient request-rate limit. Exa budget exhaustion uses HTTP
-402 and rotates to the next configured key. Known partial work
-before an explicit quota/4xx response is audited and remains retryable; only
-ambiguous paid requests are replay-suppressed.
+## 5. Configure the recurring Hermes job
 
-Catalogue ingestion is history-preserving: absence from a later source snapshot
-does not automatically archive/delete a product or remove it from the homepage.
-Do not infer destructive retirement without an explicit user policy.
+Install the bundled `pv-wiki-research` runtime skill in the Hermes skill path.
+Create one Hermes-native cron job using only the `mcp-exa-pool` and
+`mcp-pv-wiki` toolsets. Do not substitute a shell cron loop or an n8n workflow.
 
-## 6. Acceptance
+Require every session to follow this order:
 
-Run these checks in order:
+1. Check `pv_pending_publication` and retry that publication first.
+2. If a pending completion exists, call `pv_publish_result` and end the run.
+3. Otherwise call `pv_next_product` with its default catalogue refresh.
+4. Stop when no unfinished product exists.
+5. Research through the Exa MCP only.
+6. Save one schema-version-`2` decision with the returned `product_id`,
+   `source_hash`, and extracted evidence documents.
+7. Publish the saved result only when it is publishable, then end the run.
 
-1. n8n `/healthz/readiness` returns 200.
-2. Worker `/healthz` returns 200 from the n8n network.
-3. `pv-wiki doctor --live` confirms the selected PostgreSQL mode, a read-only
-   catalogue transaction, and Wiki.js access. Record any unencrypted-transport
-   warning.
-4. Run exactly one private/unpublished product directly with
-   `pv-wiki run-one --worker-id manual-acceptance` at the final prefix. Do not
-   start the looping n8n workflow until this check passes. If a different
-   staging prefix is mandatory, use separate worker state and plan an explicit
-   migration.
-5. Confirm exact full model/suffix matching, official datasheet references,
-   at least five cited specification facts, no internal family code on the
-   page, and no invented review claims.
-6. Edit text outside `PV-WIKI-AUTO`, rerun when due during acceptance, and
-   confirm the human text remains byte-for-byte intact.
-7. Run the homepage workflow and confirm brand/category indexes, total count,
-   per-brand counts, and recent products.
-8. Inspect the n8n execution and PostgreSQL audit. They must not contain API
-   keys or full extracted documents.
-9. Run `docker compose --env-file .env -f compose.yaml exec -T n8n n8n audit`
-   (or the equivalent command for the discovered instance) and confirm
-   Execute Command remains unavailable.
+Do not add the legacy three-round, seven-query, five-URL, 20-credit, or
+600-second limits. Do not add global PV Wiki credit reservations, leases,
+queue retries, or uncertain-action replay state. Hermes owns the research
+session; the completion primary key owns cross-session idempotency.
 
-Present the results. The user must explicitly approve publishing the two n8n
-workflows.
+## 6. Validate before activation
 
-## 7. Handoff
+Validate configuration without printing secrets. Confirm:
 
-Write an install manifest without secret values:
+- both MCP servers start and list only the intended tools;
+- `pv_research_status` returns completion counts;
+- `pv_next_product` refreshes the read-only catalogue and returns a stable
+  `product_id` and `source_hash`;
+- one representative product can be researched through Exa and saved once;
+- every saved document uses an unchanged `url`, exact `content`, and `receipt`
+  from one `web_fetch_exa` result, while missing or altered receipts fail;
+- a repeated save returns the existing completion rather than overwriting it;
+- a publishable completion creates or updates only the managed Wiki.js block;
+- a simulated Wiki.js failure leaves the completion pending and the next run
+  retries publication without invoking research;
+- the Wiki.js page remains private/unpublished during acceptance;
+- no raw Exa key, catalogue password, state URL, or Wiki.js token appears in
+  Hermes history or logs.
 
-- deployment mode: reused or dedicated n8n;
-- n8n URL, version/image, Compose/service path, and owner;
-- worker image/source revision and network;
-- workflow names and IDs;
-- credential names only;
-- AI base URL and model, but not its key;
-- state and backup locations;
-- staging test product, result, and Wiki path;
-- activation status and next scheduled time;
-- rollback commands.
+Show the user the acceptance result and obtain approval before enabling the
+cron or changing new-page visibility.
 
-Report that recurring ownership has transferred to n8n, then stop.
+## 7. Operate, upgrade, and roll back
 
-## Upgrade, repair, and removal
+Use `pv_research_status` for durable counts and
+`pv-wiki-publish-researched` for a publication-only recovery. Rotate Exa keys
+by atomically replacing the secret file, preserving mode `0600`, and restarting
+only the Exa MCP process.
 
-For upgrades, export workflows and back up all persistent stores first. Review
-n8n release notes, change one pinned image/runtime revision at a time, import
-workflows inactive if they must be replaced, and repeat acceptance before
-reactivation.
+Before an upgrade, disable the Hermes cron, drain or inspect pending
+publication, back up the state database and Hermes configuration, install one
+pinned revision, start both MCP servers, validate status and one private page,
+then re-enable the schedule.
 
-For repair, diagnose before changing. Preserve active leases and the
-PostgreSQL state; do not “fix” a queue by deleting it.
-
-For removal on a shared n8n, deactivate/export/remove only the PV Wiki
-workflows and revoke their worker credential. Do not stop shared services. For
-a dedicated stack, stopping containers while retaining volumes is the default
-reversible action. Removing volumes/state, deleting Wiki.js pages, or revoking
-external credentials each requires separate explicit approval.
+For rollback, stop the Hermes cron and MCP processes first. Restore a compatible
+state backup if required, then reactivate the preserved legacy n8n worker only
+after verifying that no Hermes research job can run. Never run both schedulers
+against the same catalogue and Wiki.js prefix. Do not automatically remove
+`product_research_completions`; it prevents old successful products from being
+researched again after returning to Hermes.

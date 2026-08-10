@@ -1,348 +1,253 @@
 # PV Wiki
 
-PV Wiki turns a read-only PostgreSQL product catalogue into cited,
-reader-facing Wiki.js pages. n8n owns schedules, execution history, bounded
-retries for idempotent catalogue/homepage calls, and notifications. A separate
-`pv-wiki-worker` performs one bounded product cycle at a time and owns durable
-queue retry/backoff state:
+PV Wiki turns a read-only PostgreSQL product catalogue into cited Wiki.js
+pages. Since version 0.4, the default runtime is a Hermes cron job with two
+small MCP servers:
 
 ```text
-PostgreSQL catalogue (read only)
-  → bounded Exa Search and Contents
-  ↔ user-configured OpenAI-compatible research actions
-  → strict local decision validation
-  → Wiki.js GraphQL API
+Hermes cron (one fresh, serialized research session)
+  ├── mcp-exa-pool
+  │     ├── web_search_exa
+  │     ├── web_search_advanced_exa
+  │     └── web_fetch_exa
+  └── mcp-pv-wiki
+        ├── pv_pending_publication
+        ├── pv_next_product
+        ├── pv_save_research
+        ├── pv_publish_result
+        └── pv_research_status
+                 │
+                 ├── read-only product catalogue
+                 ├── product_research_completions
+                 └── Wiki.js GraphQL API
 ```
 
-The included Hermes skill is an installation and operations runbook. Hermes
-may inspect an authorized VPS, reuse or install n8n, deploy the worker, import
-inactive workflows, and run acceptance checks. It is not the recurring worker
-and must not create a Hermes cron job.
+Hermes owns the research plan and recurring schedule. The Exa MCP gateway
+owns credential selection and read-only Exa calls. PV Wiki owns only catalogue
+selection, durable completion, evidence validation, and publication.
+
+`web_fetch_exa` returns each successful extraction as JSON containing its
+normalized public `url`, exact `content`, content SHA-256, and a versioned HMAC
+`receipt`. `pv_save_research` requires the unchanged URL/content/receipt tuple
+and verifies it before the existing catalogue-identity, source-authority, and
+fact-grounding gates. Search snippets are never signed and therefore cannot be
+submitted as extracted evidence. Receipts are stateless and add no research
+attempt, lease, retry, budget, timestamp, or action-ledger state.
 
 ## Responsibility boundaries
 
 | Component | Responsibility |
 | --- | --- |
-| Hermes skill | One-time discovery, installation, upgrade, repair, and removal guidance |
-| n8n | Schedule triggers, execution history, bounded batches, idempotent-operation retries, and system/batch-level alerts |
-| PV Wiki worker | Product queue/backoff, bounded multi-round research, source validation, and Wiki.js updates |
-| Exa | Bounded public-web discovery and content extraction; never writes Wiki.js |
-| AI provider | Proposes either a final decision or a bounded evidence-gap search; never writes Wiki.js |
+| Hermes cron | Run one autonomous research session at a time and decide when enough evidence exists |
+| `pv-wiki-exa-mcp` | Expose the three Exa-compatible read-only tools through a health-aware API-key pool |
+| `pv-wiki-research-mcp` | Refresh the catalogue, select an unfinished product, save its first completion, and publish completed results |
+| Completion store | Permanently exclude completed `product_id` values and retain pending publication state |
+| Publisher | Apply an already-completed publish decision to Wiki.js without invoking research |
 
-The model, API base URL, and API key are all operator supplied. The first
-release supports OpenAI-compatible Chat Completions and fixes the endpoint to
-`{AI_BASE_URL}/chat/completions`. The optional
-`AI_THINKING_MODE=enabled|disabled` provider extension sends
-`"thinking":{"type":"..."}` when explicitly configured; it is omitted by
-default so other compatible providers retain their native behavior. The
-optional `AI_REASONING_EFFORT=high|max` extension is also omitted by default;
-for DeepSeek, `high` is the shortest supported effort.
+The self-hosted component is the MCP gateway, not the Exa search backend.
+Search and content extraction still use Exa's cloud API. Use only keys owned by
+the authorized Exa account or team, and keep Exa's service-level limits and
+account budgets enabled. Key rotation is for availability and isolation, not
+for bypassing provider limits.
 
-For a product whose catalogue brand matches the operator-owned supplier
-registry, the AI prompt receives only the public manufacturer name and bounded
-official hostnames. This prevents redundant independent-source searches when
-an exact-model extract already comes from a configured manufacturer domain;
-the model still cannot authorize a hostname, and the local decision gate
-remains authoritative. A per-product AI wall-clock timeout is audited as
-`ai_error` and returned as a normal processed/non-publish result so n8n can
-continue the remaining products in that batch.
+## Completion and publication contract
 
-## Database boundaries
+`product_research_completions.product_id` is the durable idempotency key. Both
+publish and non-publish outcomes create a completion. Once present, that
+product is excluded by `pv_next_product` even if its catalogue row changes
+later. Re-research requires an explicit, operator-approved deletion of the
+completion row; it never happens automatically.
 
-There are four independent data roles:
+Selection also uses a process-local wraparound cursor over unfinished product
+ids. This lets the catalogue continue when one product has no safely provable
+public outcome, without persisting a lease, backoff, or retry schedule. Such a
+product remains unfinished and can be reconsidered after wraparound; completed
+products remain excluded by the database primary key.
 
-- the existing product catalogue PostgreSQL database is queried with a
-  read-only transaction;
-- n8n uses its own PostgreSQL database/user for workflows, encrypted
-  credentials, and executions;
-- PV Wiki uses a dedicated PostgreSQL database/user for queue state, leases,
-  evidence URLs, and audit metadata;
-- Wiki.js owns and connects to its own application database.
+The save path checks the `source_hash` returned by `pv_next_product` before it
+inserts the completion. This prevents a stale Hermes session from completing a
+newer catalogue snapshot. The insert is first-writer-wins and never overwrites
+an existing completion.
 
-PV Wiki never creates tables in the product catalogue or the Wiki.js database.
-It writes Wiki.js content only through the restricted GraphQL API token. Its
-state database is separate from the catalogue, n8n, and Wiki.js databases.
+The same save boundary preserves the legacy publication safety policy without
+its scheduler limits: a publish result must match the catalogue manufacturer
+alias and exact model, establish an authoritative primary datasheet (or the
+explicitly enabled two-mirror fallback), and ground every fact's model, name,
+value, and unit in an exact quote from that primary evidence. A table fact may
+also provide an exact `model_quote` header row. Permanent non-publish outcomes
+must submit extracted evidence plus at least one exact `conclusion_evidence`
+quote; `no_datasheet` is not accepted as an unsupported assertion.
 
-## What it does
+Publication is deliberately separate:
 
-- Reads the fixed `public.products` shape through an explicitly configured
-  PostgreSQL transport and a read-only account.
-- Maintains durable and resumable leases in its dedicated PostgreSQL state
-  database.
-- Runs one initial research pass and at most two AI-requested supplemental
-  passes inside one `/run-one` call. Defaults cap the product at three AI
-  actions, seven basic search queries, five unique extract URLs, and a
-  20-unit search admission budget. Before each call it reserves one normalized
-  unit per Search query or two units per Extract batch; Exa's reported dollar
-  cost is also retained in audit metadata. The final AI action is explicitly
-  final-only; a model request for another search at that point is converted
-  locally into a conservative machine-handled outcome. No new
-  research action starts after the 600-second deadline.
-- Uses Exa as the sole bounded search and extraction provider. A retrieval
-  comparison supporting that decision is recorded in
-  [`docs/search-provider-benchmark-2026-07-26.md`](docs/search-provider-benchmark-2026-07-26.md).
-- Calls a user-selected OpenAI-compatible model with bounded public discovery
-  hints and extracts so it can identify the manufacturer and product type.
-  Search-result URLs are withheld from the model; only successful Extract URLs
-  are visible as citation candidates.
-  The model may return only a final proposal or one of six fixed evidence gaps
-  with one or two locally validated, exact-model-bound supplemental queries.
-- Lets the model classify matching generic hardware such as screws, bolts,
-  nuts, and washers as out of scope, without using `family_code` for routing.
-  The local gate requires an exact contiguous quote tying the complete product
-  identity to an explicit hardware type. If an energy-product page merely
-  mentions an accessory bolt, the classification is rejected. A second local
-  gate also rejects any `publish` proposal whose model or public category
-  itself identifies generic hardware.
-- Uses the versioned operator-owned
-  [`suppliers.json`](skills/wikijs-sync-products/scripts/pv_wiki/suppliers.json)
-  registry to map catalogue `brand_code` values to public manufacturers,
-  category-only codes, and role-labelled global/B2B/regional official hosts.
-  Raw brand codes are never substituted by AI output. The two JSON environment
-  variables remain narrow deployment overrides.
-- During a full catalogue sync, a bundle row with an empty `brand_code` may
-  inherit a registered supplier only from one exact model-candidate sibling in
-  the same source catalogue (for example `KIT H1-4K-S2` from branded
-  `H1-4K-S2`). Fuzzy names, conflicts, and unregistered brands remain empty;
-  the sync result reports the bounded count as `brands_inferred`.
-- Searches approved manufacturer domains first through Exa `includeDomains`.
-  An official result counts only when its URL, title, or search extract contains
-  a complete operator-derived model candidate. Otherwise one exact-model query
-  performs an open-web discovery fallback with the registry's low-value domains
-  excluded; complete-model PDF results rank first. Supplemental AI queries are
-  discovery-only and cannot grant source trust.
-- When no trusted-domain mapping matches, automatically verifies only an HTTPS
-  manufacturer host whose name is consistent with the operator-approved public
-  alias when one is configured, or otherwise with the AI-discovered public
-  manufacturer. Its extracted body must contain both that manufacturer and the
-  complete product model. A second independent HTTPS extract must corroborate
-  that manufacturer and complete model. Specification facts themselves are
-  quoted from the verified primary manufacturer datasheet; they do not each
-  need a duplicate quote from the independent identity source. A failed check
-  becomes `source_unverified` and cannot publish.
-- Separates a descriptive catalogue name from its public model identities.
-  With internal hints enabled, the resolver keeps an ordered set containing a
-  clean catalogue number plus exact model-shaped tokens from the description.
-  Electrical ratings, dimensions, refrigerants, and other specification tokens
-  are excluded. Queries therefore use `R125-G2` instead of a 125000 W
-  description while a stock alias such as `JA460W` can retain `JAM72S20` as an
-  exact alternate. Only cited extracts—not unrelated successful candidates—
-  may establish the final model.
-- Allows multi-model series datasheets into analysis. A normal prose/target-only
-  row still needs one exact model/label/value quote. A Markdown-pipe or TSV
-  table may instead provide `model_quote` for the exact model-header row and
-  `quote` for the exact parameter row; the runtime accepts it only when the
-  target model occurs in one unique header cell and the selected value is
-  unambiguous in the same column.
-- Keeps family codes, lease tokens, secrets, and unapproved database IDs out of
-  the model prompt. Only an explicitly enabled, short ASCII model-shaped
-  `product_id` may be promoted to the public model hint.
-- Validates exact source URLs, source trust, confidence, conflicts, public
-  category, five unique facts, and source-grounded model/label/value evidence
-  spans before a page can publish. Ordinary URL/domain constraints accidentally
-  included in an AI supplemental query are discarded; obfuscated forms fail
-  closed.
-- Upserts only the `PV-WIKI-AUTO` section and preserves human-authored text.
-- Builds a normal catalogue homepage with brand/category entry points, totals,
-  per-brand counts, and recently updated products.
-- Creates new Wiki.js pages as private, unpublished drafts by default.
-- Records valid non-publish outcomes in PostgreSQL and retries them
-  automatically;
-  it does not create a per-product AI issue or manual-review queue.
-- Selects eligible `due` and matured `backoff` products with an approximately
-  4:1 weighted preference, falling back to the other class when one is empty.
-  Six consecutive content failures for one unchanged source revision cause a
-  `content_quarantined` annual wait; a catalogue source change wakes the
-  product immediately.
-- Supports optional UTC-wide research stop-losses through
-  `PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT` and
-  `PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT`. Zero disables the corresponding
-  window; each non-zero limit must be at least the per-product
-  `PV_WIKI_RESEARCH_MAX_CREDITS`. Immediately before paid research, the worker
-  reserves that full per-product maximum. Insufficient remaining headroom or
-  any unknown/uncertain Exa usage in the active window stops fail-closed,
-  restores the product's exact prior queue state, and reports its UTC resume
-  boundary. These limits count audited Exa Search/Extract units, not AI tokens
-  or currency; keep provider-account spend limits enabled for AI.
-- Persists every Search, Extract, and AI action before execution. A current
-  attempt cannot replay an action slot, and any unresolved `started` or
-  `uncertain` action blocks later calls while its action-specific provider and
-  wire-contract scope is unchanged. Search-provider and AI scopes are independent, and
-  legacy rows without a reliable scope block fail-closed. The queue records
-  `research_uncertain` instead of inventing a content conclusion; completed
-  calls may be repeated after a crash because response bodies are deliberately
-  not stored.
+1. `pv_save_research` validates and stores the completed decision.
+2. A publishable completion becomes pending publication.
+3. `pv_publish_result` or `pv-wiki-publish-researched` applies it to Wiki.js.
+4. A Wiki.js failure leaves it pending. The next run retries publication only;
+   it does not research the product again.
 
-It does not mirror full datasheets, expose an arbitrary command endpoint, mount
-the Docker socket, enable n8n Execute Command, or silently accept low-confidence
-AI output.
+Opening the completion store also backfills products successfully published by
+the legacy worker. A legacy `products.last_success_at` row with no completion
+is inserted as already completed and published; `ON CONFLICT DO NOTHING`
+remains the concurrent-initialization safeguard. An upgrade therefore does not
+research previously finished products again.
 
-## Deploy with n8n
+## Research policy
 
-The production bundle is in [`deploy/n8n`](deploy/n8n/README.md). It includes:
+The new Hermes path intentionally has no PV Wiki research scheduler or
+per-product research budget. The legacy limits of three rounds, seven queries,
+five extracted URLs, 20 credits, and 600 seconds do not apply. Neither do the
+legacy global daily/monthly credit reservations, product leases, retry queue,
+or uncertain-action ledger.
 
-- a dedicated n8n PostgreSQL service;
-- persistent n8n storage and a dedicated PV Wiki PostgreSQL state database;
-- an internal-only authenticated worker;
-- an optional Caddy HTTPS overlay;
-- two secret-free, inactive workflow templates:
-  - `PV Wiki - Product Cycle` starts on the existing monthly quota cadence
-    and makes at most 15 serial product calls per workflow execution, without
-    starting a new call after 45 minutes; a daily non-quota-waking
-    catalogue refresh recovers partial/failed source scans, and an hourly
-    trigger resumes due/backoff work without rerunning the catalogue sync;
-  - `PV Wiki - Homepage Refresh` daily at 02:35 Asia/Shanghai.
+Hermes decides how to research. Its recurring PV Wiki job must expose only:
 
-The installation and rollout, rather than recurring product decisions, are
-deliberately review-gated:
+- `mcp-exa-pool`, restricted to `web_search_exa`,
+  `web_search_advanced_exa`, and `web_fetch_exa`;
+- `mcp-pv-wiki`, restricted to the five `pv_*` tools shown above.
 
-1. Copy and fill `deploy/n8n/.env.example` and
-   `deploy/n8n/worker.env.example`; keep both actual files mode `0600`.
-2. Configure `EXA_API_KEYS` (or `EXA_API_KEY`), then select `AI_BASE_URL`,
-   `AI_API_KEY`, and `AI_MODEL`. If the selected provider supports the
-   `thinking` request extension and its default consumes the output budget
-   before returning JSON, explicitly set `AI_THINKING_MODE=disabled`;
-   otherwise leave it empty. Review the bundled `suppliers.json` registry and
-   use `PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` or
-   `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` only for deployment-specific
-   overrides. AI output cannot select or replace either the bundled registry
-   or an override. A trusted-domain override also requires an
-   operator-approved public brand identity. Set the optional global
-   daily/monthly credit limits before
-   unattended operation; their default `0` values disable those stop-losses.
-3. Start the Compose project or attach only the worker to an existing n8n
-   network.
-4. Import the workflows while inactive.
-5. Create one n8n Header Auth credential for the internal worker and attach it
-   to the four HTTP Request nodes.
-6. Run `pv-wiki doctor --live`, then manually test one private/unpublished
-   product at the final path prefix and the homepage.
-7. Let the user publish the schedules only after reviewing the output.
+Do not enable Hermes native web, browser, terminal, delegation, or an Exa
+`agent_run` tool for the recurring job. This keeps every public-web request on
+the self-hosted Exa gateway and avoids nesting another research agent inside
+Hermes.
 
-After activation, `no_datasheet`, `ambiguous`, `insufficient_identity`,
-`out_of_scope`, `source_unverified`, and `research_uncertain` are normal
-machine-handled outcomes:
-they are silently audited and scheduled for an appropriate retry. They do not
-open issues. Notifications are reserved for failures that stop or materially
-impair a workflow batch, such as provider, configuration, database, or service
-outages. For the first three conservative outcomes, the runtime discards all
-model-authored publication fields and records a fixed empty non-publish
-decision, so a contradictory primary/source/fact field cannot escalate a safe
-negative conclusion into a publication attempt or provider failure.
+The key pool still enforces provider health semantics. It rotates after every
+successful request, disables invalid or key-budget-exhausted credentials,
+cools down rate-limited credentials, and stops on team/account budget errors.
+The Exa gateway itself does not replay an ambiguous network or provider
+request across keys. Hermes currently may reconnect and invoke an MCP tool once
+more after a transport failure; this project deliberately adds no local action
+ledger for that delegated behavior. Search/fetch may therefore consume a
+duplicate provider call, while completion inserts and Wiki.js upserts remain
+idempotent.
 
-Five consecutive invalid decisions affecting distinct products inside
-30 minutes open one batch-level decision circuit before more paid research. A
-recent AI 401/402/403/404 or Exa 401/403/404 opens a six-hour provider circuit,
-either provider's 429 opens a one-hour rate-limit circuit, and exhausted Exa
-keys open through the next UTC month. Invalid AI output on three distinct products
-within the same one-hour provider scope opens the same pre-search batch stop.
-These gates are checked after local-only handling but before paid research.
-While open they audit `system_paused`, restore the product's prior queue state,
-and return a clean `processed=false` response. Exact resume times are returned
-for provider rejection/rate-limit and quota gates; decision/output gates expose
-their bounded windows in authenticated status. n8n does not automatically
-retry `Run One Product`; a request failure stops that execution for one
-batch-level alert.
-If an explicit quota/4xx response follows an earlier completed subrequest, the
-known partial credits are audited and the action remains automatically
-retryable; only genuinely ambiguous paid requests are replay-suppressed.
+## Install and configure
 
-n8n remains the outer supervisor: it schedules bounded batches and repeatedly
-calls the fixed `/run-one` endpoint at most 15 times, stopping before a new
-call once 45 minutes has elapsed. `Run One Product` has no automatic retry,
-because another call can lease a different queue item. The worker owns the
-inner evidence feedback
-loop, leases, paid-call ledger, source trust, and final Wiki.js permission, so
-n8n does not need search, AI, catalogue, or Wiki.js credentials.
-
-The example keeps new pages private and unpublished for the one-time rollout.
-After that acceptance, an unattended public catalogue can set
-`WIKIJS_NEW_PAGE_PRIVATE=false` and `WIKIJS_NEW_PAGE_PUBLISHED=true` once at the
-deployment level; this is not a per-product approval step.
-
-The worker exposes only:
-
-- `GET /healthz`
-- `GET /status`
-- `POST /sync-catalogue`
-- `POST /refresh-catalogue`
-- `POST /run-one`
-- `POST /publish-home`
-
-`GET /status` and all POST operations require the separate
-`PV_WIKI_WORKER_TOKEN`; only `/healthz` is public. The authenticated status
-response reports redacted queue, global-budget, and circuit readiness without
-making paid probes. An overlapping
-scheduled `/run-one` stops cleanly with `worker_busy`. Catalogue synchronization
-has its own serialized lock and may safely overlap research; source changes
-invalidate the leased snapshot and are rescheduled. A shared publication fence
-serializes only catalogue writes against the final source check, Wiki mutation,
-and durable outcome, preventing a locally applied source revision from being
-inserted midway through publication. Homepage publication also uses its own
-serialized lock because it targets a different Wiki path. This fence is
-process-local: the supported deployment runs exactly one worker replica, and
-scheduled mutations must use its authenticated HTTP endpoints rather than a
-concurrent direct CLI process. Other same-operation conflicts are rejected.
-Exa HTTP 402 responses rotate to the next configured key. AI and Exa
-provider-global rejection/rate-limit circuits, Exa monthly quota, decision and
-invalid-output circuits, and the global daily/monthly Exa research budget are
-checked after local-only handling but before another paid call. A pause writes
-an audit-only `system_paused` attempt and restores the product without changing
-its failure count or last outcome. This still allows empty-identity handling,
-content quarantine, and same-source Wiki-only publication recovery. The
-product workflow also stops cleanly for an open circuit, no due product, or the
-n8n 15-call/45-minute batch boundary.
-
-Catalogue sync is intentionally history-preserving. A product absent from a
-later PostgreSQL snapshot is not automatically deleted, archived, or removed
-from the homepage; destructive retirement needs an explicit future policy so
-the worker never erases historical or human-maintained Wiki content by
-inference.
-
-## Local CLI
-
-For development or a supervised acceptance test:
+Python 3.11 or newer is required. Install the package and MCP Python SDK v2:
 
 ```bash
-python3 -m pip install -e .
-pv-wiki doctor --live
-pv-wiki sync-db
-pv-wiki run-one --worker-id manual-acceptance
-pv-wiki publish-home
+python3 -m venv .venv
+.venv/bin/python -m pip install .
 ```
 
-Copy `.env.example` to an ignored `.env` and export it before running the CLI.
-Prefer `PGSSLMODE=verify-full` with `PGSSLROOTCERT` pointing at the mounted
-public/private CA. All standard libpq modes must be selected explicitly.
-`disable`, `allow`, and `prefer` are supported for a catalogue server that
-cannot use TLS, but may send catalogue credentials and data unencrypted; use
-them only after the operator accepts that network risk.
+Follow [`deploy/hermes/README.md`](deploy/hermes/README.md) for the production
+layout and use its
+[`mcp-config.yaml.example`](deploy/hermes/mcp-config.yaml.example) as the
+Hermes MCP configuration template. The recurring research procedure is in
+[`skills/pv-wiki-research/SKILL.md`](skills/pv-wiki-research/SKILL.md).
 
-The low-level `claim`, `search`, `extract`, and `publish` commands remain
-available for supervised diagnosis. n8n should call the fixed HTTP worker
-operations instead. A low-level publish decision requires the corresponding
-bounded extract JSON through `publish --evidence-file ...`; source bodies are
-used in memory for quote verification and are not added to the PostgreSQL
-audit.
+For production, place the Exa keys in one mode-`0600` secret file. Also create
+a separate mode-`0600` receipt HMAC key file containing at least 32 random
+bytes. Never reuse an Exa key as the receipt key:
 
-## Safe rollout and migration
+```dotenv
+EXA_API_KEYS_FILE=/run/secrets/pv-wiki-exa-keys
+PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
+```
 
-Start with 20–50 representative products at the final Wiki.js prefix while
-keeping new pages private and unpublished. Use a separate worker state volume
-if a distinct staging prefix is required.
-Review exact suffix/model matches, official datasheet citations, specification
-tables, category/brand navigation, and preserved human content before enabling
-public unattended publishing.
+Only file paths belong in MCP process configuration. Both stdio MCP processes
+receive the receipt-key path; only the Exa MCP receives the Exa-key path. Raw
+keys must
+not appear in Hermes configuration, prompts, skill files, command-line
+arguments, Git, or logs. `EXA_API_KEYS` and `EXA_API_KEY` remain code-level
+compatibility fallbacks for legacy migration, but the supported production
+deployment uses `EXA_API_KEYS_FILE`.
 
-Older pages using `HERMES-AUTO` are migrated in place on their next update.
-The legacy block and `managed-by-hermes` tag are removed while all text outside
-the block remains untouched.
+Configure the research-state MCP with:
+
+- `PV_WIKI_STATE_DATABASE_URL` for its dedicated production PostgreSQL state
+  database (`PV_WIKI_STATE_PATH` is a local/test compatibility option);
+- `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, and an explicit
+  `PGSSLMODE` for the read-only catalogue;
+- the restricted `WIKIJS_URL` and `WIKIJS_TOKEN`, plus the desired Wiki.js
+  path, locale, and new-page visibility settings.
+
+The bundled supplier registry supplies approved manufacturer aliases and
+domains for known brands. For deployment-specific brands, configure
+`PV_WIKI_PUBLIC_BRAND_ALIASES_JSON` together with
+`PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON` in the PV Wiki MCP only. Optional
+publication thresholds remain `PV_WIKI_AUTO_PUBLISH_MIN_CONFIDENCE` and
+`PV_WIKI_MIN_FACT_CONFIDENCE`; the two-mirror fallback stays disabled unless
+an operator explicitly sets `PV_WIKI_ALLOW_MIRRORS=true`. A model-discovered
+manufacturer or self-declared source type cannot authorize publication:
+publish decisions fail closed without an operator-approved catalogue brand
+identity and trusted source domain (or the explicitly enabled two-mirror
+policy).
+
+The Hermes model is configured in Hermes itself. The research-state MCP does
+not need Exa or AI credentials, and the Exa MCP does not need catalogue,
+state-database, or Wiki.js credentials.
+
+Both MCP servers use stdio by default:
+
+```bash
+pv-wiki-exa-mcp
+pv-wiki-research-mcp
+```
+
+Streamable HTTP is opt-in for separated deployments. It binds to loopback by
+default; do not publish either MCP endpoint directly to the Internet. See the
+deployment guide for the explicit transport, host, port, and private-network
+requirements.
+
+## Hermes cron sequence
+
+Keep exactly one non-overlapping recurring PV Wiki job. Each fresh session
+must:
+
+1. Call `pv_pending_publication`. Publish the pending result before starting
+   new research. If one is found, call `pv_publish_result` and end this run.
+2. Otherwise call `pv_next_product`. Its default `refresh_catalogue=true` performs the
+   read-only catalogue refresh before the completion anti-join.
+3. Stop cleanly when it returns `found=false`.
+4. Research the returned product using only the three Exa MCP tools.
+5. Submit decision schema version `2`, the returned `product_id` and
+   `source_hash`, and each unchanged `url`/`content`/`receipt` tuple returned by
+   `web_fetch_exa` as the extracted evidence documents to
+   `pv_save_research`.
+6. If the stored completion is publishable, call `pv_publish_result` for that
+   `product_id`, then end the run.
+
+The selector is an anti-join, not a lease. Serialization prevents two fresh
+sessions from doing the same unfinished research concurrently; the completion
+primary key prevents a completed product from being accepted twice.
+
+## Operations
+
+Use `pv_research_status` for completion and pending-publication counts. The
+publisher can also run independently of Hermes:
+
+```bash
+pv-wiki-publish-researched
+pv-wiki-publish-researched --product-id PRODUCT_ID
+```
+
+The first form publishes the oldest pending completion. Both forms print one
+JSON result and never call Exa or an AI model. Detailed key rotation, recovery,
+backup, and rollback procedures are in
+[`references/operations.md`](skills/wikijs-sync-products/references/operations.md).
+The completion schema and migration behavior are in
+[`references/database-schema.md`](skills/wikijs-sync-products/references/database-schema.md).
+
+## Legacy n8n rollback path
+
+The version 0.3 n8n workflows and bounded worker remain under
+[`deploy/n8n`](deploy/n8n/README.md) only as a rollback/migration path. They are
+not the version 0.4 default. Do not run the legacy n8n product workflow and the
+Hermes cron at the same time.
+
+The legacy 3/7/5/20/600 limits, global budgets, leases, queue retries,
+provider circuits, and action ledger remain implemented for that rollback
+worker only. No legacy code or audit tables are deleted by the Hermes upgrade.
 
 ## Development
 
+The test suites are offline and use mocked providers and temporary state:
+
 ```bash
-python3 -m unittest discover -s tests -v
-python3 -m unittest discover -s skills/wikijs-sync-products/tests -v
+python -m pip install -e '.[dev]'
+python -m unittest discover -s tests -v
+python -m unittest discover -s skills/wikijs-sync-products/tests -v
 ```
 
-Tests are offline and use mocked HTTP clients and temporary databases.
+CI runs both suites on Python 3.11, 3.12, and 3.13.

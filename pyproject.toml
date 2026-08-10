@@ -4,19 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pv-wiki"
-version = "0.3.0"
-description = "An n8n-scheduled worker that researches PostgreSQL products and maintains cited Wiki.js pages."
+version = "0.4.0"
+description = "A Hermes-scheduled product research pipeline with pooled Exa MCP access and idempotent Wiki.js publishing."
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [{name = "sulirang"}]
-dependencies = ["psycopg[binary]>=3.2,<4"]
+dependencies = [
+  "mcp>=2,<3",
+  "psycopg[binary]>=3.2,<4",
+]
 
 [project.optional-dependencies]
 dev = ["PyYAML>=6,<7"]
 
 [project.scripts]
 pv-wiki = "pv_wiki.cli:main"
+pv-wiki-exa-mcp = "pv_wiki.exa_mcp:main"
+pv-wiki-research-mcp = "pv_wiki.research_mcp:main"
+pv-wiki-publish-researched = "pv_wiki.hermes_store:main_publish"
 
 [tool.setuptools]
 package-dir = {"" = "skills/wikijs-sync-products/scripts"}

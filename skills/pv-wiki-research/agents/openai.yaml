@@ -1,0 +1,4 @@
+interface:
+  display_name: "PV Wiki Product Research"
+  short_description: "Research and publish one cited PV Wiki product"
+  default_prompt: "Use $pv-wiki-research to research and publish the next unfinished PV Wiki product."
