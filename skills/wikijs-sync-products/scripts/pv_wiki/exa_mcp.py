@@ -12,15 +12,23 @@ import json
 import math
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .evidence_receipt import (
     EvidenceReceiptError,
     content_sha256,
     issue_evidence_receipt,
+    issue_evidence_receipt_v2,
     normalize_evidence_url,
     resolve_evidence_hmac_key,
+)
+from .documents import (
+    PDFDocumentError,
+    PDFEvidence,
+    PDF_EXTRACTION_CONTRACT_VERSION,
+    extract_pdf_evidence,
+    looks_like_pdf_url,
 )
 from .exa_pool import ExaPoolClient, ExaPoolError, ExaPoolUnavailableError
 
@@ -48,6 +56,13 @@ _ADVANCED_CATEGORIES = frozenset(
 )
 _SEARCH_TYPES = frozenset({"auto", "fast", "instant"})
 _SENSITIVE_RESPONSE_KEYS = frozenset({"requestTags"})
+MAX_URLS_PER_CALL = 20
+MAX_TARGET_MODELS_PER_CALL = 16
+DEFAULT_PDF_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_PDF_MAX_PAGES = 100
+DEFAULT_PDF_MAX_CHARS = 100_000
+DEFAULT_PDF_DOWNLOAD_TIMEOUT = 30.0
+DEFAULT_PDF_PARSE_TIMEOUT = 30.0
 
 
 def _is_record(value: Any) -> bool:
@@ -277,7 +292,86 @@ def _normalise_urls(value: list[str] | str) -> list[str]:
         value = decoded if isinstance(decoded, list) else [value]
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ValueError("urls must be an array of strings")
+    if not 1 <= len(value) <= MAX_URLS_PER_CALL:
+        raise ValueError(
+            "urls must contain 1-20 entries; this is a per-call transport "
+            "bound, not a product research budget"
+        )
     return value
+
+
+def _normalise_target_models(value: list[str] | str | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = [value]
+        value = decoded if isinstance(decoded, list) else [value]
+    if (
+        not isinstance(value, list)
+        or any(not isinstance(item, str) or not item.strip() for item in value)
+        or len(value) > MAX_TARGET_MODELS_PER_CALL
+    ):
+        raise ValueError("targetModels must contain at most 16 non-empty strings")
+    normalized = [" ".join(item.split()) for item in value]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("targetModels must be unique")
+    return normalized
+
+
+def _trusted_pdf_host_groups_from_environment(
+    environ: Mapping[str, str],
+) -> tuple[tuple[str, ...], ...]:
+    raw = environ.get("PV_WIKI_PDF_TRUSTED_HOST_GROUPS_JSON", "").strip()
+    if not raw:
+        return ()
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "PV_WIKI_PDF_TRUSTED_HOST_GROUPS_JSON must be valid JSON"
+        ) from exc
+    if not isinstance(decoded, list):
+        raise ValueError(
+            "PV_WIKI_PDF_TRUSTED_HOST_GROUPS_JSON must be an array"
+        )
+    groups: list[tuple[str, ...]] = []
+    for index, item in enumerate(decoded):
+        if (
+            not isinstance(item, list)
+            or len(item) < 2
+            or any(not isinstance(host, str) or not host.strip() for host in item)
+        ):
+            raise ValueError(
+                "each trusted PDF operator group must contain at least two hostnames"
+            )
+        group = tuple(host.strip().rstrip(".").casefold() for host in item)
+        if len(set(group)) != len(group):
+            raise ValueError(f"trusted PDF operator group {index} has duplicates")
+        groups.append(group)
+    return tuple(groups)
+
+
+def _pdf_parameter_rows(evidence: PDFEvidence) -> list[dict[str, Any]]:
+    return [
+        {
+            "parameter_id": f"p{index:03d}",
+            "model": row.model,
+            "source_label": row.source_label,
+            "value": row.value,
+            "unit": row.unit,
+            "section": row.section,
+            "page": row.page,
+            "order": row.order,
+            "model_quote": row.model_quote,
+            "quote": row.quote,
+            "table_title": row.table_title,
+            "value_state": row.value_state,
+        }
+        for index, row in enumerate(evidence.parameter_rows, start=1)
+    ]
 
 
 def _error_message(error: ExaPoolError) -> str:
@@ -294,6 +388,8 @@ def build_server(
     client: ExaPoolClient | None = None,
     *,
     evidence_hmac_key: bytes | bytearray | memoryview | None = None,
+    pdf_extractor: Callable[..., PDFEvidence] = extract_pdf_evidence,
+    trusted_pdf_host_groups: Sequence[Sequence[str]] | None = None,
 ) -> Any:
     """Build the MCP v2 server, permitting an injected client for tests."""
 
@@ -309,6 +405,11 @@ def build_server(
     active_receipt_key = resolve_evidence_hmac_key(
         evidence_hmac_key,
         environ=os.environ,
+    )
+    active_pdf_host_groups = (
+        tuple(tuple(group) for group in trusted_pdf_host_groups)
+        if trusted_pdf_host_groups is not None
+        else _trusted_pdf_host_groups_from_environment(os.environ)
     )
     server = MCPServer(
         "exa-pool-mcp",
@@ -540,7 +641,11 @@ def build_server(
         description=(
             "Fetch one or more webpages and return JSON evidence documents. "
             "Each successful result has an exact content body and a receipt "
-            "required by pv_save_research; search snippets have no receipt."
+            "required by pv_save_research; search snippets have no receipt. "
+            "One call accepts at most 20 URLs as a transport safety bound, "
+            "not as a product research budget. PDF URLs that Exa cannot "
+            "extract are parsed locally inside this MCP without a second "
+            "Exa-key acquisition."
         ),
         annotations=annotations,
         structured_output=False,
@@ -548,9 +653,11 @@ def build_server(
     def web_fetch_exa(
         urls: list[str] | str,
         maxCharacters: int | float | str | None = None,
+        targetModels: list[str] | str | None = None,
     ) -> Any:
         try:
             clean_urls = _normalise_urls(urls)
+            target_models = _normalise_target_models(targetModels)
             response = active_client.post(
                 "/contents",
                 {
@@ -572,24 +679,9 @@ def build_server(
             sanitized = _sanitize_response(response)
             results = sanitized.get("results")
             clean_results = results if isinstance(results, list) else []
-            if not clean_results and url_errors:
-                messages = []
-                for error in url_errors:
-                    raw_error = error.get("error")
-                    tag = (
-                        raw_error.get("tag")
-                        if _is_record(raw_error)
-                        else "unknown error"
-                    )
-                    messages.append(f"{error.get('id')}: {tag or 'unknown error'}")
-                return text_result(
-                    "Error fetching URL(s): " + "; ".join(messages),
-                    is_error=True,
-                )
-            if not clean_results:
-                return text_result("No content found for the provided URL(s).")
 
-            evidence_results: list[dict[str, str]] = []
+            evidence_results: list[dict[str, Any]] = []
+            fetched_urls: set[str] = set()
             for result in clean_results:
                 raw_url = result.get("url")
                 content = result.get("text")
@@ -599,6 +691,7 @@ def build_server(
                     )
                     continue
                 normalized_url = normalize_evidence_url(raw_url)
+                fetched_urls.add(normalized_url)
                 evidence: dict[str, str] = {
                     "url": normalized_url,
                     "content": content,
@@ -614,8 +707,91 @@ def build_server(
                     if isinstance(value, str):
                         evidence[field] = value
                 evidence_results.append(evidence)
+            pdf_success_requested: set[str] = set()
+            for requested in clean_urls:
+                if not looks_like_pdf_url(requested):
+                    continue
+                normalized_requested = normalize_evidence_url(requested)
+                if normalized_requested in fetched_urls:
+                    continue
+                extraction_arguments: dict[str, Any] = {
+                    "max_bytes": DEFAULT_PDF_MAX_BYTES,
+                    "max_pages": DEFAULT_PDF_MAX_PAGES,
+                    "max_chars": DEFAULT_PDF_MAX_CHARS,
+                    "download_timeout": DEFAULT_PDF_DOWNLOAD_TIMEOUT,
+                    "parse_timeout": DEFAULT_PDF_PARSE_TIMEOUT,
+                    "target_models": target_models,
+                }
+                if active_pdf_host_groups:
+                    extraction_arguments["trusted_host_groups"] = (
+                        active_pdf_host_groups
+                    )
+                try:
+                    pdf = pdf_extractor(requested, **extraction_arguments)
+                except PDFDocumentError as exc:
+                    url_errors.append(
+                        {
+                            "id": requested,
+                            "error": {"tag": str(exc)[:300]},
+                        }
+                    )
+                    continue
+                parameter_rows = _pdf_parameter_rows(pdf)
+                redirect_chain = list(
+                    pdf.redirect_chain
+                    or tuple(
+                        dict.fromkeys(
+                            (pdf.requested_url, pdf.final_url)
+                        )
+                    )
+                )
+                parser_metadata = {
+                    "contract_version": PDF_EXTRACTION_CONTRACT_VERSION,
+                    "page_count": pdf.page_count,
+                    "extracted_pages": pdf.extracted_pages,
+                    "truncated": pdf.truncated,
+                }
+                receipt = issue_evidence_receipt_v2(
+                    active_receipt_key,
+                    requested_url=pdf.requested_url,
+                    final_url=pdf.final_url,
+                    redirect_chain=redirect_chain,
+                    content=pdf.text,
+                    artifact_sha256=pdf.sha256,
+                    parser_metadata=parser_metadata,
+                    target_models=target_models,
+                    parameter_rows=parameter_rows,
+                )
+                # Return the exact normalized rows covered by the signature.
+                # Callers can therefore copy this array into decision schema
+                # v3 without a whitespace-normalization mismatch.
+                parameter_rows = [
+                    dict(item) for item in receipt["parameter_rows"]
+                ]
+                evidence_results.append(
+                    {
+                        "url": normalize_evidence_url(pdf.final_url),
+                        "requested_url": normalize_evidence_url(
+                            pdf.requested_url
+                        ),
+                        "content": pdf.text,
+                        "content_sha256": content_sha256(pdf.text),
+                        "artifact_sha256": pdf.sha256,
+                        "parser_metadata": parser_metadata,
+                        "target_models": target_models,
+                        "parameter_rows": parameter_rows,
+                        "receipt": receipt,
+                    }
+                )
+                pdf_success_requested.add(normalized_requested)
             errors: list[dict[str, str]] = []
             for error in url_errors:
+                try:
+                    error_url = normalize_evidence_url(error.get("id"))
+                except EvidenceReceiptError:
+                    error_url = ""
+                if error_url in pdf_success_requested:
+                    continue
                 raw_error = error.get("error")
                 tag = (
                     raw_error.get("tag")
@@ -628,6 +804,16 @@ def build_server(
                         "error": str(tag or "unknown error"),
                     }
                 )
+            if not evidence_results and errors:
+                return text_result(
+                    "Error fetching URL(s): "
+                    + "; ".join(
+                        f"{item['url']}: {item['error']}" for item in errors
+                    ),
+                    is_error=True,
+                )
+            if not evidence_results:
+                return text_result("No content found for the provided URL(s).")
             payload: dict[str, Any] = {"results": evidence_results}
             if errors:
                 payload["errors"] = errors

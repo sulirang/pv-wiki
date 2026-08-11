@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,8 +21,10 @@ from pv_wiki.evidence_receipt import (  # noqa: E402
     EvidenceReceiptError,
     content_sha256,
     issue_evidence_receipt,
+    issue_evidence_receipt_v2,
     load_evidence_hmac_key,
     verify_evidence_receipt,
+    verify_evidence_receipt_v2,
 )
 
 
@@ -32,6 +35,39 @@ CONTENT = "PV-42 rated output 42 W\nExact extracted text."
 
 
 class EvidenceReceiptTests(unittest.TestCase):
+    def v2_receipt(self) -> dict:
+        return issue_evidence_receipt_v2(
+            KEY,
+            requested_url=URL,
+            final_url=NORMALIZED_URL,
+            redirect_chain=[NORMALIZED_URL],
+            content=CONTENT,
+            artifact_sha256="a" * 64,
+            parser_metadata={
+                "contract_version": "2026-07-29.2",
+                "page_count": 2,
+                "extracted_pages": 2,
+                "truncated": False,
+            },
+            target_models=["PV-42"],
+            parameter_rows=[
+                {
+                    "parameter_id": "p001",
+                    "model": "PV-42",
+                    "source_label": "Rated output",
+                    "value": "42",
+                    "unit": "W",
+                    "section": "Output",
+                    "page": 2,
+                    "order": 1,
+                    "model_quote": "Type\tPV-42",
+                    "quote": "Rated output\t42 W",
+                    "table_title": "",
+                    "value_state": "explicit",
+                }
+            ],
+        )
+
     def test_valid_receipt_binds_normalized_url_and_exact_content(self) -> None:
         receipt = issue_evidence_receipt(KEY, url=URL, content=CONTENT)
         self.assertEqual(
@@ -53,6 +89,45 @@ class EvidenceReceiptTests(unittest.TestCase):
         self.assertTrue(receipt.startswith("pvwiki-evidence-v1."))
         self.assertNotIn(KEY.decode("ascii"), receipt)
         self.assertNotIn(content_sha256(CONTENT), receipt)
+
+    def test_v2_receipt_signs_pdf_provenance_and_keeps_v1_compatible(self) -> None:
+        receipt = self.v2_receipt()
+        payload = verify_evidence_receipt_v2(
+            KEY,
+            content=CONTENT,
+            receipt=receipt,
+        )
+        self.assertEqual(NORMALIZED_URL, payload["final_url"])
+        self.assertEqual("p001", payload["parameter_rows"][0]["parameter_id"])
+        self.assertEqual(
+            NORMALIZED_URL,
+            verify_evidence_receipt(
+                KEY,
+                url=NORMALIZED_URL,
+                content=CONTENT,
+                receipt=receipt,
+            ),
+        )
+
+    def test_v2_receipt_rejects_unknown_fields_and_noncanonical_numbers(self) -> None:
+        receipt = self.v2_receipt()
+        unknown = copy.deepcopy(receipt)
+        unknown["future"] = True
+        with self.assertRaises(EvidenceReceiptError):
+            verify_evidence_receipt_v2(
+                KEY,
+                content=CONTENT,
+                receipt=unknown,
+            )
+
+        invalid = copy.deepcopy(receipt)
+        invalid["parser_metadata"]["page_count"] = float("nan")
+        with self.assertRaises(EvidenceReceiptError):
+            verify_evidence_receipt_v2(
+                KEY,
+                content=CONTENT,
+                receipt=invalid,
+            )
 
     def test_tampered_url_content_and_receipt_are_rejected(self) -> None:
         receipt = issue_evidence_receipt(KEY, url=URL, content=CONTENT)

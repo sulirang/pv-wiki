@@ -214,6 +214,12 @@ _SPECIFICATION_FRAGMENT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _ELLIPSIS_RE = re.compile(r"\s*(?:\.{3,}|…+)\s*")
+_DERIVED_TABLE_START_RE = re.compile(
+    r"\[Derived PDF layout table ([1-9]\d*)\]"
+)
+_DERIVED_TABLE_END_RE = re.compile(
+    r"\[End derived PDF layout table ([1-9]\d*)\]"
+)
 _PRODUCT_CATEGORY_ALIASES = {
     "heat pump": "热泵",
     "heat pumps": "热泵",
@@ -886,13 +892,34 @@ def _numeric_value_pattern(value: int | float) -> str:
     number = format(float(value), ".15g") if isinstance(value, float) else str(value)
     if "e" in number.casefold():
         mantissa, exponent = re.split(r"[eE]", number, maxsplit=1)
-        mantissa_pattern = re.escape(mantissa).replace(r"\.", r"[.,]")
+        mantissa_pattern = re.escape(mantissa)
         return mantissa_pattern + r"[eE]" + re.escape(exponent)
-    if "." in number:
-        whole, fraction = number.split(".", maxsplit=1)
-        return re.escape(whole) + r"[.,]" + re.escape(fraction) + r"0*"
-    return re.escape(number) + (
-        r"(?:[.,]0+)?"
+    sign = ""
+    if number.startswith("-"):
+        sign = r"\-"
+    elif number.startswith("+"):
+        sign = r"\+"
+    unsigned = number.lstrip("+-")
+    whole, separator, fraction = unsigned.partition(".")
+    if len(whole) > 3:
+        first_group_length = len(whole) % 3 or 3
+        groups = [
+            whole[:first_group_length],
+            *[
+                whole[index:index + 3]
+                for index in range(first_group_length, len(whole), 3)
+            ],
+        ]
+        thousands_separator = r"(?:[,\u00a0\u202f ]?)"
+        whole_pattern = thousands_separator.join(
+            re.escape(group) for group in groups
+        )
+    else:
+        whole_pattern = re.escape(whole)
+    if separator:
+        return sign + whole_pattern + r"\." + re.escape(fraction) + r"0*"
+    return sign + whole_pattern + (
+        r"(?:\.0+)?"
         if isinstance(value, float)
         else ""
     )
@@ -981,7 +1008,7 @@ def _quote_supports_fact(
 
 
 def _table_row_cells(row: str) -> list[str] | None:
-    """Parse one explicit Markdown/TSV row; prose spacing is not structural."""
+    """Parse one explicit Markdown, TSV, or fixed-width PDF table row."""
 
     lines = [line.strip() for line in row.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -996,8 +1023,119 @@ def _table_row_cells(row: str) -> list[str] | None:
     elif "\t" in line:
         cells = [cell.strip() for cell in line.split("\t")]
     else:
-        return None
+        cells = [
+            cell.strip()
+            for cell in re.split(r"[ \u00a0]{2,}", line)
+        ]
     return cells if len(cells) >= 2 and all(cells) else None
+
+
+def _derived_table_context_ids(lines: list[str]) -> list[int | None]:
+    """Map well-formed parser-authored table blocks to unique local IDs."""
+
+    context_ids: list[int | None] = [None] * len(lines)
+    invalid_ids: set[int] = set()
+    active: tuple[int, str] | None = None
+    next_id = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        start = _DERIVED_TABLE_START_RE.fullmatch(stripped)
+        end = _DERIVED_TABLE_END_RE.fullmatch(stripped)
+        if start is not None:
+            if active is not None:
+                invalid_ids.add(active[0])
+            next_id += 1
+            active = (next_id, start.group(1))
+            context_ids[index] = next_id
+            continue
+        if active is None:
+            continue
+        context_ids[index] = active[0]
+        if end is not None:
+            if end.group(1) != active[1]:
+                invalid_ids.add(active[0])
+            active = None
+    if active is not None:
+        invalid_ids.add(active[0])
+    return [0 if item in invalid_ids else item for item in context_ids]
+
+
+def _table_row_starts_new_header_context(
+    row: str,
+    *,
+    model_header_cells: list[str],
+    expected_product_name: str,
+) -> bool:
+    cells = _table_row_cells(row)
+    if cells is None:
+        return False
+    return (
+        any(
+            text_contains_exact_identity(expected_product_name, cell)
+            and not text_contains_competing_identity(expected_product_name, cell)
+            for cell in cells
+        )
+        or (
+            len(cells) == len(model_header_cells)
+            and identity_key(cells[0]) == identity_key(model_header_cells[0])
+        )
+    )
+
+
+def _table_quotes_share_source_context(
+    *,
+    model_quote: str,
+    fact_quote: str,
+    expected_product_name: str,
+    source_body: str,
+) -> bool:
+    """Require two grounded rows to belong to the same source table."""
+
+    if not source_body:
+        return False
+    model_header_cells = _table_row_cells(model_quote)
+    if model_header_cells is None:
+        return False
+    lines = source_body.splitlines()
+    model_indexes = [
+        index for index, line in enumerate(lines)
+        if line.strip() == model_quote.strip()
+    ]
+    fact_indexes = [
+        index for index, line in enumerate(lines)
+        if line.strip() == fact_quote.strip()
+    ]
+    if not model_indexes or not fact_indexes:
+        return False
+    contexts = _derived_table_context_ids(lines)
+    for model_index in model_indexes:
+        for fact_index in fact_indexes:
+            if fact_index <= model_index:
+                continue
+            model_context = contexts[model_index]
+            fact_context = contexts[fact_index]
+            if model_context == 0 or fact_context == 0:
+                continue
+            if model_context is not None or fact_context is not None:
+                if model_context is None or model_context != fact_context:
+                    continue
+            elif any(
+                not lines[index].strip()
+                or _table_row_cells(lines[index]) is None
+                for index in range(model_index + 1, fact_index)
+            ):
+                continue
+            if any(
+                _table_row_starts_new_header_context(
+                    lines[index],
+                    model_header_cells=model_header_cells,
+                    expected_product_name=expected_product_name,
+                )
+                for index in range(model_index + 1, fact_index)
+            ):
+                continue
+            return True
+    return False
 
 
 def _cell_has_unambiguous_fact_value(
@@ -1013,13 +1151,16 @@ def _cell_has_unambiguous_fact_value(
 
     expected = float(value)
     numeric_tokens = re.findall(
-        r"(?<![\w.,])[+\-]?\d+(?:[.,]\d+)?(?![\w.,])",
+        r"(?<![\w.,])[+\-]?(?:"
+        r"\d{1,3}(?:[,\u00a0\u202f ]\d{3})+(?:\.\d+)?"
+        r"|\d+(?:\.\d+)?"
+        r")(?![\w.,])",
         unicodedata.normalize("NFKC", cell),
         flags=re.UNICODE,
     )
     for token in numeric_tokens:
         try:
-            candidate = float(token.replace(",", "."))
+            candidate = float(re.sub(r"[,\u00a0\u202f ]", "", token))
         except ValueError:
             return False
         if not math.isclose(candidate, expected, rel_tol=1e-12, abs_tol=1e-12):
@@ -1035,15 +1176,27 @@ def _structured_table_quote_supports_fact(
     value: Any,
     unit: str,
     expected_product_name: str,
+    source_body: str | None = None,
 ) -> bool:
     """Bind a target model header cell to the same column in a fact row."""
 
+    context_body = (
+        source_body
+        if isinstance(source_body, str)
+        else f"{model_quote}\n{fact_quote}"
+    )
     header_cells = _table_row_cells(model_quote)
     fact_cells = _table_row_cells(fact_quote)
     if (
         header_cells is None
         or fact_cells is None
         or len(header_cells) != len(fact_cells)
+        or not _table_quotes_share_source_context(
+            model_quote=model_quote,
+            fact_quote=fact_quote,
+            expected_product_name=expected_product_name,
+            source_body=context_body,
+        )
     ):
         return False
     target_columns = [
@@ -1614,6 +1767,7 @@ def validate_decision(
                             value=value,
                             unit=unit,
                             expected_product_name=model,
+                            source_body=evidence_body_by_url.get(quote_url, ""),
                         )
                     )
                 elif grounded_quote is not None:

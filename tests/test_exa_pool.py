@@ -22,7 +22,7 @@ SCRIPTS = (
 )
 sys.path.insert(0, str(SCRIPTS))
 
-from pv_wiki import exa_mcp, exa_pool  # noqa: E402
+from pv_wiki import documents, exa_mcp, exa_pool  # noqa: E402
 from pv_wiki.evidence_receipt import verify_evidence_receipt  # noqa: E402
 
 
@@ -131,6 +131,22 @@ class KeyLoadingTests(unittest.TestCase):
             ):
                 exa_pool.resolve_api_keys(
                     environ={"EXA_API_KEYS_FILE": str(path)}
+                )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX symlink semantics")
+    def test_keys_file_rejects_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target.keys"
+            target.write_text("exa-secret\n", encoding="utf-8")
+            target.chmod(0o600)
+            link = Path(directory) / "exa.keys"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(
+                exa_pool.ExaPoolConfigError,
+                "cannot be read",
+            ):
+                exa_pool.resolve_api_keys(
+                    environ={"EXA_API_KEYS_FILE": str(link)}
                 )
 
 
@@ -503,6 +519,88 @@ class MCPMetadataTests(unittest.TestCase):
         searched = tools["web_search_exa"].fn(query="PV-42")
         self.assertFalse(searched.is_error)
         self.assertNotIn("receipt", searched.content[0].text)
+
+    def test_pdf_fallback_uses_one_exa_call_and_returns_signed_v2_rows(self) -> None:
+        calls: list[str] = []
+        pdf_url = "https://docs.acme.example/pv-42.pdf"
+        pdf_text = "PV-42 rated output 42 W\n" + ("datasheet " * 30)
+
+        class Client:
+            def post(self, path: str, _payload: object, *, timeout: float) -> dict:
+                del timeout
+                calls.append(path)
+                return {
+                    "statuses": [
+                        {
+                            "id": pdf_url,
+                            "status": "error",
+                            "source": "contents",
+                            "error": {"tag": "unsupported"},
+                        }
+                    ],
+                    "results": [],
+                }
+
+        row = documents.PDFParameterRow(
+            model="PV-42",
+            source_label="Rated output",
+            value="42",
+            unit="W",
+            section="Output",
+            page=2,
+            order=1,
+            model_quote="Type\tPV-42",
+            quote="Rated output\t42 W",
+        )
+        extractor = mock.Mock(
+            return_value=documents.PDFEvidence(
+                text=pdf_text,
+                requested_url=pdf_url,
+                final_url=pdf_url,
+                sha256="b" * 64,
+                page_count=2,
+                extracted_pages=2,
+                truncated=False,
+                parameter_rows=(row,),
+                redirect_chain=(pdf_url,),
+            )
+        )
+        server = exa_mcp.build_server(
+            client=Client(),
+            evidence_hmac_key=EVIDENCE_HMAC_KEY,
+            pdf_extractor=extractor,
+        )
+        fetched = server._tool_manager._tools["web_fetch_exa"].fn(
+            urls=[pdf_url],
+            targetModels=["PV-42"],
+        )
+        self.assertFalse(fetched.is_error)
+        self.assertEqual(["/contents"], calls)
+        payload = json.loads(fetched.content[0].text)
+        evidence = payload["results"][0]
+        self.assertEqual("p001", evidence["parameter_rows"][0]["parameter_id"])
+        verify_evidence_receipt(
+            EVIDENCE_HMAC_KEY,
+            url=evidence["url"],
+            content=evidence["content"],
+            receipt=evidence["receipt"],
+        )
+
+    def test_fetch_url_cap_is_transport_only_and_fails_before_exa(self) -> None:
+        client = mock.Mock()
+        server = exa_mcp.build_server(
+            client=client,
+            evidence_hmac_key=EVIDENCE_HMAC_KEY,
+        )
+        result = server._tool_manager._tools["web_fetch_exa"].fn(
+            urls=[
+                f"https://docs.acme.example/{index}.html"
+                for index in range(21)
+            ]
+        )
+        self.assertTrue(result.is_error)
+        self.assertIn("transport", result.content[0].text)
+        client.post.assert_not_called()
 
 
 if __name__ == "__main__":

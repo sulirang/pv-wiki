@@ -136,24 +136,40 @@ def _split_keys(value: str) -> list[str]:
 
 def _read_keys_file(path_value: str) -> list[str]:
     path = Path(path_value).expanduser()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        file_stat = path.stat()
+        descriptor = os.open(path, flags)
     except OSError as exc:
         raise ExaPoolConfigError("EXA_API_KEYS_FILE cannot be read") from exc
-    if not stat.S_ISREG(file_stat.st_mode):
-        raise ExaPoolConfigError("EXA_API_KEYS_FILE must be a regular file")
-    if os.name == "posix" and file_stat.st_mode & 0o077:
-        raise ExaPoolConfigError(
-            "EXA_API_KEYS_FILE must not grant group or world permissions"
-        )
-    if file_stat.st_size > MAX_KEYS_FILE_BYTES:
-        raise ExaPoolConfigError(
-            f"EXA_API_KEYS_FILE exceeds {MAX_KEYS_FILE_BYTES} bytes"
-        )
     try:
-        text = path.read_text(encoding="utf-8")
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ExaPoolConfigError(
+                "EXA_API_KEYS_FILE must be a regular file"
+            )
+        if os.name == "posix" and file_stat.st_mode & 0o077:
+            raise ExaPoolConfigError(
+                "EXA_API_KEYS_FILE must not grant group or world permissions"
+            )
+        if file_stat.st_size > MAX_KEYS_FILE_BYTES:
+            raise ExaPoolConfigError(
+                f"EXA_API_KEYS_FILE exceeds {MAX_KEYS_FILE_BYTES} bytes"
+            )
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            data = stream.read(MAX_KEYS_FILE_BYTES + 1)
+        if len(data) > MAX_KEYS_FILE_BYTES:
+            raise ExaPoolConfigError(
+                f"EXA_API_KEYS_FILE exceeds {MAX_KEYS_FILE_BYTES} bytes"
+            )
+        text = data.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ExaPoolConfigError("EXA_API_KEYS_FILE cannot be read") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     return _split_keys(text)
 
 

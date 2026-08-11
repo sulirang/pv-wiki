@@ -13,6 +13,7 @@ authors = [{name = "sulirang"}]
 dependencies = [
   "mcp>=2,<3",
   "psycopg[binary]>=3.2,<4",
+  "pypdf>=5,<7",
 ]
 
 [project.optional-dependencies]
