@@ -692,6 +692,8 @@ def _home_catalogue_product(item: Any, *, path_prefix: str) -> dict[str, Any]:
         "product_id": item.product_id,
         "product_name": payload.get("product_name"),
         "model": decision.get("model") or payload.get("product_name"),
+        "manufacturer_zh": decision.get("manufacturer_zh"),
+        "product_description_zh": decision.get("product_description_zh"),
         "manufacturer": (
             decision.get("manufacturer") or payload.get("brand_code")
         ),

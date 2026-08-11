@@ -901,11 +901,22 @@ def _home_catalogue_entries(products: Sequence[Any]) -> list[dict[str, str]]:
             raise ValueError(
                 f"published_products[{index}] needs a publication timestamp"
             )
-        description = product_bilingual_description(product, product)
-        if not description:
-            description = _plain_text(
-                _first(product, ("product_name", "name", "description", "model"))
+        # Preserve the legacy homepage's public decision-model priority while
+        # appending the schema-v3 Chinese description when available.  The
+        # catalogue product_name may be an internal or stale label.
+        source_description = _plain_text(
+            _first(product, ("model", "product_name", "name", "description"))
+        )
+        localized_description = product_description_zh(product, product)
+        if source_description and localized_description:
+            description = (
+                source_description
+                if _display_identity_key(source_description)
+                == _display_identity_key(localized_description)
+                else f"{source_description}｜{localized_description}"
             )
+        else:
+            description = source_description or localized_description
         # Validate the path before it can influence counts or links.
         _internal_link(product_id, wiki_path)
         entries.append(
