@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 import os
@@ -26,15 +27,23 @@ sys.path.insert(0, str(SCRIPTS))
 
 from pv_wiki.config import WikiSettings  # noqa: E402
 from pv_wiki.catalogue_snapshot import replace_catalogue_snapshot  # noqa: E402
-from pv_wiki.evidence_receipt import issue_evidence_receipt  # noqa: E402
+from pv_wiki.evidence_receipt import (  # noqa: E402
+    issue_evidence_receipt,
+    issue_evidence_receipt_v2,
+)
 from pv_wiki.hermes_store import (  # noqa: E402
+    CompletionError,
     CompletionValidationError,
     HermesCompletionStore,
+    PublicationFenceError,
     ProductSourceChangedError,
+    RenderModel,
     publish_researched,
+    rerender_completion,
 )
 from pv_wiki import research_mcp  # noqa: E402
 from pv_wiki.research_mcp import _next_product  # noqa: E402
+from pv_wiki.render import stable_path  # noqa: E402
 from pv_wiki.state import StateStore  # noqa: E402
 
 
@@ -62,6 +71,128 @@ def evidence_document(url: str, content: str) -> dict[str, str]:
             content=content,
         ),
     }
+
+
+def pdf_parameter_rows() -> list[dict[str, object]]:
+    rows = (
+        ("Max. PV Array Power [Wp]@STC", "15000", "Wp", "Input (DC)"),
+        ("MPPT Voltage Range [V]", "160-950", "V", "Input (DC)"),
+        ("Rated AC Power [W]", "10000", "W", "Output (AC)"),
+    )
+    return [
+        {
+            "parameter_id": f"p{index:03d}",
+            "model": "PV-42",
+            "source_label": label,
+            "value": value,
+            "unit": unit,
+            "section": section,
+            "page": index,
+            "order": index,
+            "model_quote": "Type PV-42",
+            "quote": f"{label} {value} {unit}",
+            "table_title": "Technical data",
+            "value_state": "explicit",
+        }
+        for index, (label, value, unit, section) in enumerate(rows, start=1)
+    ]
+
+
+def pdf_evidence_document() -> dict[str, object]:
+    return {
+        "url": EVIDENCE_URL,
+        "content": EVIDENCE_TEXT,
+        "receipt": issue_evidence_receipt_v2(
+            EVIDENCE_HMAC_KEY,
+            requested_url=EVIDENCE_URL,
+            final_url=EVIDENCE_URL,
+            redirect_chain=[EVIDENCE_URL],
+            content=EVIDENCE_TEXT,
+            artifact_sha256="a" * 64,
+            parser_metadata={
+                "contract_version": "2026-07-29.2",
+                "page_count": 3,
+                "extracted_pages": 3,
+                "truncated": False,
+            },
+            target_models=["PV-42"],
+            parameter_rows=pdf_parameter_rows(),
+        ),
+    }
+
+
+def parameter_enrichment() -> dict[str, object]:
+    return {
+        "translations": [
+            {
+                "parameter_id": "p001",
+                "name_zh": "最大光伏阵列功率 [Wp]（STC）",
+                "section_zh": "直流输入（DC）",
+                "subsection_zh": "",
+                "value_zh": "",
+            },
+            {
+                "parameter_id": "p002",
+                "name_zh": "MPPT 电压范围 [V]",
+                "section_zh": "直流输入（DC）",
+                "subsection_zh": "",
+                "value_zh": "",
+            },
+            {
+                "parameter_id": "p003",
+                "name_zh": "额定交流功率 [W]",
+                "section_zh": "交流输出（AC）",
+                "subsection_zh": "",
+                "value_zh": "",
+            },
+        ],
+        "sections": [
+            {
+                "section_code": "dc_input",
+                "paragraphs": [
+                    {
+                        "analysis_kind": "engineering_interpretation",
+                        "basis_parameter_ids": ["p001", "p002"],
+                        "analysis_zh": (
+                            "直流侧最大光伏阵列功率为 15000 Wp，MPPT "
+                            "电压范围为 160–950 V；组串设计还需核对现场条件。"
+                        ),
+                        "conditions_zh": ["仅以制造商数据表参数为依据。"],
+                        "limitations_zh": ["不能替代具体项目设计。"],
+                    }
+                ],
+            }
+        ],
+        "overall_limitations_zh": [
+            "本分析仅解释制造商数据表参数，不构成项目设计结论。"
+        ],
+    }
+
+
+def publish_decision_v3() -> dict[str, object]:
+    decision: dict[str, object] = publish_decision()
+    decision.update(
+        {
+            "schema_version": "3",
+            "manufacturer_zh": "艾克米",
+            "product_description_zh": "面向光伏系统的并网逆变器产品。",
+            "product_category_code": "inverter",
+            "product_type": "并网光伏逆变器",
+            "parameters": pdf_parameter_rows(),
+            "parameter_enrichment": parameter_enrichment(),
+            "derived_insights": [
+                {
+                    "name": "直交流容量比",
+                    "value": 1.5,
+                    "unit": "",
+                    "formula": "15000 / 10000",
+                    "basis_parameter_ids": ["p001", "p003"],
+                    "explanation": "数据表参数计算得到的直流与交流额定容量比。",
+                }
+            ],
+        }
+    )
+    return decision
 
 
 def product(product_id: str = "P-42") -> dict:
@@ -197,6 +328,213 @@ class HermesCompletionStoreTests(unittest.TestCase):
                 saved = store.upsert_product(product(product_id))
                 hashes[product_id] = saved.source_hash
         return hashes
+
+    @staticmethod
+    def wiki_settings() -> WikiSettings:
+        return WikiSettings(
+            base_url="https://wiki.example",
+            token="test-only-token",
+            locale="en",
+            path_prefix="products",
+            home_path="home",
+            home_title="PV Wiki",
+            timeout=10.0,
+            new_page_private=True,
+            new_page_published=False,
+        )
+
+    def test_v3_signed_parameters_render_without_rewriting_completion(self) -> None:
+        source_hash = self.add_products("P-42")["P-42"]
+        original = publish_decision_v3()
+        with HermesCompletionStore(self.state_path) as store:
+            saved = store.save_completion(
+                product_id="P-42",
+                source_hash=source_hash,
+                decision=original,
+                evidence_documents=[pdf_evidence_document()],
+            )
+            completion = saved.completion
+            self.assertEqual("3", completion.decision["schema_version"])
+            self.assertEqual(64, len(completion.decision["parameter_set_sha256"]))
+            stored_before = copy.deepcopy(completion.decision)
+            rendered = RenderModel.from_completion(completion)
+            self.assertEqual("逆变器", rendered.decision["product_category"])
+            self.assertEqual(
+                "最大光伏阵列功率 [Wp]（STC）",
+                rendered.decision["datasheet_parameters"][0]["name_zh"],
+            )
+            self.assertEqual(
+                3,
+                rendered.decision["professional_analysis"][
+                    "input_parameter_count"
+                ],
+            )
+            self.assertEqual(stored_before, completion.decision)
+            self.assertNotIn("datasheet_parameters", completion.decision)
+
+    def test_v3_rejects_partial_enrichment_and_future_schema(self) -> None:
+        source_hash = self.add_products("P-42")["P-42"]
+        partial = publish_decision_v3()
+        partial["parameter_enrichment"]["translations"].pop()  # type: ignore[index]
+        with HermesCompletionStore(self.state_path) as store:
+            with self.assertRaisesRegex(
+                CompletionValidationError,
+                "invalid or incomplete",
+            ):
+                store.save_completion(
+                    product_id="P-42",
+                    source_hash=source_hash,
+                    decision=partial,
+                    evidence_documents=[pdf_evidence_document()],
+                )
+
+            future = publish_decision()
+            future["schema_version"] = "4"
+            with self.assertRaisesRegex(
+                CompletionValidationError,
+                "unsupported; refusing future schema",
+            ):
+                store.save_completion(
+                    product_id="P-42",
+                    source_hash=source_hash,
+                    decision=future,
+                    evidence_documents=[
+                        evidence_document(EVIDENCE_URL, EVIDENCE_TEXT)
+                    ],
+                )
+
+    def test_v2_render_adapter_does_not_mutate_or_trigger_research(self) -> None:
+        source_hash = self.add_products("P-42")["P-42"]
+        with HermesCompletionStore(self.state_path) as store:
+            completion = store.save_completion(
+                product_id="P-42",
+                source_hash=source_hash,
+                decision=publish_decision(),
+                evidence_documents=[
+                    evidence_document(EVIDENCE_URL, EVIDENCE_TEXT)
+                ],
+            ).completion
+            before = copy.deepcopy(completion.decision)
+            rendered = RenderModel.from_completion(completion)
+            self.assertEqual(before, completion.decision)
+            self.assertEqual(before, rendered.decision)
+            self.assertNotIn("datasheet_parameters", rendered.decision)
+
+    def test_suppress_resume_is_append_only_and_fenced(self) -> None:
+        source_hash = self.add_products("P-42")["P-42"]
+        with HermesCompletionStore(self.state_path) as store:
+            completion = store.save_completion(
+                product_id="P-42",
+                source_hash=source_hash,
+                decision=publish_decision(),
+                evidence_documents=[
+                    evidence_document(EVIDENCE_URL, EVIDENCE_TEXT)
+                ],
+            ).completion
+            initial_fence = store.publication_fence("P-42")
+            suppressed_fence = store.append_control_event(
+                "P-42",
+                action="suppress",
+                reason="operator hold",
+                expected_fence=initial_fence,
+            )
+            self.assertTrue(store.is_suppressed("P-42"))
+            self.assertIsNone(store.pending_publication())
+            self.assertEqual(completion, store.get_completion("P-42"))
+            with self.assertRaises(PublicationFenceError):
+                store.append_control_event(
+                    "P-42",
+                    action="resume",
+                    reason="stale operator action",
+                    expected_fence=initial_fence,
+                )
+            resumed_fence = store.append_control_event(
+                "P-42",
+                action="resume",
+                reason="review complete",
+                expected_fence=suppressed_fence,
+            )
+            self.assertFalse(store.is_suppressed("P-42"))
+            self.assertIsNotNone(store.pending_publication())
+            self.assertNotEqual(suppressed_fence, resumed_fence)
+
+    def test_rerender_preview_apply_and_missing_page_refusal(self) -> None:
+        source_hash = self.add_products("P-42")["P-42"]
+        settings = self.wiki_settings()
+        path = stable_path(product(), prefix=settings.path_prefix)
+        page = {
+            "id": 19,
+            "path": path,
+            "locale": "en",
+            "content": "Human introduction\n\nHuman maintenance notes",
+        }
+        updates: list[str] = []
+
+        class ExistingClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def get_page(self, *_args: object) -> dict[str, object]:
+                return dict(page)
+
+            def update_existing_page(
+                self,
+                _path: str,
+                _locale: str,
+                _title: str,
+                _description: str,
+                managed: str,
+                _tags: list[str],
+            ) -> dict[str, object]:
+                updates.append(managed)
+                return {"action": "updated", "page": dict(page)}
+
+        with HermesCompletionStore(self.state_path) as store:
+            store.save_completion(
+                product_id="P-42",
+                source_hash=source_hash,
+                decision=publish_decision(),
+                evidence_documents=[
+                    evidence_document(EVIDENCE_URL, EVIDENCE_TEXT)
+                ],
+            )
+            store.mark_published(
+                "P-42",
+                wiki_path=path,
+                wiki_action="created",
+            )
+            self.assertEqual("direct", store.publication_status("P-42")["mode"])
+            preview = rerender_completion(
+                store,
+                "P-42",
+                settings=settings,
+                client_factory=ExistingClient,
+            )
+            self.assertTrue(preview["preview"])
+            self.assertEqual([], updates)
+            applied = rerender_completion(
+                store,
+                "P-42",
+                apply=True,
+                settings=settings,
+                client_factory=ExistingClient,
+            )
+            self.assertTrue(applied["applied"])
+            self.assertEqual(1, len(updates))
+            self.assertEqual("rerender", store.publication_status("P-42")["mode"])
+
+            class MissingClient(ExistingClient):
+                def get_page(self, *_args: object) -> None:
+                    return None
+
+            with self.assertRaisesRegex(CompletionError, "create is refused"):
+                rerender_completion(
+                    store,
+                    "P-42",
+                    apply=True,
+                    settings=settings,
+                    client_factory=MissingClient,
+                )
 
     def test_startup_backfills_legacy_success_and_skips_it(self) -> None:
         hashes = self.add_products("P-42", "P-43")
@@ -985,7 +1323,14 @@ class HermesCompletionStoreTests(unittest.TestCase):
             },
             set(tools),
         )
-        output = asyncio.run(tools["pv_research_status"].run({}, None))
+        # The registered implementation is always exercised.  The restricted
+        # host runner cannot wake an asyncio loop from any worker thread, so a
+        # network-disabled local Docker validation opts into the real MCP
+        # async tool runner and covers that bridge on this same machine.
+        if os.environ.get("PV_WIKI_TEST_REAL_MCP_RUNNER") == "1":
+            output = asyncio.run(tools["pv_research_status"].run({}))
+        else:
+            output = tools["pv_research_status"].fn()
         self.assertFalse(output.is_error)
         payload = json.loads(output.content[0].text)
         self.assertEqual(0, payload["counts"]["completed"])

@@ -868,3 +868,39 @@ class WikiJSClient:
                 tags=normalized_tags,
             )
         return {"action": "created", "page": page}
+
+    def update_existing_page(
+        self,
+        path: str,
+        locale: str,
+        title: str,
+        description: str,
+        managed_content: str,
+        tags: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Update only an existing exact path; never create or move a page."""
+
+        path = _clean_path(path)
+        locale = _clean_string(locale, "locale")
+        existing = self.get_page(path, locale)
+        if existing is None:
+            raise WikiJSResponseError(
+                "Wiki.js page is missing; create and move are refused"
+            )
+        if existing.get("path") != path or existing.get("locale") != locale:
+            raise WikiJSResponseError(
+                "Wiki.js page identity changed; move is refused"
+            )
+        return self._update_existing(
+            existing,
+            path=path,
+            locale=locale,
+            title=_clean_string(title, "title"),
+            description=_clean_string(
+                description,
+                "description",
+                allow_empty=True,
+            ),
+            managed_content=managed_content,
+            tags=_normalize_tags(tags),
+        )

@@ -25,6 +25,7 @@ pv-wiki-exa-mcp = "pv_wiki.exa_mcp:main"
 pv-wiki-research-mcp = "pv_wiki.research_mcp:main"
 pv-wiki-catalogue-mcp = "pv_wiki.catalogue_mcp:main"
 pv-wiki-publish-researched = "pv_wiki.hermes_store:main_publish"
+pv-wiki-admin = "pv_wiki.admin:main"
 
 [tool.setuptools]
 package-dir = {"" = "skills/wikijs-sync-products/scripts"}

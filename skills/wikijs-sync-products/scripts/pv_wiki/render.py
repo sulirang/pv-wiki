@@ -220,7 +220,8 @@ def escape_table_cell(value: Any) -> str:
 
     text = _plain_text(value)
     text = html.escape(text, quote=False)
-    return text.replace("\\", "\\\\").replace("|", "\\|")
+    text = text.replace("\\", "\\\\").replace("|", "\\|")
+    return re.sub(r"([\[\]()*_`])", r"\\\1", text)
 
 
 def _escape_markdown_text(value: Any) -> str:
@@ -273,12 +274,15 @@ def _collect_sources(decision: Any) -> list[tuple[str, str, bool]]:
     candidates.extend((item, True) for item in _as_items(_get(decision, "datasheets")))
     for key in ("source_url", "sources", "related_links", "references"):
         candidates.extend((item, False) for item in _as_items(_get(decision, key)))
-    for fact in _as_items(_get(decision, "facts")):
-        if not isinstance(fact, Mapping):
-            continue
-        fact_name = _first(fact, ("name", "label")) or "规格参数"
-        for url in _as_items(_get(fact, "evidence_urls")):
-            candidates.append(({"title": f"{fact_name}（证据）", "url": url}, False))
+    for collection in ("datasheet_parameters", "facts"):
+        for fact in _as_items(_get(decision, collection)):
+            if not isinstance(fact, Mapping):
+                continue
+            fact_name = _first(fact, ("name", "label")) or "产品参数"
+            for url in _as_items(_get(fact, "evidence_urls")):
+                candidates.append(
+                    ({"title": f"{fact_name}（证据）", "url": url}, False)
+                )
     for conflict in _as_items(_get(decision, "conflicts")):
         if not isinstance(conflict, Mapping):
             continue
@@ -340,13 +344,461 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
     )
 
 
+def _datasheet_parameters(decision: Any) -> list[dict[str, str]]:
+    """Return display-ready datasheet parameters in their exact source order."""
+
+    parameters: list[dict[str, str]] = []
+    for item in _as_items(_get(decision, "datasheet_parameters")):
+        if not isinstance(item, Mapping):
+            continue
+        name = _first(item, ("name", "key", "label", "parameter"))
+        value_present = False
+        value: Any = None
+        for key in ("value", "content", "text"):
+            if key in item:
+                value = item[key]
+                value_present = True
+                break
+        if name is None or not value_present or value is None:
+            continue
+        unit = _first(item, ("unit", "units"))
+        rendered_value = _plain_text(value)
+        if rendered_value and unit is not None and _plain_text(unit):
+            rendered_value = f"{rendered_value} {_plain_text(unit)}"
+        parameters.append(
+            {
+                "id": f"p{len(parameters) + 1:03d}",
+                "section": _plain_text(_get(item, "section")),
+                "section_zh": _plain_text(_get(item, "section_zh")),
+                "subsection": _plain_text(_get(item, "subsection")),
+                "subsection_zh": _plain_text(_get(item, "subsection_zh")),
+                "name": _plain_text(name),
+                "name_zh": _plain_text(_get(item, "name_zh")),
+                "value": rendered_value,
+            }
+        )
+    return parameters
+
+
+def _derived_insights(decision: Any) -> list[dict[str, Any]]:
+    """Return bounded renderer-facing insights; validation owns their semantics."""
+
+    insights: list[dict[str, Any]] = []
+    for item in _as_items(_get(decision, "derived_insights")):
+        if not isinstance(item, Mapping):
+            continue
+        name = _first(item, ("name", "label", "title"))
+        value = _first(item, ("value", "content", "text"))
+        formula = _get(item, "formula")
+        basis = _as_items(_get(item, "basis"))
+        if name is None or value is None or formula is None or not basis:
+            continue
+        unit = _first(item, ("unit", "units"))
+        rendered_value = _plain_text(value)
+        if unit is not None and _plain_text(unit):
+            rendered_value = f"{rendered_value} {_plain_text(unit)}"
+        insights.append(
+            {
+                "name": _plain_text(name),
+                "value": rendered_value,
+                "formula": _plain_text(formula),
+                "basis": "、".join(_plain_text(value) for value in basis),
+                "explanation": _plain_text(_get(item, "explanation")),
+            }
+        )
+    return insights
+
+
+def _display_identity_key(value: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", _plain_text(value)).casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _bilingual_heading(
+    source: Any,
+    localized: Any,
+    *,
+    fallback: str,
+) -> str:
+    source_text = _plain_text(source)
+    localized_text = _plain_text(localized)
+    if source_text and localized_text:
+        if _display_identity_key(source_text) == _display_identity_key(localized_text):
+            return source_text
+        return f"{source_text}｜{localized_text}"
+    return source_text or localized_text or fallback
+
+
+_PROFESSIONAL_ANALYSIS_SECTION_TITLES = {
+    "product_positioning": "产品定位与功率配置",
+    "dc_input": "直流输入与 MPPT",
+    "ac_output": "交流输出与电网侧",
+    "efficiency": "效率表现",
+    "protection": "保护功能与电气安全",
+    "installation": "安装、环境与运维",
+    "limitations": "数据边界与选型注意事项",
+}
+
+
+def _professional_analysis_lines(
+    decision: Any,
+    datasheet_parameters: Sequence[Mapping[str, str]],
+) -> list[str]:
+    """Render grounded structured analysis, or the legacy summary as fallback."""
+
+    raw_analysis = _get(decision, "professional_analysis")
+    overall_limitations = [
+        text
+        for item in _as_items(
+            _get(raw_analysis, "overall_limitations_zh")
+            if isinstance(raw_analysis, Mapping)
+            else None
+        )
+        if (text := _plain_text(item))
+    ]
+    parameter_by_id = {
+        parameter["id"]: parameter
+        for parameter in datasheet_parameters
+        if parameter.get("id")
+    }
+    section_lines: list[str] = []
+    rendered_limitations_section = False
+    if isinstance(raw_analysis, Mapping):
+        for section in _as_items(_get(raw_analysis, "sections")):
+            if not isinstance(section, Mapping):
+                continue
+            section_code = _plain_text(_get(section, "section_code"))
+            section_title = _PROFESSIONAL_ANALYSIS_SECTION_TITLES.get(section_code)
+            if section_title is None:
+                continue
+
+            paragraph_lines: list[str] = []
+            for paragraph in _as_items(_get(section, "paragraphs")):
+                if not isinstance(paragraph, Mapping):
+                    continue
+                analysis_text = _plain_text(_get(paragraph, "analysis_zh"))
+                if not analysis_text:
+                    continue
+
+                resolved_basis: list[str] = []
+                seen_basis_ids: set[str] = set()
+                for raw_parameter_id in _as_items(
+                    _get(paragraph, "basis_parameter_ids")
+                ):
+                    parameter_id = _plain_text(raw_parameter_id)
+                    if parameter_id in seen_basis_ids:
+                        continue
+                    parameter = parameter_by_id.get(parameter_id)
+                    if parameter is None:
+                        continue
+                    seen_basis_ids.add(parameter_id)
+                    resolved_basis.append(
+                        f"{parameter_id} "
+                        f"{_escape_markdown_text(parameter['name'])} = "
+                        f"{_escape_markdown_text(parameter['value'])}"
+                    )
+
+                if paragraph_lines:
+                    paragraph_lines.append("")
+                paragraph_lines.append(_escape_markdown_text(analysis_text))
+                paragraph_lines.extend(
+                    [
+                        "",
+                        (
+                            "- **依据参数：** "
+                            + (
+                                "；".join(resolved_basis)
+                                if resolved_basis
+                                else "—"
+                            )
+                        ),
+                    ]
+                )
+                conditions = [
+                    text
+                    for item in _as_items(_get(paragraph, "conditions_zh"))
+                    if (text := _plain_text(item))
+                ]
+                if conditions:
+                    paragraph_lines.append(
+                        "- **适用条件：** "
+                        + "；".join(
+                            _escape_markdown_text(item) for item in conditions
+                        )
+                    )
+                limitations = [
+                    text
+                    for item in _as_items(_get(paragraph, "limitations_zh"))
+                    if (text := _plain_text(item))
+                ]
+                if limitations:
+                    paragraph_lines.append(
+                        "- **注意事项：** "
+                        + "；".join(
+                            _escape_markdown_text(item) for item in limitations
+                        )
+                    )
+
+            if section_code == "limitations":
+                rendered_limitations_section = True
+                if overall_limitations:
+                    if paragraph_lines:
+                        paragraph_lines.append("")
+                    paragraph_lines.extend(["**总体注意事项：**", ""])
+                    paragraph_lines.extend(
+                        f"- {_escape_markdown_text(item)}"
+                        for item in overall_limitations
+                    )
+            if paragraph_lines:
+                section_lines.extend(
+                    ["", f"### {section_title}", "", *paragraph_lines]
+                )
+
+    if overall_limitations and not rendered_limitations_section:
+        section_lines.extend(
+            [
+                "",
+                "### 数据边界与选型注意事项",
+                "",
+                "**总体注意事项：**",
+                "",
+                *(
+                    f"- {_escape_markdown_text(item)}"
+                    for item in overall_limitations
+                ),
+            ]
+        )
+
+    if section_lines:
+        lines = ["", "## 产品分析", ""]
+        if isinstance(raw_analysis, Mapping) and _get(
+            raw_analysis, "input_complete"
+        ) is True:
+            lines.append(
+                "系统向模型提供了本页全部 "
+                f"{len(datasheet_parameters)} 项已核验参数。"
+            )
+        elif isinstance(raw_analysis, Mapping):
+            supplied_count = _get(raw_analysis, "input_parameter_count")
+            if (
+                isinstance(supplied_count, int)
+                and not isinstance(supplied_count, bool)
+                and 0 <= supplied_count <= len(datasheet_parameters)
+            ):
+                lines.append(
+                    f"系统向模型提供了 {supplied_count} 项已核验参数；"
+                    f"本页展示 {len(datasheet_parameters)} 项，分析输入并不完整。"
+                )
+        lines.extend(section_lines)
+        return lines
+
+    summary = _get(decision, "summary")
+    if summary is not None and _plain_text(summary):
+        return ["", "## 产品分析", "", _escape_markdown_text(summary)]
+    return []
+
+
+def product_page_title(product: Any) -> str:
+    """Return the stable catalogue product ID used by Wiki metadata and H1."""
+
+    product_id = _first(product, ("product_id", "id"))
+    if product_id is None:
+        raise ValueError("product needs a product_id for its page title")
+    return _plain_text(product_id)
+
+
+def _without_leading_identity(value: Any, identities: Sequence[Any]) -> str:
+    """Remove legacy brand/model/series prefixes while preserving description."""
+
+    original = _plain_text(value)
+    text = original
+    normalized_identities = [
+        _plain_text(identity)
+        for identity in identities
+        if _plain_text(identity)
+    ]
+    for _ in range(len(normalized_identities) + 2):
+        changed = False
+        for identity_text in normalized_identities:
+            tokens = re.findall(r"[^\W_]+", identity_text, flags=re.UNICODE)
+            if not tokens:
+                continue
+            pattern = (
+                r"^\s*"
+                + r"[\W_]*".join(re.escape(token) for token in tokens)
+                + r"(?![^\W_])"
+            )
+            match = re.match(pattern, text, flags=re.IGNORECASE | re.UNICODE)
+            if match is None:
+                continue
+            remainder = text[match.end() :].lstrip(
+                " \t|｜:：,，;；—–-"
+            )
+            if remainder:
+                text = remainder
+                changed = True
+                break
+        if changed:
+            continue
+        series_match = re.match(
+            r"^\s*(?:R5\s*/\s*R6|R[56])\s*系列"
+            r"(?:产品)?(?:\s*[-—–:：|｜,，;；]\s*|\s+)?",
+            text,
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+        if series_match is not None:
+            remainder = text[series_match.end() :].lstrip(
+                " \t|｜:：,，;；—–-"
+            )
+            if remainder:
+                text = remainder
+                continue
+        break
+    return text or original
+
+
+def product_description_zh(product: Any, decision: Any) -> str:
+    """Return Chinese descriptive copy with legacy display-title compatibility."""
+
+    localized = _first(
+        decision,
+        ("product_description_zh", "display_title_zh"),
+    )
+    if localized is None:
+        return ""
+    return _without_leading_identity(
+        localized,
+        (
+            _first(
+                decision,
+                ("manufacturer_zh",),
+            ),
+            _first(
+                decision,
+                ("manufacturer", "brand", "vendor", "maker"),
+            ),
+            _first(
+                product,
+                (
+                    "manufacturer",
+                    "brand",
+                    "vendor",
+                    "maker",
+                    "brand_code",
+                ),
+            ),
+            _first(
+                decision,
+                (
+                    "model",
+                    "model_number",
+                    "part_number",
+                    "mpn",
+                    "sku",
+                    "product_code",
+                    "code",
+                ),
+            ),
+            _first(product, ("product_id", "id")),
+        ),
+    )
+
+
+def product_bilingual_description(product: Any, decision: Any) -> str:
+    """Join the PostgreSQL source description and Chinese AI description."""
+
+    source = _first(product, ("product_name", "name", "description"))
+    source_text = _plain_text(source)
+    localized_text = product_description_zh(product, decision)
+    if source_text and localized_text:
+        if _display_identity_key(source_text) == _display_identity_key(localized_text):
+            return source_text
+        return f"{source_text}｜{localized_text}"
+    return source_text or localized_text
+
+
+def product_display_title(product: Any, decision: Any) -> str:
+    """Return a Chinese reader title while always preserving the model."""
+
+    localized = _first(
+        decision,
+        ("product_description_zh", "display_title_zh"),
+    )
+    model = _first(
+        decision,
+        (
+            "model",
+            "model_number",
+            "part_number",
+            "mpn",
+            "sku",
+            "product_code",
+            "code",
+        ),
+    )
+    if localized is not None and _plain_text(localized):
+        localized_text = _plain_text(localized)
+        model_text = _plain_text(model)
+        if (
+            model_text
+            and _display_identity_key(model_text)
+            not in _display_identity_key(localized_text)
+        ):
+            return f"{model_text} {localized_text}"
+        return localized_text
+    fallback = _first(
+        decision,
+        ("model", "model_number", "part_number", "mpn", "sku"),
+    )
+    if fallback is None:
+        fallback = _first(
+            product,
+            ("product_name", "name", "title", "model", "product_id", "id"),
+        )
+    if fallback is None:
+        raise ValueError("product needs a display name, model, or id")
+    return _plain_text(fallback)
+
+
+def manufacturer_display_name(product: Any, decision: Any) -> str:
+    """Return a Chinese brand label while always preserving canonical identity."""
+
+    localized = _first(decision, ("manufacturer_zh",))
+    canonical = _first(
+        decision,
+        ("manufacturer", "brand", "vendor", "maker"),
+    )
+    if canonical is None:
+        canonical = _first(
+            product,
+            ("manufacturer", "brand", "vendor", "maker", "brand_code"),
+        )
+    localized_text = _plain_text(localized)
+    canonical_text = _plain_text(canonical)
+    if localized_text:
+        if (
+            canonical_text
+            and _display_identity_key(canonical_text)
+            not in _display_identity_key(localized_text)
+        ):
+            return f"{localized_text}（{canonical_text}）"
+        return localized_text
+    return canonical_text
+
+
 def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
     fields = (
         ("产品 ID", product, ("product_id", "id")),
         (
             "品牌/制造商",
             decision,
-            ("manufacturer", "brand", "vendor", "maker"),
+            (
+                "manufacturer_zh",
+                "manufacturer",
+                "brand",
+                "vendor",
+                "maker",
+            ),
         ),
         (
             "型号/料号",
@@ -366,17 +818,19 @@ def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
             decision,
             ("product_category", "category", "product_type", "type"),
         ),
-        ("产品名称", product, ("product_name", "name", "title")),
+        ("产品类型", decision, ("product_type",)),
+        (
+            "产品描述",
+            decision,
+            ("product_description_zh", "display_title_zh"),
+        ),
         ("计量单位", product, ("unit_of_measure", "uom", "unit")),
-        ("数据库描述", product, ("description",)),
     )
     rows = []
     for label, owner, aliases in fields:
         value = _first(owner, aliases)
-        if value is None and label == "品牌/制造商":
-            value = _first(
-                product, ("manufacturer", "brand", "vendor", "maker", "brand_code")
-            )
+        if label == "品牌/制造商":
+            value = manufacturer_display_name(product, decision)
         elif value is None and label == "型号/料号":
             value = _first(
                 product,
@@ -390,6 +844,8 @@ def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
                     "code",
                 ),
             )
+        elif label == "产品描述":
+            value = product_bilingual_description(product, decision)
         if value is not None:
             rows.append((label, value))
     return rows
@@ -432,29 +888,30 @@ def _home_catalogue_entries(products: Sequence[Any]) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     for index, product in enumerate(products):
         product_id = _first(product, ("product_id", "id"))
-        title = _first(
-            product,
-            ("model", "product_name", "name", "title", "product_id", "id"),
-        )
         wiki_path = _first(product, ("wiki_path", "path"))
         published_at = _first(
             product, ("published_at", "last_success_at", "updated_at")
         )
-        if product_id is None or title is None or wiki_path is None:
+        if product_id is None or wiki_path is None:
             raise ValueError(
-                f"published_products[{index}] needs product_id, title, and wiki_path"
+                f"published_products[{index}] needs product_id and wiki_path"
             )
         published_text = _checked_at(published_at)
         if not published_text:
             raise ValueError(
                 f"published_products[{index}] needs a publication timestamp"
             )
+        description = product_bilingual_description(product, product)
+        if not description:
+            description = _plain_text(
+                _first(product, ("product_name", "name", "description", "model"))
+            )
         # Validate the path before it can influence counts or links.
-        _internal_link(title, wiki_path)
+        _internal_link(product_id, wiki_path)
         entries.append(
             {
                 "product_id": _plain_text(product_id),
-                "title": _plain_text(title),
+                "description": description,
                 "brand": _plain_text(
                     _first(
                         product,
@@ -593,12 +1050,20 @@ def render_home_page(
     if entries:
         lines.extend(
             [
-                "| 产品 | 品牌 | 产品类别 | 更新时间 |",
-                "| --- | --- | --- | --- |",
+                "| 产品 ID | 产品描述 | 品牌 | 产品类别 | 更新时间 |",
+                "| --- | --- | --- | --- | --- |",
             ]
         )
         for entry in entries[:recent_limit]:
-            product_link = _internal_link(entry["title"], entry["wiki_path"])
+            product_link = _internal_link(
+                entry["product_id"],
+                entry["wiki_path"],
+            )
+            description = (
+                escape_table_cell(entry["description"])
+                if entry["description"]
+                else "暂无描述"
+            )
             brand = (
                 _tag_index_link(entry["brand"], "brand", entry["brand"])
                 if entry["brand"]
@@ -610,7 +1075,7 @@ def render_home_page(
                 else "待分类"
             )
             lines.append(
-                f"| {product_link} | {brand} | {category} | "
+                f"| {product_link} | {description} | {brand} | {category} | "
                 f"{escape_table_cell(_display_publication_date(entry['published_at']))} |"
             )
     else:
@@ -644,19 +1109,24 @@ def render_product_page(
     """
 
     decision = {} if decision is None else decision
-    title = _first(product, ("product_name", "name", "title", "model", "product_id", "id"))
-    if title is None:
-        raise ValueError("product needs a display name, model, or id")
+    title = product_page_title(product)
+    subtitle = product_bilingual_description(product, decision)
 
     lines = [
         AUTO_BEGIN,
         f"# {_escape_markdown_text(title)}",
-        "",
-        "## 产品信息",
-        "",
-        "| 字段 | 值 |",
-        "| --- | --- |",
     ]
+    if subtitle:
+        lines.extend(["", f"## {_escape_markdown_text(subtitle)}"])
+    lines.extend(
+        [
+            "",
+            "## 产品信息",
+            "",
+            "| 字段 | 值 |",
+            "| --- | --- |",
+        ]
+    )
     rows = _product_rows(product, decision)
     if rows:
         lines.extend(
@@ -665,10 +1135,6 @@ def render_product_page(
         )
     else:  # pragma: no cover - title guarantees a useful row for normal inputs
         lines.append("| 产品 | 未提供 |")
-
-    summary = _get(decision, "summary")
-    if summary is not None and _plain_text(summary):
-        lines.extend(["", _escape_markdown_text(summary)])
 
     review_summary = _get(decision, "review_summary")
     if review_summary is not None and _plain_text(review_summary):
@@ -679,12 +1145,78 @@ def render_product_page(
             ]
         )
 
+    datasheet_parameters = _datasheet_parameters(decision)
     specifications = _specifications(product, decision)
+    derived_insights = _derived_insights(decision)
+    lines.extend(["", "## 产品参数", ""])
+    if datasheet_parameters:
+        lines.append(
+            f"**参数完整性：** 已安全提取 {len(datasheet_parameters)} 项数据表参数，"
+            "按原数据表顺序和层级展示；此数量不代表数据表的全部字段。"
+        )
+        lines.extend(
+            [
+                "",
+                "### 数据表参数",
+            ]
+        )
+        previous_section: tuple[str, str] | None = None
+        previous_subsection: tuple[str, str] | None = None
+        for parameter in datasheet_parameters:
+            section = (parameter["section"], parameter["section_zh"])
+            subsection = (
+                parameter["subsection"],
+                parameter["subsection_zh"],
+            )
+            section_changed = section != previous_section
+            subsection_changed = section_changed or subsection != previous_subsection
+            if section_changed:
+                section_title = _bilingual_heading(
+                    *section,
+                    fallback="未分组",
+                )
+                lines.extend(
+                    ["", f"#### {_escape_markdown_text(section_title)}"]
+                )
+            if subsection_changed:
+                subsection_title = _bilingual_heading(
+                    *subsection,
+                    fallback="",
+                )
+                if subsection_title:
+                    lines.extend(
+                        [
+                            "",
+                            f"##### {_escape_markdown_text(subsection_title)}",
+                        ]
+                    )
+                elif not section_changed:
+                    lines.extend(["", "##### 未分组"])
+                lines.extend(
+                    [
+                        "",
+                        "| 英文原文参数 | 专业中文参数 | 值 |",
+                        "| --- | --- | --- |",
+                    ]
+                )
+            lines.append(
+                f"| {escape_table_cell(parameter['name'])} | "
+                f"{escape_table_cell(parameter['name_zh'] or '—')} | "
+                f"{escape_table_cell(parameter['value'])} |"
+            )
+            previous_section = section
+            previous_subsection = subsection
+    else:
+        lines.append(
+            "**参数完整性：** 暂未提取到可安全归属该型号的数据表参数；"
+            "请以参考文献中的原始数据表为准。"
+        )
+
     if specifications:
         lines.extend(
             [
                 "",
-                "## 规格参数",
+                "### 关键参数",
                 "",
                 "| 类别 | 参数 | 值 |",
                 "| --- | --- | --- |",
@@ -697,6 +1229,37 @@ def render_product_page(
             )
             for category, key, value in specifications
         )
+    elif not datasheet_parameters:
+        lines.extend(["", "暂无可安全展示的已核验关键参数。"])
+
+    if derived_insights:
+        lines.extend(
+            [
+                "",
+                "### AI 参数对照（需复核）",
+                "",
+                (
+                    "系统仅复核二元算术，以及两个操作数是否分别对应"
+                    "“依据参数”中的源数值；不验证工程含义、量纲兼容性"
+                    "或单位换算。以下结果并非数据表原文，使用前需人工复核。"
+                ),
+                "",
+                "| 衍生项 | 结果 | 公式 | 依据参数 | 说明 |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        lines.extend(
+            (
+                f"| {escape_table_cell(item['name'])} | "
+                f"{escape_table_cell(item['value'])} | "
+                f"{escape_table_cell(item['formula'])} | "
+                f"{escape_table_cell(item['basis'])} | "
+                f"{escape_table_cell(item['explanation'] or '—')} |"
+            )
+            for item in derived_insights
+        )
+
+    lines.extend(_professional_analysis_lines(decision, datasheet_parameters))
 
     sources = _collect_sources(decision)
 
