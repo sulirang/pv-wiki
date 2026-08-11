@@ -30,7 +30,6 @@ DEFAULT_MCP_PORT = 8001
 _SECRET_ENVIRONMENT = (
     "WIKIJS_TOKEN",
     "PV_WIKI_STATE_DATABASE_URL",
-    "PGPASSWORD",
 )
 
 
@@ -63,32 +62,29 @@ def _safe_error(exc: BaseException) -> str:
     )
 
 
-def _refresh_catalogue() -> Mapping[str, Any]:
-    # Imported lazily: the legacy CLI is large and must not be initialized
-    # merely to list MCP tools or retry a pending publication.
-    from .cli import sync_catalogue
-
-    return sync_catalogue(resume_quota=False)
-
-
 def _next_product(
     *,
     store_factory: Callable[[], HermesCompletionStore],
-    refresh: Callable[[], Mapping[str, Any]],
-    refresh_catalogue: bool,
     after_product_id: str | None = None,
 ) -> dict[str, Any]:
-    refreshed: Mapping[str, Any] | None = None
-    if refresh_catalogue:
-        refreshed = refresh()
     with store_factory() as store:
         product = store.next_product(after_product_id=after_product_id)
+        catalogue = store.catalogue_status()
     if product is None:
         return {
             "ok": True,
             "found": False,
-            "reason": "no_unresearched_product",
-            "catalogue": dict(refreshed) if refreshed is not None else None,
+            "reason": (
+                "no_unresearched_product"
+                if catalogue.initialized
+                else "catalogue_not_loaded"
+            ),
+            "catalogue": {
+                "initialized": catalogue.initialized,
+                "generation": catalogue.generation,
+                "source_records": catalogue.source_records,
+                "refreshed_at": _time_text(catalogue.refreshed_at),
+            },
         }
     return {
         "ok": True,
@@ -96,14 +92,18 @@ def _next_product(
         "product_id": product.product_id,
         "source_hash": product.source_hash,
         "product": product.payload,
-        "catalogue": dict(refreshed) if refreshed is not None else None,
+        "catalogue": {
+            "initialized": catalogue.initialized,
+            "generation": catalogue.generation,
+            "source_records": catalogue.source_records,
+            "refreshed_at": _time_text(catalogue.refreshed_at),
+        },
     }
 
 
 def build_server(
     *,
     store_factory: Callable[[], HermesCompletionStore] | None = None,
-    catalogue_refresh: Callable[[], Mapping[str, Any]] | None = None,
     publisher: Callable[..., dict[str, Any]] | None = None,
 ) -> Any:
     """Build an official MCP v2 server with injectable boundaries for tests."""
@@ -117,7 +117,6 @@ def build_server(
         ) from exc
 
     active_store_factory = store_factory or HermesCompletionStore
-    active_refresh = catalogue_refresh or _refresh_catalogue
     active_publisher = publisher or publish_researched
     selection_lock = threading.Lock()
     selection_cursor: str | None = None
@@ -191,23 +190,19 @@ def build_server(
     @server.tool(
         name="pv_next_product",
         description=(
-            "Refresh the catalogue snapshot and fairly return a product with no "
-            "durable completion. This is an anti-join with a process-local "
-            "wraparound cursor, not a lease or retry schedule."
+            "Read the active server-side catalogue snapshot and fairly return a "
+            "product with no durable completion. This never connects to the source "
+            "business database."
         ),
-        annotations=annotations(read_only=False),
+        annotations=annotations(read_only=True),
         structured_output=False,
     )
-    def pv_next_product(refresh_catalogue: bool = True) -> Any:
+    def pv_next_product() -> Any:
         nonlocal selection_cursor
         try:
-            if not isinstance(refresh_catalogue, bool):
-                raise ValueError("refresh_catalogue must be boolean")
             with selection_lock:
                 payload = _next_product(
                     store_factory=active_store_factory,
-                    refresh=active_refresh,
-                    refresh_catalogue=refresh_catalogue,
                     after_product_id=selection_cursor,
                 )
                 selection_cursor = (
@@ -282,11 +277,20 @@ def build_server(
             with active_store_factory() as store:
                 counts = store.counts()
                 next_product = store.next_product()
+                catalogue = store.catalogue_status()
             return result(
                 {
                     "ok": True,
                     "counts": counts,
                     "unresearched_available": next_product is not None,
+                    "catalogue": {
+                        "initialized": catalogue.initialized,
+                        "generation": catalogue.generation,
+                        "source_records": catalogue.source_records,
+                        "checksum": catalogue.checksum,
+                        "refreshed_at": _time_text(catalogue.refreshed_at),
+                        "source": catalogue.source,
+                    },
                 }
             )
         except Exception as exc:

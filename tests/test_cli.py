@@ -354,6 +354,40 @@ class CLITests(unittest.TestCase):
             self.assertEqual("due", current.status)
             self.assertEqual(0, current.consecutive_failures)
 
+    def test_first_manual_sync_reports_every_source_product_as_added(self) -> None:
+        fresh_state = Path(self.tempdir.name) / "fresh-state.sqlite3"
+        reader = mock.Mock()
+        reader.fetch_products.return_value = [product()]
+
+        with mock.patch.dict(
+            os.environ,
+            {"PV_WIKI_STATE_PATH": str(fresh_state)},
+            clear=True,
+        ):
+            payload = cli.sync_catalogue(
+                resume_quota=False,
+                product_reader=reader,
+            )
+
+        self.assertEqual(1, payload["snapshot"]["added"])
+        self.assertEqual(0, payload["snapshot"]["unchanged"])
+        self.assertEqual(1, payload["snapshot"]["generation"])
+
+    def test_duplicate_manual_sync_is_rejected_before_legacy_rows_change(self) -> None:
+        first = {**product(), "product_id": "P-duplicate", "product_name": "A"}
+        second = {**first, "product_name": "B"}
+        reader = mock.Mock()
+        reader.fetch_products.return_value = [first, second]
+
+        with self.assertRaisesRegex(state.StateError, "duplicate product_id"):
+            cli.sync_catalogue(
+                resume_quota=False,
+                product_reader=reader,
+            )
+
+        with state.StateStore(self.state_path) as store:
+            self.assertIsNone(store.get_product("P-duplicate"))
+
     def test_sync_catalogue_inherits_brand_from_exact_model_sibling(self) -> None:
         reader = mock.Mock()
         reader.fetch_products.return_value = [

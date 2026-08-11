@@ -1,20 +1,21 @@
 ---
 name: wikijs-sync-products
-description: Install, upgrade, validate, repair, roll back, or remove the Hermes-scheduled PV Wiki product-research deployment on a user-authorized host. Use when configuring the rotating-key Exa MCP gateway, the PV Wiki research-state MCP, Hermes MCP tool allowlists and cron, the durable completion database, read-only catalogue access, or restricted Wiki.js publication; treat the bundled n8n worker as a legacy rollback path only.
+description: Install, upgrade, validate, repair, roll back, or remove the Hermes-scheduled PV Wiki product-research deployment on a user-authorized host. Use when configuring the rotating-key Exa MCP gateway, the PV Wiki research-state MCP, the manual one-shot catalogue-admin MCP, Hermes tool allowlists and cron, durable catalogue/completion state, or restricted Wiki.js publication; treat the bundled n8n worker as a legacy rollback path only.
 ---
 
 # Install the Hermes PV Wiki automation
 
 Deploy Hermes as the recurring research owner. Deploy the rotating-key Exa MCP
-as the only public-web boundary and the PV Wiki MCP as the catalogue,
-completion, and publication boundary. Do not deploy n8n for a new installation.
+as the only public-web boundary, the PV Wiki MCP as the offline-snapshot,
+completion, and publication boundary, and the separate catalogue-admin MCP only
+for explicit interactive refreshes. Do not deploy n8n for a new installation.
 
 Read these resources before changing a host:
 
 - [`deploy/hermes/README.md`](../../deploy/hermes/README.md) for the production
   layout and Hermes cron configuration;
 - [`deploy/hermes/mcp-config.yaml.example`](../../deploy/hermes/mcp-config.yaml.example)
-  for the two MCP server definitions and tool allowlists;
+  for the three MCP server definitions and tool allowlists;
 - [`skills/pv-wiki-research/SKILL.md`](../pv-wiki-research/SKILL.md) for the
   recurring research procedure;
 - [database boundaries](references/database-schema.md);
@@ -39,12 +40,15 @@ Read these resources before changing a host:
   search and extraction still use Exa's cloud API.
 - Keep stdio as the default transport on the same host. If a split deployment
   requires Streamable HTTP, bind to loopback or an authenticated private
-  network. Never expose either MCP endpoint publicly.
+  network. Never expose any MCP endpoint publicly.
 - Do not enable Hermes native web, browser, terminal, delegation, or Exa
   `agent_run` in the recurring job. Enable only `mcp-exa-pool` and
   `mcp-pv-wiki` with their explicit tool allowlists.
 - Keep one serialized recurring job. Do not run the legacy n8n product cycle
   concurrently.
+- Never give the recurring job `mcp-pv-wiki-catalogue-admin`. Source database
+  credentials may be used only in one explicit interactive refresh call and
+  must never be persisted by PV Wiki.
 - Obtain explicit approval before activating a schedule, publishing public
   pages, deleting a completion, deleting state, removing volumes, or revoking
   external credentials.
@@ -99,18 +103,11 @@ account or team. Use rotation for availability, not to evade provider limits.
 The implementation retains `EXA_API_KEYS` and `EXA_API_KEY` only as legacy
 compatibility inputs; do not use them in a new production deployment.
 
-Configure the PV Wiki MCP separately:
+Configure the recurring PV Wiki MCP without source-database access:
 
 ```dotenv
 PV_WIKI_STATE_DATABASE_URL=postgresql://...
 PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
-PGHOST=...
-PGPORT=5432
-PGDATABASE=...
-PGUSER=...                 # SELECT-only catalogue role
-PGPASSWORD=...
-PGSSLMODE=verify-full
-PGSSLROOTCERT=/run/secrets/catalogue-ca.pem
 WIKIJS_URL=https://wiki.example.com
 WIKIJS_TOKEN=...
 ```
@@ -120,6 +117,14 @@ the accepted deployment policy. Keep new pages private and unpublished during
 acceptance. Do not install Exa keys in the PV Wiki MCP and do not install
 catalogue, state, or Wiki.js credentials in the Exa MCP.
 
+Configure only the non-secret source endpoint on the separate catalogue-admin
+MCP: `PGHOST`, `PGPORT`, `PGDATABASE`, an explicit `PGSSLMODE`, and optionally
+`PGSSLROOTCERT`. Do not configure `PGUSER` or `PGPASSWORD`. After the user
+explicitly requests an update, `pv_refresh_catalogue` receives a temporary
+SELECT-only username/password once as tool inputs and never stores or returns
+them. Warn that Hermes/provider tool-call history may retain those inputs; use a
+short-lived role and revoke it immediately after the refresh.
+
 Review the bundled supplier registry. For every deployment-specific catalogue
 brand that may publish, configure both an operator-approved public alias and
 its trusted manufacturer/regulatory/authorized domains through
@@ -127,10 +132,11 @@ its trusted manufacturer/regulatory/authorized domains through
 `PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON`. Model output and independent unregistered
 domains cannot establish publication authority.
 
-For stdio, both MCP subprocesses run as the Hermes user and may read the same
-owner-only receipt-key file. For separately supervised HTTP services, mount
-the same receipt secret into two different mode-`0600` files, each owned by its
-service account. The receipt is stateless; do not add a receipt table,
+For stdio, the Exa and research MCP subprocesses run as the Hermes user and may
+read the same owner-only receipt-key file; the catalogue-admin MCP does not need
+that key. For separately supervised HTTP services, mount the same receipt secret
+into two different mode-`0600` files, each owned by its service account. The
+receipt is stateless; do not add a receipt table,
 timestamp, lease, retry, action ledger, or budget.
 
 Configure the Hermes model through Hermes. Do not add the legacy worker's
@@ -139,11 +145,12 @@ or action-ledger settings to the new path.
 
 ## 4. Configure the MCP servers
 
-Use the bundled MCP example. Run both servers over stdio on the same host:
+Use the bundled MCP example. Run all three servers over stdio on the same host:
 
 ```text
 pv-wiki-exa-mcp
 pv-wiki-research-mcp
+pv-wiki-catalogue-mcp
 ```
 
 Allow exactly these Exa tools:
@@ -159,6 +166,12 @@ Allow exactly these PV Wiki tools:
 - `pv_save_research`
 - `pv_publish_result`
 - `pv_research_status`
+
+Allow exactly one tool on the separate interactive admin server:
+
+- `pv_refresh_catalogue`
+
+Never add the admin server's toolset to the recurring job.
 
 Do not enable MCP prompts or resources. Keep parallel tool calls disabled until
 the deployment has demonstrated that its Hermes job is serialized.
@@ -178,7 +191,8 @@ Require every session to follow this order:
 
 1. Check `pv_pending_publication` and retry that publication first.
 2. If a pending completion exists, call `pv_publish_result` and end the run.
-3. Otherwise call `pv_next_product` with its default catalogue refresh.
+3. Otherwise call the zero-argument `pv_next_product`; it reads only the active
+   server-side snapshot.
 4. Stop when no unfinished product exists.
 5. Research through the Exa MCP only.
 6. Save one schema-version-`2` decision with the returned `product_id`,
@@ -194,10 +208,12 @@ session; the completion primary key owns cross-session idempotency.
 
 Validate configuration without printing secrets. Confirm:
 
-- both MCP servers start and list only the intended tools;
+- all three MCP servers start and list only the intended tools;
 - `pv_research_status` returns completion counts;
-- `pv_next_product` refreshes the read-only catalogue and returns a stable
-  `product_id` and `source_hash`;
+- `pv_next_product` works without any source-database environment variables and
+  returns a stable `product_id` and `source_hash` from the local snapshot;
+- `pv_refresh_catalogue` is unavailable to cron, rejects an empty source list,
+  atomically activates a full snapshot, and never returns credentials;
 - one representative product can be researched through Exa and saved once;
 - every saved document uses an unchanged `url`, exact `content`, and `receipt`
   from one `web_fetch_exa` result, while missing or altered receipts fail;
@@ -206,8 +222,9 @@ Validate configuration without printing secrets. Confirm:
 - a simulated Wiki.js failure leaves the completion pending and the next run
   retries publication without invoking research;
 - the Wiki.js page remains private/unpublished during acceptance;
-- no raw Exa key, catalogue password, state URL, or Wiki.js token appears in
-  Hermes history or logs.
+- no raw Exa key, catalogue password, state URL, or Wiki.js token appears in PV
+  Wiki state, MCP responses, or service logs; separately warn that the requested
+  one-shot username/password can remain in Hermes/provider tool-call history.
 
 Show the user the acceptance result and obtain approval before enabling the
 cron or changing new-page visibility.
@@ -221,8 +238,8 @@ only the Exa MCP process.
 
 Before an upgrade, disable the Hermes cron, drain or inspect pending
 publication, back up the state database and Hermes configuration, install one
-pinned revision, start both MCP servers, validate status and one private page,
-then re-enable the schedule.
+pinned revision, start all three MCP servers, validate status and one private
+page, then re-enable the schedule.
 
 For rollback, stop the Hermes cron and MCP processes first. Restore a compatible
 state backup if required, then reactivate the preserved legacy n8n worker only

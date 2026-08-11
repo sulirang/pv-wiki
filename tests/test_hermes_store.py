@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import tempfile
@@ -24,6 +25,7 @@ SCRIPTS = (
 sys.path.insert(0, str(SCRIPTS))
 
 from pv_wiki.config import WikiSettings  # noqa: E402
+from pv_wiki.catalogue_snapshot import replace_catalogue_snapshot  # noqa: E402
 from pv_wiki.evidence_receipt import issue_evidence_receipt  # noqa: E402
 from pv_wiki.hermes_store import (  # noqa: E402
     CompletionValidationError,
@@ -750,6 +752,70 @@ class HermesCompletionStoreTests(unittest.TestCase):
                     evidence_documents=nonpublish_evidence(),
                 )
 
+    def test_manual_refresh_rejects_a_stale_selected_snapshot(self) -> None:
+        old_hash = self.add_products("P-42")["P-42"]
+        changed = product("P-42")
+        changed["product_name"] = "PV-42 revised"
+        with StateStore(self.state_path) as state:
+            replace_catalogue_snapshot(state, [changed])
+
+        with HermesCompletionStore(self.state_path) as store:
+            with self.assertRaises(ProductSourceChangedError):
+                store.save_completion(
+                    product_id="P-42",
+                    source_hash=old_hash,
+                    decision=nonpublish_decision(),
+                    evidence_documents=nonpublish_evidence(),
+                )
+
+    def test_completed_product_stays_complete_after_removal_and_readdition(self) -> None:
+        source_hash = self.add_products("P-42")["P-42"]
+        with HermesCompletionStore(self.state_path) as store:
+            store.save_completion(
+                product_id="P-42",
+                source_hash=source_hash,
+                decision=nonpublish_decision(),
+                evidence_documents=nonpublish_evidence(),
+            )
+
+        with StateStore(self.state_path) as state:
+            replace_catalogue_snapshot(state, [product("P-43")])
+        with HermesCompletionStore(self.state_path) as store:
+            self.assertIsNotNone(store.get_completion("P-42"))
+            selected = store.next_product()
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual("P-43", selected.product_id)
+
+        with StateStore(self.state_path) as state:
+            replace_catalogue_snapshot(
+                state,
+                [product("P-42"), product("P-43")],
+            )
+        with HermesCompletionStore(self.state_path) as store:
+            selected = store.next_product()
+            self.assertIsNotNone(selected)
+            assert selected is not None
+            self.assertEqual("P-43", selected.product_id)
+
+    def test_snapshot_removal_does_not_cancel_a_completed_publication(self) -> None:
+        source_hash = self.add_products("P-42")["P-42"]
+        with HermesCompletionStore(self.state_path) as store:
+            store.save_completion(
+                product_id="P-42",
+                source_hash=source_hash,
+                decision=publish_decision(),
+                evidence_documents=[evidence_document(EVIDENCE_URL, EVIDENCE_TEXT)],
+            )
+
+        with StateStore(self.state_path) as state:
+            replace_catalogue_snapshot(state, [product("P-43")])
+        with HermesCompletionStore(self.state_path) as store:
+            pending = store.pending_publication()
+            self.assertIsNotNone(pending)
+            assert pending is not None
+            self.assertEqual("P-42", pending.product_id)
+
     def test_publish_failure_remains_pending_without_reresearch(self) -> None:
         source_hash = self.add_products("P-42")["P-42"]
         settings = WikiSettings(
@@ -823,22 +889,15 @@ class HermesCompletionStoreTests(unittest.TestCase):
             self.assertFalse(replay["changed"])
             self.assertEqual(1, len(calls))
 
-    def test_next_product_helper_refreshes_then_uses_antijoin(self) -> None:
+    def test_next_product_helper_uses_local_snapshot_without_refresh(self) -> None:
         self.add_products("P-42")
-        refresh_calls: list[bool] = []
-
-        def refresh() -> dict:
-            refresh_calls.append(True)
-            return {"ok": True, "source_records": 1}
 
         payload = _next_product(
             store_factory=lambda: HermesCompletionStore(self.state_path),
-            refresh=refresh,
-            refresh_catalogue=True,
         )
-        self.assertEqual([True], refresh_calls)
         self.assertTrue(payload["found"])
         self.assertEqual("P-42", payload["product_id"])
+        self.assertTrue(payload["catalogue"]["initialized"])
 
     def test_mcp_v2_server_builds_exact_five_tools(self) -> None:
         self.add_products("P-42", "P-43")
@@ -886,7 +945,6 @@ class HermesCompletionStoreTests(unittest.TestCase):
         ):
             server = research_mcp.build_server(
                 store_factory=lambda: HermesCompletionStore(self.state_path),
-                catalogue_refresh=lambda: {"ok": True},
             )
         self.assertIsInstance(server, FakeServer)
         self.assertEqual(
@@ -900,9 +958,10 @@ class HermesCompletionStoreTests(unittest.TestCase):
             set(registered),
         )
         next_tool = registered["pv_next_product"][0]
-        first = json.loads(next_tool(False).content[0].text)  # type: ignore[operator]
-        second = json.loads(next_tool(False).content[0].text)  # type: ignore[operator]
-        third = json.loads(next_tool(False).content[0].text)  # type: ignore[operator]
+        self.assertEqual({}, dict(inspect.signature(next_tool).parameters))
+        first = json.loads(next_tool().content[0].text)  # type: ignore[operator]
+        second = json.loads(next_tool().content[0].text)  # type: ignore[operator]
+        third = json.loads(next_tool().content[0].text)  # type: ignore[operator]
         self.assertEqual("P-42", first["product_id"])
         self.assertEqual("P-43", second["product_id"])
         self.assertEqual("P-42", third["product_id"])
@@ -914,7 +973,6 @@ class HermesCompletionStoreTests(unittest.TestCase):
             self.skipTest("MCP runtime is not installed")
         server = research_mcp.build_server(
             store_factory=lambda: HermesCompletionStore(self.state_path),
-            catalogue_refresh=lambda: {"ok": True},
         )
         tools = server._tool_manager._tools
         self.assertEqual(

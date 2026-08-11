@@ -32,11 +32,12 @@ issues only `SELECT` statements and starts a read-only transaction.
 Never use `product_name` as the idempotency key. Names may be blank, generic,
 or repeated. Never assume `brand_code` names the public manufacturer.
 
-Configure the catalogue with `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`,
-`PGPASSWORD`, and an explicit `PGSSLMODE`. Accept only the standard libpq
-modes `disable`, `allow`, `prefer`, `require`, `verify-ca`, and `verify-full`.
-Prefer `verify-full` with `PGSSLROOTCERT` pointing at a read-only mounted CA.
-Use a SELECT-only PostgreSQL role.
+Configure the manual catalogue-admin MCP with `PGHOST`, `PGPORT`, `PGDATABASE`,
+and an explicit `PGSSLMODE`. Accept only the standard libpq modes `disable`,
+`allow`, `prefer`, `require`, `verify-ca`, and `verify-full`. Prefer
+`verify-full` with `PGSSLROOTCERT` pointing at a read-only mounted CA. Do not
+configure `PGUSER` or `PGPASSWORD`: an explicitly requested interactive refresh
+receives a temporary SELECT-only username/password for that one tool call.
 
 ## Database roles
 
@@ -57,16 +58,49 @@ writes Wiki.js content only through the restricted GraphQL API token.
 
 ## Catalogue snapshot
 
-`pv_next_product` defaults to `refresh_catalogue=true`. It calls the existing
-read-only catalogue synchronizer with quota wakeups disabled, updates the
-state database's `products` snapshot, and then selects a product. An operator
-may pass `refresh_catalogue=false` only when another authorized process has
-just refreshed the same snapshot.
+The zero-argument `pv_next_product` reads only the state database and has no
+source-database connection path. A separate interactive toolset exposes
+`pv_refresh_catalogue(username, password)` only after the user explicitly asks
+to update the product list. The username/password are used as explicit psycopg
+connection arguments, then released; PV Wiki never writes or returns them.
+Hermes/provider history can still retain tool inputs, so use a short-lived
+SELECT-only role and revoke it after the call.
 
-The existing `products` state table remains the local source snapshot. The
-Hermes selector uses only its identity, source hash, payload, and source-time
-fields. Legacy queue state, leases, failure counters, and next-run timestamps
-do not affect selection.
+The manual tool first completes one full, repeatable-read, read-only scan. It
+rejects an empty list or duplicate `product_id`, updates the legacy rollback
+rows, and atomically replaces these Hermes-specific tables:
+
+```sql
+CREATE TABLE IF NOT EXISTS product_catalogue_snapshot (
+    product_id TEXT PRIMARY KEY,
+    source_hash TEXT NOT NULL,
+    source_updated_at TEXT,
+    payload_json TEXT NOT NULL,
+    refreshed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS product_catalogue_snapshot_metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    initialized INTEGER NOT NULL CHECK (initialized IN (0, 1)),
+    source_records INTEGER NOT NULL CHECK (source_records >= 0),
+    checksum TEXT,
+    refreshed_at TEXT,
+    source TEXT NOT NULL
+);
+```
+
+The replacement is one state-database transaction: readers see either the old
+complete snapshot or the new complete snapshot. A product absent from the new
+source scan disappears from the active snapshot without deleting legacy
+`products`, attempts, or completions. On upgrade, the snapshot is backfilled
+once from the existing `products` table; later legacy upserts do not silently
+change it. The recurring research MCP receives no `PG*` source settings.
+
+This removal affects future product selection only. It does not cancel an
+already accepted pending publication, which uses the immutable `product_json`
+captured in its completion. Publication withdrawal requires a separate,
+explicit operator decision.
 
 ## Completion table
 
@@ -131,7 +165,7 @@ lexical unfinished id:
 
 ```sql
 SELECT p.product_id, p.source_hash, p.payload_json
-FROM products AS p
+FROM product_catalogue_snapshot AS p
 WHERE NOT EXISTS (
     SELECT 1
     FROM product_research_completions AS completed
@@ -157,12 +191,12 @@ an atomic write fence:
 1. Verify every submitted Exa evidence receipt, including on an idempotent save
    replay.
 2. Return the existing completion when `product_id` is already present.
-3. Read the catalogue snapshot and reject an absent product or mismatched
+3. Read the active catalogue snapshot and reject an absent product or mismatched
    `source_hash`.
 4. Validate schema version `2`, catalogue identity, source authority,
    citations, and exact evidence spans against that snapshot.
-5. In the write transaction, reread the product and compare `source_hash`
-   again so a concurrent catalogue change rejects stale research.
+5. In the write transaction, reread the active snapshot row and compare
+   `source_hash` again so a concurrent change or removal rejects stale research.
 6. Insert with `ON CONFLICT (product_id) DO NOTHING` and return the first
    writer's row.
 
@@ -195,9 +229,9 @@ marker; a backfilled row still counts as completed and published.
 
 ## Legacy tables
 
-Do not delete the version 0.3 tables during upgrade. The Hermes path reuses
-`products` as its catalogue snapshot and reads `attempts` once for successful
-publication backfill. It does not use:
+Do not delete the version 0.3 tables during upgrade. The Hermes path copies
+`products` into its dedicated snapshot once and reads `products`/`attempts` for
+successful publication backfill. It does not use:
 
 - product queue states, leases, backoff, or failure streaks;
 - attempt ownership or retry policy;

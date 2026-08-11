@@ -8,10 +8,10 @@ that matters across fresh Hermes sessions:
 * a product has a completed research decision; and
 * a publishable decision has (or has not) been applied to Wiki.js.
 
-The completion table lives beside the legacy PV Wiki state tables so an
-existing deployment can be upgraded without copying catalogue snapshots.  On
-first open, products with ``last_success_at`` are backfilled as already
-completed and published.  This prevents the new Hermes scheduler from
+The completion table and active catalogue snapshot live beside the legacy PV
+Wiki state tables. On first open, the snapshot is backfilled once from legacy
+products, while products with ``last_success_at`` are backfilled as already
+completed and published. This prevents the new Hermes scheduler from
 researching pages that the former worker already published.
 """
 
@@ -28,6 +28,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .catalogue_snapshot import (
+    CATALOGUE_TABLE,
+    CatalogueSnapshotStatus,
+    catalogue_snapshot_status,
+    initialize_catalogue_snapshot,
+)
 from .config import (
     WikiSettings,
     allow_mirrors,
@@ -1067,6 +1073,7 @@ class HermesCompletionStore:
         self._state = StateStore(target if target is not None else state_target(), timeout=timeout)
         self.backend = self._state.backend
         self.location = self._state.location
+        initialize_catalogue_snapshot(self._state)
         self._initialize()
 
     def close(self) -> None:
@@ -1192,7 +1199,7 @@ class HermesCompletionStore:
             return connection.execute(
                 f"""
                 SELECT p.product_id, p.source_hash, p.payload_json
-                FROM products AS p
+                FROM {CATALOGUE_TABLE} AS p
                 WHERE NOT EXISTS (
                     SELECT 1
                     FROM {COMPLETION_TABLE} AS completed
@@ -1216,6 +1223,11 @@ class HermesCompletionStore:
             source_hash=row["source_hash"],
             payload=self._decoded_object(row["payload_json"]),
         )
+
+    def catalogue_status(self) -> CatalogueSnapshotStatus:
+        """Return non-secret metadata for the active local catalogue snapshot."""
+
+        return catalogue_snapshot_status(self._state)
 
     def get_completion(self, product_id: Any) -> ResearchCompletion | None:
         with self._state._connection() as connection:
@@ -1277,9 +1289,9 @@ class HermesCompletionStore:
                 (normalized_product_id,),
             ).fetchone()
             product_row = connection.execute(
-                """
+                f"""
                 SELECT product_id, source_hash, payload_json
-                FROM products
+                FROM {CATALOGUE_TABLE}
                 WHERE product_id = ?
                 """,
                 (normalized_product_id,),
@@ -1305,9 +1317,9 @@ class HermesCompletionStore:
         completed_at = _time_text(_utc(now))
         with self._state._write_transaction() as connection:
             product_row = connection.execute(
-                """
+                f"""
                 SELECT product_id, source_hash, payload_json
-                FROM products
+                FROM {CATALOGUE_TABLE}
                 WHERE product_id = ?
                 """,
                 (normalized_product_id,),

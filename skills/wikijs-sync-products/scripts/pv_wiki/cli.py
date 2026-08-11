@@ -55,6 +55,11 @@ from .config import (
     trusted_source_domain_map,
     trusted_source_domains_for_product,
 )
+from .catalogue_snapshot import (
+    initialize_catalogue_snapshot,
+    replace_catalogue_snapshot,
+    validate_catalogue_snapshot,
+)
 from .exa import (
     API_BASE_URL as EXA_API_BASE_URL,
     EXTRACT_CONTRACT_VERSION as EXA_EXTRACT_CONTRACT_VERSION,
@@ -968,16 +973,27 @@ def _inherit_registered_sibling_brands(
     return enriched, inferred
 
 
-def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
+def sync_catalogue(
+    *,
+    resume_quota: bool = True,
+    product_reader: ProductReader | None = None,
+) -> dict[str, Any]:
     """Refresh the queue, optionally waking explicit monthly quota waits."""
 
     if not isinstance(resume_quota, bool):
         raise TypeError("resume_quota must be a boolean")
 
-    products = ProductReader().fetch_products(batch_size=500)
+    products = (product_reader or ProductReader()).fetch_products(batch_size=500)
     products, brands_inferred = _inherit_registered_sibling_brands(products)
+    # Reject an empty, duplicate, or structurally invalid full scan before
+    # touching either the legacy rollback rows or the active Hermes snapshot.
+    validate_catalogue_snapshot(products)
     with _SOURCE_PUBLISH_FENCE:
         with _store() as store:
+            # Freeze any pre-Hermes legacy catalogue before writing the new
+            # source rows. Otherwise a first manual refresh would backfill its
+            # own just-written rows and incorrectly report every row unchanged.
+            initialize_catalogue_snapshot(store)
             # Keep SQLite write-lock holds short enough that a concurrently
             # running product can durably seal a paid provider action without
             # timing out.
@@ -991,6 +1007,11 @@ def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
                 if resume_quota
                 else 0
             )
+            snapshot = replace_catalogue_snapshot(
+                store,
+                products,
+                source="source-database",
+            )
             counts = store.status_counts()
     return {
         "ok": True,
@@ -999,6 +1020,20 @@ def sync_catalogue(*, resume_quota: bool = True) -> dict[str, Any]:
         "created": sum(item.created for item in results),
         "changed": sum(item.changed and not item.created for item in results),
         "rescheduled": sum(item.rescheduled for item in results),
+        "snapshot": {
+            "generation": snapshot.status.generation,
+            "source_records": snapshot.status.source_records,
+            "checksum": snapshot.status.checksum,
+            "refreshed_at": (
+                snapshot.status.refreshed_at.isoformat()
+                if snapshot.status.refreshed_at is not None
+                else None
+            ),
+            "added": snapshot.added,
+            "changed": snapshot.changed,
+            "removed": snapshot.removed,
+            "unchanged": snapshot.unchanged,
+        },
         "quota_resumed": quota_resumed,
         "queue": counts,
     }

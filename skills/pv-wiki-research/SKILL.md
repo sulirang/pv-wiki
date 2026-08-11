@@ -10,6 +10,9 @@ Use only these MCP toolsets:
 - `mcp-exa-pool`: `web_search_exa`, `web_search_advanced_exa`, and `web_fetch_exa`
 - `mcp-pv-wiki`: `pv_pending_publication`, `pv_next_product`, `pv_save_research`, `pv_publish_result`, and `pv_research_status`
 
+Do not request source-database credentials and do not enable
+`mcp-pv-wiki-catalogue-admin` in a recurring or unattended session.
+
 Do not use native web search, browser tools, terminal or shell tools, delegation,
 subagents, or `agent_run`. Do not request, inspect, print, or transmit Exa keys.
 The Exa MCP owns credentials and rotation.
@@ -28,9 +31,12 @@ uncited claims.
 2. If it returns a pending completion, call `pv_publish_result` with its
    `product_id`. Stop the run if publication fails. Do not research that product
    again. A later run will retry only publication.
-3. Otherwise call `pv_next_product`. Leave `refresh_catalogue` enabled unless
-   the caller explicitly says the catalogue was just refreshed.
-4. If no product is found, report that the queue is complete and stop.
+3. Otherwise call the zero-argument `pv_next_product`. It reads only the active
+   server-side snapshot and can never connect to the source business database.
+4. If the result is `catalogue_not_loaded`, stop and ask the user to perform an
+   explicit manual refresh with the separate `pv-wiki-refresh-catalogue` skill.
+   If no unresearched product is found, report that the queue is complete and
+   stop.
 5. Research the exact product identity using only `mcp-exa-pool` tools. Search
    autonomously until the evidence supports a publish or non-publish decision.
    Do not impose fixed rounds, query counts, URL counts, credit limits, or a

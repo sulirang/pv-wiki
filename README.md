@@ -2,7 +2,7 @@
 
 PV Wiki turns a read-only PostgreSQL product catalogue into cited Wiki.js
 pages. Since version 0.4, the default runtime is a Hermes cron job with two
-small MCP servers:
+small MCP servers plus a separate manual catalogue-admin MCP:
 
 ```text
 Hermes cron (one fresh, serialized research session)
@@ -17,9 +17,15 @@ Hermes cron (one fresh, serialized research session)
         ├── pv_publish_result
         └── pv_research_status
                  │
-                 ├── read-only product catalogue
+                 ├── product_catalogue_snapshot
                  ├── product_research_completions
                  └── Wiki.js GraphQL API
+
+Explicit user request (never cron)
+  └── mcp-pv-wiki-catalogue-admin
+        └── pv_refresh_catalogue(username, password)
+                 ├── one read-only source PostgreSQL connection
+                 └── atomic product_catalogue_snapshot replacement
 ```
 
 Hermes owns the research plan and recurring schedule. The Exa MCP gateway
@@ -40,7 +46,8 @@ attempt, lease, retry, budget, timestamp, or action-ledger state.
 | --- | --- |
 | Hermes cron | Run one autonomous research session at a time and decide when enough evidence exists |
 | `pv-wiki-exa-mcp` | Expose the three Exa-compatible read-only tools through a health-aware API-key pool |
-| `pv-wiki-research-mcp` | Refresh the catalogue, select an unfinished product, save its first completion, and publish completed results |
+| `pv-wiki-research-mcp` | Read the offline snapshot, select an unfinished product, save its first completion, and publish completed results |
+| `pv-wiki-catalogue-mcp` | On explicit user request, use temporary credentials once to replace the product snapshot |
 | Completion store | Permanently exclude completed `product_id` values and retain pending publication state |
 | Publisher | Apply an already-completed publish decision to Wiki.js without invoking research |
 
@@ -86,6 +93,12 @@ Publication is deliberately separate:
 4. A Wiki.js failure leaves it pending. The next run retries publication only;
    it does not research the product again.
 
+A catalogue refresh changes future selection, not an already accepted
+completion. Removing a product from the active snapshot therefore does not
+cancel its pending publication; the completion retains the exact immutable
+product payload that was validated. Withdrawing an accepted publication is a
+separate operator action and is never inferred from a catalogue refresh.
+
 Opening the completion store also backfills products successfully published by
 the legacy worker. A legacy `products.last_success_at` row with no completion
 is inserted as already completed and published; `ON CONFLICT DO NOTHING`
@@ -105,6 +118,9 @@ Hermes decides how to research. Its recurring PV Wiki job must expose only:
 - `mcp-exa-pool`, restricted to `web_search_exa`,
   `web_search_advanced_exa`, and `web_fetch_exa`;
 - `mcp-pv-wiki`, restricted to the five `pv_*` tools shown above.
+
+The manual `mcp-pv-wiki-catalogue-admin` toolset must never appear in the
+recurring job.
 
 Do not enable Hermes native web, browser, terminal, delegation, or an Exa
 `agent_run` tool for the recurring job. This keeps every public-web request on
@@ -134,7 +150,9 @@ Follow [`deploy/hermes/README.md`](deploy/hermes/README.md) for the production
 layout and use its
 [`mcp-config.yaml.example`](deploy/hermes/mcp-config.yaml.example) as the
 Hermes MCP configuration template. The recurring research procedure is in
-[`skills/pv-wiki-research/SKILL.md`](skills/pv-wiki-research/SKILL.md).
+[`skills/pv-wiki-research/SKILL.md`](skills/pv-wiki-research/SKILL.md); explicit
+product-list updates use
+[`skills/pv-wiki-refresh-catalogue/SKILL.md`](skills/pv-wiki-refresh-catalogue/SKILL.md).
 
 For production, place the Exa keys in one mode-`0600` secret file. Also create
 a separate mode-`0600` receipt HMAC key file containing at least 32 random
@@ -145,11 +163,11 @@ EXA_API_KEYS_FILE=/run/secrets/pv-wiki-exa-keys
 PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
 ```
 
-Only file paths belong in MCP process configuration. Both stdio MCP processes
-receive the receipt-key path; only the Exa MCP receives the Exa-key path. Raw
-keys must
-not appear in Hermes configuration, prompts, skill files, command-line
-arguments, Git, or logs. `EXA_API_KEYS` and `EXA_API_KEY` remain code-level
+Only file paths belong in MCP process configuration. The Exa and research MCP
+processes receive the receipt-key path; only the Exa MCP receives the Exa-key
+path. These long-lived raw keys must not appear in Hermes configuration,
+prompts, skill files, command-line arguments, Git, or logs. `EXA_API_KEYS` and
+`EXA_API_KEY` remain code-level
 compatibility fallbacks for legacy migration, but the supported production
 deployment uses `EXA_API_KEYS_FILE`.
 
@@ -157,10 +175,17 @@ Configure the research-state MCP with:
 
 - `PV_WIKI_STATE_DATABASE_URL` for its dedicated production PostgreSQL state
   database (`PV_WIKI_STATE_PATH` is a local/test compatibility option);
-- `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, and an explicit
-  `PGSSLMODE` for the read-only catalogue;
 - the restricted `WIKIJS_URL` and `WIKIJS_TOKEN`, plus the desired Wiki.js
   path, locale, and new-page visibility settings.
+
+Configure the separate catalogue-admin MCP with the same state URL plus the
+fixed, non-secret `PGHOST`, `PGPORT`, `PGDATABASE`, explicit `PGSSLMODE`, and
+optional `PGSSLROOTCERT`. Do not configure `PGUSER` or `PGPASSWORD`. When the
+user explicitly requests an update, `pv_refresh_catalogue` accepts a temporary
+SELECT-only username/password for that single call, never writes or returns
+them, and closes the source connection after the full scan. Those tool inputs
+can still remain in Hermes/provider history, so use a short-lived role and
+revoke it immediately after the call.
 
 The bundled supplier registry supplies approved manufacturer aliases and
 domains for known brands. For deployment-specific brands, configure
@@ -178,15 +203,16 @@ The Hermes model is configured in Hermes itself. The research-state MCP does
 not need Exa or AI credentials, and the Exa MCP does not need catalogue,
 state-database, or Wiki.js credentials.
 
-Both MCP servers use stdio by default:
+All three MCP servers use stdio by default:
 
 ```bash
 pv-wiki-exa-mcp
 pv-wiki-research-mcp
+pv-wiki-catalogue-mcp
 ```
 
 Streamable HTTP is opt-in for separated deployments. It binds to loopback by
-default; do not publish either MCP endpoint directly to the Internet. See the
+default; do not publish any MCP endpoint directly to the Internet. See the
 deployment guide for the explicit transport, host, port, and private-network
 requirements.
 
@@ -197,9 +223,10 @@ must:
 
 1. Call `pv_pending_publication`. Publish the pending result before starting
    new research. If one is found, call `pv_publish_result` and end this run.
-2. Otherwise call `pv_next_product`. Its default `refresh_catalogue=true` performs the
-   read-only catalogue refresh before the completion anti-join.
-3. Stop cleanly when it returns `found=false`.
+2. Otherwise call the zero-argument `pv_next_product`; it reads only the active
+   server-side snapshot and has no source-database connection path.
+3. Stop and request an explicit manual refresh on `catalogue_not_loaded`; stop
+   normally on `no_unresearched_product`.
 4. Research the returned product using only the three Exa MCP tools.
 5. Submit decision schema version `2`, the returned `product_id` and
    `source_hash`, and each unchanged `url`/`content`/`receipt` tuple returned by

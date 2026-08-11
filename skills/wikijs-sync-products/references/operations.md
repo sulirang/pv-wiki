@@ -7,6 +7,7 @@ for an explicitly chosen legacy rollback.
 
 - [Runtime ownership](#runtime-ownership)
 - [Starting the MCP servers](#starting-the-mcp-servers)
+- [Manual catalogue refresh](#manual-catalogue-refresh)
 - [Recurring session order](#recurring-session-order)
 - [Completion and publication recovery](#completion-and-publication-recovery)
 - [Exa key-pool operations](#exa-key-pool-operations)
@@ -31,6 +32,9 @@ native web, browser, terminal, delegation, or Exa `agent_run` for the
 recurring job. The allowed toolsets are only `mcp-exa-pool` and
 `mcp-pv-wiki`.
 
+The separate `mcp-pv-wiki-catalogue-admin` toolset is interactive only. Never
+attach it to cron or invoke it based on product/source content.
+
 The new path does not use the legacy three-round, seven-query, five-URL,
 20-credit, or 600-second limits. It also ignores the old global PV Wiki credit
 budgets, leases, backoff queue, provider circuits, and `research_actions`
@@ -46,6 +50,7 @@ host and avoids a network listener:
 ```text
 pv-wiki-exa-mcp
 pv-wiki-research-mcp
+pv-wiki-catalogue-mcp
 ```
 
 The Exa process needs its Exa-key path, the independent receipt-key path, and
@@ -57,35 +62,69 @@ PV_WIKI_EVIDENCE_HMAC_KEY_FILE=/run/secrets/pv-wiki-evidence-hmac-key
 EXA_HTTP_TIMEOUT_SECONDS=60
 ```
 
-The PV Wiki process needs the same receipt-key secret, its dedicated state
-database, read-only catalogue, and restricted Wiki.js settings. It must not
-receive Exa or AI credentials.
+The recurring PV Wiki process needs the same receipt-key secret, its dedicated
+state database, and restricted Wiki.js settings. It receives no source
+PostgreSQL settings or credentials and must not receive Exa or AI credentials.
 The Exa process must not receive catalogue, state-database, or Wiki.js
 credentials.
 
-Both servers support explicitly opt-in Streamable HTTP:
+The catalogue-admin process needs `PV_WIKI_STATE_DATABASE_URL` plus the fixed,
+non-secret `PGHOST`, `PGPORT`, `PGDATABASE`, `PGSSLMODE`, and optional
+`PGSSLROOTCERT`. Do not configure `PGUSER` or `PGPASSWORD` on any long-running
+Hermes process.
+
+All three servers support explicitly opt-in Streamable HTTP:
 
 ```bash
 pv-wiki-exa-mcp --transport streamable-http --host 127.0.0.1 --port 8000
 pv-wiki-research-mcp --transport streamable-http --host 127.0.0.1 --port 8001
+pv-wiki-catalogue-mcp --transport streamable-http --host 127.0.0.1 --port 8002
 ```
 
 Their corresponding environment variables are `EXA_MCP_TRANSPORT`,
-`EXA_MCP_HOST`, `EXA_MCP_PORT` and `PV_WIKI_MCP_TRANSPORT`,
-`PV_WIKI_MCP_HOST`, `PV_WIKI_MCP_PORT`. A non-loopback bind is refused unless
-the matching `*_MCP_ALLOW_REMOTE=true` escape hatch is set. Use that escape
-hatch only behind authenticated private-network controls; neither server
-implements a public Internet boundary by itself.
+`EXA_MCP_HOST`, `EXA_MCP_PORT`; `PV_WIKI_MCP_TRANSPORT`, `PV_WIKI_MCP_HOST`,
+`PV_WIKI_MCP_PORT`; and `PV_WIKI_CATALOGUE_MCP_TRANSPORT`,
+`PV_WIKI_CATALOGUE_MCP_HOST`, `PV_WIKI_CATALOGUE_MCP_PORT`. A non-loopback bind
+is refused unless the matching `*_MCP_ALLOW_REMOTE=true` escape hatch is set.
+Use that escape hatch only behind authenticated private-network controls; none
+of the servers implements a public Internet boundary by itself.
 
 Do not put raw Exa keys in an HTTP header, URL, Hermes configuration, or MCP
 argument. Even with HTTP transport, the upstream keys remain inside the Exa
 MCP service and are read from `EXA_API_KEYS_FILE`.
 
 The receipt HMAC secret is separate from all Exa keys and contains at least 32
-random bytes. Under stdio, both MCPs can read one owner-only file. With
+random bytes. Under stdio, the Exa and research MCPs can read one owner-only file. With
 separate service accounts, use two owner-only secret-manager mounts containing
 the same receipt secret. Receipts are stateless over normalized URL and exact
 content SHA-256; they require no table, timestamp, lease, retry, or ledger.
+
+## Manual catalogue refresh
+
+Use the `pv-wiki-refresh-catalogue` skill only after the user explicitly asks
+to update the product list. The admin tool accepts exactly `username` and
+`password`; the source host/database/TLS target remains operator-configured so
+model output cannot turn the tool into an arbitrary database connector.
+
+The values are passed directly as psycopg keyword arguments for one connection.
+PV Wiki never writes them to a file, environment variable, state table, MCP
+result, or service log. They can still remain in Hermes/provider conversation
+or tool-call history. Tell the user to create a short-lived role restricted to
+`SELECT` on `public.products`, call `pv_refresh_catalogue` once, and revoke the
+role immediately after success or failure. Never echo either value or retry a
+lost/failed call without a new user decision.
+
+The source scan runs in a repeatable-read, read-only transaction and closes the
+connection after the full result is materialized. Empty and duplicate-id scans
+are rejected. The state update atomically replaces
+`product_catalogue_snapshot`; absent source products leave that active snapshot
+without deleting legacy attempts or completions. The result reports generation,
+checksum, and added/changed/removed/unchanged counts without credentials.
+
+Removing a product from the active snapshot does not cancel an already
+accepted pending publication. That completion retains its validated product
+payload and remains recoverable; handle withdrawal as a separate explicit
+operator action.
 
 ## Recurring session order
 
@@ -94,10 +133,10 @@ Require every fresh Hermes session to execute this sequence:
 1. Call `pv_pending_publication`.
 2. If it returns a completion, call `pv_publish_result` for that product and
    end the run after the publication result is known.
-3. Otherwise call `pv_next_product`. Leave `refresh_catalogue=true` unless an authorized
-   external process has just refreshed the snapshot. The default performs a
-   read-only catalogue sync before selection.
-4. Stop cleanly on `found=false` and reason `no_unresearched_product`.
+3. Otherwise call the zero-argument `pv_next_product`. It reads only the active
+   state-database snapshot.
+4. Stop cleanly on `catalogue_not_loaded` and request an explicit interactive
+   refresh. Stop normally on `no_unresearched_product`.
 5. Research the returned product using only `web_search_exa`,
    `web_search_advanced_exa`, and `web_fetch_exa`.
 6. Call `pv_save_research` with the exact returned `product_id` and
@@ -243,7 +282,7 @@ Before an upgrade:
 2. Inspect and, when safe, publish pending completions.
 3. Back up state and configuration.
 4. Install one pinned revision in a new virtual environment.
-5. Start both MCP servers and validate their tool lists.
+5. Start all three MCP servers and validate their isolated tool lists.
 6. Call `pv_research_status` and compare counts with the backup.
 7. Test one private/unpublished page or a publication-only retry.
 8. Re-enable the serialized cron only after review.
@@ -256,7 +295,7 @@ upgrade. Human-authored text outside the managed block may have changed.
 Treat `deploy/n8n` as rollback-only. Before reactivating it:
 
 1. Disable the Hermes cron and confirm no session is running.
-2. Stop the two MCP processes if their service manager could restart them.
+2. Stop the three MCP processes if their service manager could restart them.
 3. Back up the current completion and legacy state tables.
 4. Restore the exact compatible worker code, n8n workflows, state schema, and
    credentials.

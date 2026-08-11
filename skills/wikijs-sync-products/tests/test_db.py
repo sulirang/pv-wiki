@@ -90,7 +90,10 @@ class ProductReaderTests(unittest.TestCase):
         self.assertEqual(products[0].asdict(), products[0].as_dict())
         self.assertEqual(
             connection.fake_cursor.executions[0],
-            ("SET TRANSACTION READ ONLY", None),
+            (
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+                None,
+            ),
         )
         query, parameters = connection.fake_cursor.executions[1]
         self.assertIn("FROM public.products", query)
@@ -199,6 +202,36 @@ class ProductReaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(reader.iter_products(batch_size=0))
         connector.assert_not_called()
+
+    def test_connection_closes_when_cursor_close_fails(self):
+        connection = FakeConnection([])
+
+        def fail_cursor_close():
+            connection.fake_cursor.closed = True
+            raise RuntimeError("cursor close failed")
+
+        connection.fake_cursor.close = fail_cursor_close
+        with self.assertRaisesRegex(RuntimeError, "cursor close failed"):
+            db.ProductReader(lambda: connection).fetch_products()
+
+        self.assertTrue(connection.fake_cursor.closed)
+        self.assertTrue(connection.rolled_back)
+        self.assertTrue(connection.closed)
+
+    def test_connection_closes_when_rollback_fails(self):
+        connection = FakeConnection([])
+
+        def fail_rollback():
+            connection.rolled_back = True
+            raise RuntimeError("rollback failed")
+
+        connection.rollback = fail_rollback
+        with self.assertRaisesRegex(RuntimeError, "rollback failed"):
+            db.ProductReader(lambda: connection).fetch_products()
+
+        self.assertTrue(connection.fake_cursor.closed)
+        self.assertTrue(connection.rolled_back)
+        self.assertTrue(connection.closed)
 
 
 if __name__ == "__main__":
