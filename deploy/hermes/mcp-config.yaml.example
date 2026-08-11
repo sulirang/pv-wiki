@@ -1,0 +1,135 @@
+# Merge this block into ~/.hermes/config.yaml. Server names are deliberate:
+# Hermes derives mcp-exa-pool and mcp-pv-wiki for recurring research, plus the
+# manual-only mcp-pv-wiki-catalogue-admin toolset.
+mcp_servers:
+  exa-pool:
+    command: "/opt/pv-wiki/.venv/bin/pv-wiki-exa-mcp"
+    args: []
+    env:
+      # This is a path, not a key. Keep raw Exa keys out of Hermes config and
+      # ~/.hermes/.env; the Exa MCP reads and rotates the protected file.
+      EXA_API_KEYS_FILE: "/run/secrets/pv-wiki/exa-keys"
+      # Independent from every Exa API key. Both MCPs need the same receipt
+      # secret so fetched content can be verified at the save boundary.
+      PV_WIKI_EVIDENCE_HMAC_KEY_FILE: "/run/secrets/pv-wiki/evidence-hmac-key"
+      EXA_HTTP_TIMEOUT_SECONDS: "60"
+    enabled: true
+    connect_timeout: 30
+    timeout: 360
+    supports_parallel_tool_calls: false
+    sampling:
+      enabled: false
+    elicitation:
+      enabled: false
+    tools:
+      include:
+        - web_search_exa
+        - web_search_advanced_exa
+        - web_fetch_exa
+      resources: false
+      prompts: false
+
+  pv-wiki:
+    command: "/opt/pv-wiki/.venv/bin/pv-wiki-research-mcp"
+    args: []
+    env:
+      PV_WIKI_EVIDENCE_HMAC_KEY_FILE: "/run/secrets/pv-wiki/evidence-hmac-key"
+      PV_WIKI_STATE_DATABASE_URL: "${PV_WIKI_STATE_DATABASE_URL}"
+      WIKIJS_URL: "${WIKIJS_URL}"
+      WIKIJS_TOKEN: "${WIKIJS_TOKEN}"
+      WIKIJS_LOCALE: "${WIKIJS_LOCALE}"
+      WIKIJS_PATH_PREFIX: "${WIKIJS_PATH_PREFIX}"
+      WIKIJS_NEW_PAGE_PRIVATE: "${WIKIJS_NEW_PAGE_PRIVATE}"
+      WIKIJS_NEW_PAGE_PUBLISHED: "${WIKIJS_NEW_PAGE_PUBLISHED}"
+      PV_WIKI_HTTP_TIMEOUT: "${PV_WIKI_HTTP_TIMEOUT}"
+      # Optional publication-authority settings. Uncomment only after defining
+      # them in the Hermes service environment; never let model output choose
+      # these values.
+      # PV_WIKI_PUBLIC_BRAND_ALIASES_JSON: "${PV_WIKI_PUBLIC_BRAND_ALIASES_JSON}"
+      # PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON: "${PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON}"
+      # PV_WIKI_AUTO_PUBLISH_MIN_CONFIDENCE: "${PV_WIKI_AUTO_PUBLISH_MIN_CONFIDENCE}"
+      # PV_WIKI_MIN_FACT_CONFIDENCE: "${PV_WIKI_MIN_FACT_CONFIDENCE}"
+      # PV_WIKI_ALLOW_MIRRORS: "${PV_WIKI_ALLOW_MIRRORS}"
+    enabled: true
+    connect_timeout: 30
+    timeout: 360
+    supports_parallel_tool_calls: false
+    sampling:
+      enabled: false
+    elicitation:
+      enabled: false
+    tools:
+      include:
+        - pv_pending_publication
+        - pv_next_product
+        - pv_save_research
+        - pv_publish_result
+        - pv_research_status
+      resources: false
+      prompts: false
+
+  # Interactive/manual sessions only. The recurring cron's enabled_toolsets
+  # must never include this server. PGHOST/PGDATABASE are non-secret endpoint
+  # settings; the temporary username/password are supplied once as tool inputs
+  # only after the user explicitly requests a catalogue update.
+  pv-wiki-catalogue-admin:
+    command: "/opt/pv-wiki/.venv/bin/pv-wiki-catalogue-mcp"
+    args: []
+    env:
+      PV_WIKI_STATE_DATABASE_URL: "${PV_WIKI_STATE_DATABASE_URL}"
+      PGHOST: "${PGHOST}"
+      PGPORT: "${PGPORT}"
+      PGDATABASE: "${PGDATABASE}"
+      PGSSLMODE: "${PGSSLMODE}"
+      # Required for verify-ca/verify-full unless the host trust store already
+      # contains the issuing CA. Define it first, then uncomment this line.
+      # PGSSLROOTCERT: "${PGSSLROOTCERT}"
+    enabled: true
+    connect_timeout: 30
+    timeout: 360
+    supports_parallel_tool_calls: false
+    sampling:
+      enabled: false
+    elicitation:
+      enabled: false
+    tools:
+      include:
+        - pv_refresh_catalogue
+      resources: false
+      prompts: false
+
+# Optional service-isolated Streamable HTTP form. Use this instead of, never in
+# addition to, each corresponding command/args entry. Start the MCP daemons
+# separately with their secrets, bind to loopback, and keep the endpoint off the
+# public Internet:
+#
+# mcp_servers:
+#   exa-pool:
+#     url: "http://127.0.0.1:8000/mcp"
+#     enabled: true
+#     timeout: 360
+#     supports_parallel_tool_calls: false
+#     tools:
+#       include: [web_search_exa, web_search_advanced_exa, web_fetch_exa]
+#       resources: false
+#       prompts: false
+#   pv-wiki:
+#     url: "http://127.0.0.1:8001/mcp"
+#     enabled: true
+#     timeout: 360
+#     supports_parallel_tool_calls: false
+#     tools:
+#       include:
+#         [pv_pending_publication, pv_next_product, pv_save_research,
+#          pv_publish_result, pv_research_status]
+#       resources: false
+#       prompts: false
+#   pv-wiki-catalogue-admin:
+#     url: "http://127.0.0.1:8002/mcp"
+#     enabled: true
+#     timeout: 360
+#     supports_parallel_tool_calls: false
+#     tools:
+#       include: [pv_refresh_catalogue]
+#       resources: false
+#       prompts: false

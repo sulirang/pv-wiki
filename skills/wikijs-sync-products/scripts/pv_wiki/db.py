@@ -1,11 +1,11 @@
 """Read-only access to the product catalogue in PostgreSQL.
 
-The module deliberately imports :mod:`psycopg` only when a connection is
-opened.  A deployment can therefore use the state and rendering utilities
-without installing the PostgreSQL driver.  libpq's standard ``PG*``
-environment variables remain the source of connection configuration, while a
-validated, operator-selected ``sslmode`` is passed explicitly so a service
-file cannot silently change the transport policy.
+The module deliberately imports :mod:`psycopg` only when a source connection
+is opened. A deployment can therefore use the state and rendering utilities
+without opening the business database. The manual Hermes endpoint takes only
+non-secret host/database/TLS settings from the environment and receives a
+temporary username/password explicitly for one connection. The legacy CLI
+continues to support libpq's standard ``PG*`` environment variables.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ WHERE COALESCE(updated_at, created_at) >= %s
 ORDER BY COALESCE(updated_at, created_at), product_id
 """.strip()
 
-_READ_ONLY_TRANSACTION = "SET TRANSACTION READ ONLY"
+_READ_ONLY_TRANSACTION = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
 _ALLOWED_SSLMODES = frozenset(
     {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
 )
@@ -68,6 +68,16 @@ class DatabaseConfigurationError(RuntimeError):
 
 class DatabaseDependencyError(RuntimeError):
     """Raised when the optional PostgreSQL driver is unavailable."""
+
+
+def _psycopg_module() -> Any:
+    try:
+        import psycopg  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - exact import path is env-specific
+        raise DatabaseDependencyError(
+            "PostgreSQL access requires psycopg 3; install it in the runtime"
+        ) from exc
+    return psycopg
 
 
 def validate_postgres_sslmode() -> str:
@@ -93,6 +103,105 @@ def validate_postgres_sslmode() -> str:
             "or verify-full; unknown modes are refused"
         )
     return normalized
+
+
+def _required_connection_text(value: Any, *, name: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise DatabaseConfigurationError(f"{name} must be a string")
+    normalized = value.strip()
+    if not normalized or len(normalized) > maximum or any(
+        character in normalized for character in ("\x00", "\r", "\n")
+    ):
+        raise DatabaseConfigurationError(f"{name} is invalid")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogueEndpoint:
+    """Non-secret source endpoint used by the manual catalogue MCP."""
+
+    host: str
+    port: int
+    database: str
+    sslmode: str
+    sslrootcert: str | None = None
+    connect_timeout: int = 30
+
+    @classmethod
+    def from_environment(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> "CatalogueEndpoint":
+        values = os.environ if environ is None else environ
+        host = _required_connection_text(
+            values.get("PGHOST"), name="PGHOST", maximum=255
+        )
+        database = _required_connection_text(
+            values.get("PGDATABASE"), name="PGDATABASE", maximum=128
+        )
+        raw_port = values.get("PGPORT", "5432")
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise DatabaseConfigurationError("PGPORT must be an integer") from exc
+        if not 1 <= port <= 65_535:
+            raise DatabaseConfigurationError("PGPORT must be between 1 and 65535")
+
+        raw_sslmode = values.get("PGSSLMODE", "")
+        if not isinstance(raw_sslmode, str) or not raw_sslmode.strip():
+            raise DatabaseConfigurationError("PGSSLMODE is required")
+        sslmode = raw_sslmode.strip().casefold()
+        if sslmode not in _ALLOWED_SSLMODES:
+            raise DatabaseConfigurationError(
+                "PGSSLMODE must be disable, allow, prefer, require, verify-ca, "
+                "or verify-full"
+            )
+
+        sslrootcert = values.get("PGSSLROOTCERT", "").strip() or None
+        if sslrootcert is not None:
+            sslrootcert = _required_connection_text(
+                sslrootcert,
+                name="PGSSLROOTCERT",
+                maximum=4096,
+            )
+        raw_timeout = values.get("PV_WIKI_CATALOGUE_CONNECT_TIMEOUT", "30")
+        try:
+            connect_timeout = int(raw_timeout)
+        except (TypeError, ValueError) as exc:
+            raise DatabaseConfigurationError(
+                "PV_WIKI_CATALOGUE_CONNECT_TIMEOUT must be an integer"
+            ) from exc
+        if not 1 <= connect_timeout <= 120:
+            raise DatabaseConfigurationError(
+                "PV_WIKI_CATALOGUE_CONNECT_TIMEOUT must be between 1 and 120"
+            )
+        return cls(
+            host=host,
+            port=port,
+            database=database,
+            sslmode=sslmode,
+            sslrootcert=sslrootcert,
+            connect_timeout=connect_timeout,
+        )
+
+    def connect(self, *, username: str, password: str) -> Any:
+        """Open one source connection without changing process environment."""
+
+        user = _required_connection_text(username, name="username", maximum=128)
+        if not isinstance(password, str) or not password or len(password) > 4096:
+            raise DatabaseConfigurationError("password is invalid")
+        kwargs: dict[str, Any] = {
+            "host": self.host,
+            "port": self.port,
+            "dbname": self.database,
+            "user": user,
+            "password": password,
+            "sslmode": self.sslmode,
+            "connect_timeout": self.connect_timeout,
+        }
+        if self.sslrootcert is not None:
+            kwargs["sslrootcert"] = self.sslrootcert
+        return _psycopg_module().connect(**kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,18 +252,10 @@ def _connect_from_environment() -> Any:
 
     sslmode = validate_postgres_sslmode()
 
-    try:
-        import psycopg  # type: ignore[import-not-found]
-    except ImportError as exc:  # pragma: no cover - exact import path is env-specific
-        raise DatabaseDependencyError(
-            "PostgreSQL access requires psycopg 3; install it in the runtime "
-            "and configure the connection with standard PG* environment variables"
-        ) from exc
-
     # Passing no DSN makes libpq consult PGHOST, PGPORT, PGDATABASE, PGUSER,
     # PGPASSWORD, PGSERVICE, and the other standard variables.  The explicit
     # keyword prevents a service file from changing the validated mode.
-    return psycopg.connect(sslmode=sslmode)
+    return _psycopg_module().connect(sslmode=sslmode)
 
 
 class ProductReader:
@@ -201,13 +302,20 @@ class ProductReader:
                 for row in rows:
                     yield Product.from_row(row)
         finally:
-            if cursor is not None:
-                cursor.close()
-            # End the read transaction without ever committing session state.
-            rollback = getattr(connection, "rollback", None)
-            if rollback is not None:
-                rollback()
-            connection.close()
+            try:
+                if cursor is not None:
+                    cursor.close()
+            finally:
+                try:
+                    # End the read transaction without ever committing session
+                    # state.
+                    rollback = getattr(connection, "rollback", None)
+                    if rollback is not None:
+                        rollback()
+                finally:
+                    # Closing the source connection is mandatory even if cursor
+                    # cleanup or rollback itself fails.
+                    connection.close()
 
     def fetch_products(
         self,

@@ -11,6 +11,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy" / "n8n"
 BACKUP_DEPLOY = ROOT / "deploy" / "backup"
+HERMES_DEPLOY = ROOT / "deploy" / "hermes"
 
 
 class ComposeTests(unittest.TestCase):
@@ -109,6 +110,50 @@ class ComposeTests(unittest.TestCase):
         )
         self.assertIs(systemd["services"]["pv-wiki-worker"]["init"], True)
         self.assertTrue(systemd["networks"]["state_database"]["external"])
+
+
+class HermesDeploymentTests(unittest.TestCase):
+    def test_research_cron_has_no_source_database_credentials_or_refresh_tool(self) -> None:
+        config = yaml.safe_load(
+            (HERMES_DEPLOY / "mcp-config.yaml.example").read_text(encoding="utf-8")
+        )
+        servers = config["mcp_servers"]
+        self.assertEqual(
+            {"exa-pool", "pv-wiki", "pv-wiki-catalogue-admin"},
+            set(servers),
+        )
+        research = servers["pv-wiki"]
+        self.assertFalse(
+            any(str(name).startswith("PG") for name in research["env"]),
+            research["env"],
+        )
+        self.assertEqual(
+            {
+                "pv_pending_publication",
+                "pv_next_product",
+                "pv_save_research",
+                "pv_publish_result",
+                "pv_research_status",
+            },
+            set(research["tools"]["include"]),
+        )
+
+        admin = servers["pv-wiki-catalogue-admin"]
+        self.assertEqual(["pv_refresh_catalogue"], admin["tools"]["include"])
+        self.assertNotIn("PGUSER", admin["env"])
+        self.assertNotIn("PGPASSWORD", admin["env"])
+        self.assertNotIn("password", json.dumps(config).casefold())
+
+        guide = (HERMES_DEPLOY / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            'enabled_toolsets=["mcp-exa-pool", "mcp-pv-wiki"]',
+            guide,
+        )
+        self.assertNotIn(
+            'enabled_toolsets=["mcp-exa-pool", "mcp-pv-wiki", '
+            '"mcp-pv-wiki-catalogue-admin"]',
+            guide,
+        )
 
 
 class WorkflowTemplateTests(unittest.TestCase):

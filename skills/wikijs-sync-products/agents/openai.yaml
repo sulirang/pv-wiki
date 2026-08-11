@@ -1,0 +1,4 @@
+interface:
+  display_name: "PV Wiki Hermes Installer"
+  short_description: "Deploy and operate the Hermes PV Wiki integration"
+  default_prompt: "Use $wikijs-sync-products to install or validate the Hermes-based PV Wiki deployment."

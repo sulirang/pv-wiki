@@ -1,5 +1,15 @@
 # n8n deployment
 
+> [!WARNING]
+> **Legacy rollback path only.** Version 0.4 uses the Hermes cron deployment in
+> [`deploy/hermes`](../hermes/README.md) with the rotating-key Exa MCP and PV
+> Wiki research-state MCP. Do not deploy this n8n worker for a new installation,
+> and never run its product workflow concurrently with the Hermes cron. The
+> rounds, queries, extract-URL, credit, wall-clock, global-budget, lease, retry,
+> provider-circuit, and action-ledger controls documented below apply only to
+> this preserved version 0.3 rollback worker; they do not constrain the Hermes
+> research path.
+
 This directory deploys two separate applications:
 
 - n8n, with its own PostgreSQL database and persistent `/home/node/.n8n`

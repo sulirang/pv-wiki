@@ -1,0 +1,4 @@
+interface:
+  display_name: "PV Wiki Catalogue Refresh"
+  short_description: "Refresh the product snapshot on explicit request"
+  default_prompt: "Use $pv-wiki-refresh-catalogue to refresh the PV Wiki product snapshot once after I provide temporary read-only database credentials."

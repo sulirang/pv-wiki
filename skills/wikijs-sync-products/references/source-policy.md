@@ -1,5 +1,12 @@
 # Source and AI decision policy
 
+> **Legacy orchestration reference:** version 0.4 reuses the identity,
+> source-authority, and fact-grounding checks documented here, but Hermes owns
+> research and scheduling. References below to bounded rounds, leases, retry
+> queues, or automatic rechecks apply only to the preserved legacy worker. The
+> active Hermes procedure is
+> [`skills/pv-wiki-research/SKILL.md`](../../pv-wiki-research/SKILL.md).
+
 ## Entity match
 
 The catalogue name may be either a public model or a longer description. When
