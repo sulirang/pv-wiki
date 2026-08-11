@@ -2,15 +2,146 @@
 
 from __future__ import annotations
 
+import ipaddress
+import json
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 class ConfigError(ValueError):
     """Raised when runtime configuration is missing or unsafe."""
+
+
+class TrustedSourceNotConfigured(LookupError):
+    """Raised only by the legacy strict single-brand lookup helper."""
+
+
+_PLACEHOLDER_PREFIXES = ("replace-me", "replace-with-", "<replace-")
+_COMMON_COUNTRY_PUBLIC_SUFFIX_LABELS = frozenset(
+    {"ac", "co", "com", "edu", "gov", "net", "org"}
+)
+_KNOWN_SHARED_HOST_SUFFIXES = frozenset(
+    {
+        "amazonaws.com",
+        "appspot.com",
+        "azurewebsites.net",
+        "azureedge.net",
+        "backblazeb2.com",
+        "blob.core.windows.net",
+        "blogspot.com",
+        "box.com",
+        "canva.site",
+        "carrd.co",
+        "cloudfront.net",
+        "cloudfunctions.net",
+        "digitaloceanspaces.com",
+        "docs.google.com",
+        "drive.google.com",
+        "dropbox.com",
+        "facebook.com",
+        "firebaseapp.com",
+        "ghost.io",
+        "github.io",
+        "githubusercontent.com",
+        "gitlab.io",
+        "groups.google.com",
+        "hashnode.dev",
+        "herokuapp.com",
+        "instagram.com",
+        "issuu.com",
+        "linkedin.com",
+        "linodeobjects.com",
+        "medium.com",
+        "myshopify.com",
+        "netlify.app",
+        "notion.site",
+        "notion.so",
+        "onrender.com",
+        "onedrive.live.com",
+        "pages.dev",
+        "r2.cloudflarestorage.com",
+        "r2.dev",
+        "readthedocs.io",
+        "reddit.com",
+        "run.app",
+        "scribd.com",
+        "sharepoint.com",
+        "sites.google.com",
+        "slideshare.net",
+        "storage.googleapis.com",
+        "substack.com",
+        "surge.sh",
+        "tumblr.com",
+        "twitter.com",
+        "vercel.app",
+        "wasabisys.com",
+        "web.app",
+        "weebly.com",
+        "wixsite.com",
+        "workers.dev",
+        "wordpress.com",
+        "x.com",
+        "youtube.com",
+        "youtu.be",
+    }
+)
+
+
+def is_shared_source_hostname(hostname: str) -> bool:
+    """Reject IP literals and hosts controlled by unrelated public tenants."""
+
+    if not isinstance(hostname, str):
+        return False
+    host = hostname.strip().rstrip(".").casefold()
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return True
+    return any(
+        host == suffix or host.endswith(f".{suffix}")
+        for suffix in _KNOWN_SHARED_HOST_SUFFIXES
+    )
+
+
+def is_placeholder_value(value: str) -> bool:
+    """Return whether an example value was left in a live configuration."""
+
+    return (
+        isinstance(value, str)
+        and value.strip().casefold().startswith(_PLACEHOLDER_PREFIXES)
+    )
+
+
+def redact_environment_secrets(
+    message: str,
+    names: Iterable[str],
+    *,
+    limit: int,
+) -> str:
+    """Redact configured secrets, including every key in a rotation list."""
+
+    candidates: set[str] = set()
+    for name in names:
+        value = os.getenv(name, "")
+        if not value:
+            continue
+        candidates.add(value)
+        if name == "EXA_API_KEYS":
+            candidates.update(
+                part for part in re.split(r"[\s,]+", value) if part
+            )
+    for secret in sorted(candidates, key=len, reverse=True):
+        message = message.replace(secret, "[REDACTED]")
+    return message[:limit]
 
 
 def _float_env(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -48,11 +179,45 @@ def _int_env(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 def state_path() -> Path:
-    raw = os.getenv("PV_WIKI_STATE_PATH", "~/.hermes/data/pv-wiki/state.sqlite3")
+    raw = os.getenv(
+        "PV_WIKI_STATE_PATH",
+        "~/.local/state/pv-wiki/state.sqlite3",
+    )
     path = Path(raw).expanduser()
     if not path.name:
         raise ConfigError("PV_WIKI_STATE_PATH must name a file")
     return path
+
+
+def state_target() -> str | Path:
+    """Return the configured PostgreSQL DSN or legacy SQLite path."""
+
+    database_url = os.getenv("PV_WIKI_STATE_DATABASE_URL", "").strip()
+    if not database_url:
+        return state_path()
+    parsed = urlsplit(database_url)
+    if (
+        parsed.scheme not in {"postgres", "postgresql"}
+        or not parsed.hostname
+        or not parsed.username
+        or not parsed.password
+        or not unquote(parsed.path).strip("/")
+    ):
+        raise ConfigError(
+            "PV_WIKI_STATE_DATABASE_URL must be a PostgreSQL URL with "
+            "host, database, username, and password"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigError(
+            "PV_WIKI_STATE_DATABASE_URL has an invalid port"
+        ) from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError(
+            "PV_WIKI_STATE_DATABASE_URL has an invalid port"
+        )
+    return database_url
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +226,8 @@ class WikiSettings:
     token: str
     locale: str
     path_prefix: str
+    home_path: str
+    home_title: str
     timeout: float
     new_page_private: bool
     new_page_published: bool
@@ -71,8 +238,12 @@ class WikiSettings:
         token = os.getenv("WIKIJS_TOKEN", "").strip()
         locale = os.getenv("WIKIJS_LOCALE", "en").strip()
         prefix = os.getenv("WIKIJS_PATH_PREFIX", "products").strip().strip("/")
+        home_path = os.getenv("WIKIJS_HOME_PATH", "home").strip().strip("/")
+        home_title = os.getenv("WIKIJS_HOME_TITLE", "PV Wiki").strip()
         if not base_url or not token:
             raise ConfigError("WIKIJS_URL and WIKIJS_TOKEN are required")
+        if is_placeholder_value(token):
+            raise ConfigError("WIKIJS_TOKEN still contains an example placeholder")
         parsed = urlsplit(base_url)
         if parsed.scheme != "https" or not parsed.hostname or parsed.path not in {"", "/"}:
             raise ConfigError("WIKIJS_URL must be an HTTPS origin without a path")
@@ -80,14 +251,92 @@ class WikiSettings:
             raise ConfigError("WIKIJS_LOCALE is invalid")
         if not prefix or not re.fullmatch(r"[A-Za-z0-9/_-]+", prefix):
             raise ConfigError("WIKIJS_PATH_PREFIX contains unsafe characters")
+        if (
+            not home_path
+            or not re.fullmatch(r"[A-Za-z0-9/_-]+", home_path)
+            or "//" in home_path
+        ):
+            raise ConfigError("WIKIJS_HOME_PATH contains unsafe characters")
+        if (
+            not home_title
+            or len(home_title) > 200
+            or any(ord(character) < 32 for character in home_title)
+        ):
+            raise ConfigError("WIKIJS_HOME_TITLE is invalid")
         return cls(
             base_url=base_url,
             token=token,
             locale=locale,
             path_prefix=prefix,
+            home_path=home_path,
+            home_title=home_title,
             timeout=_float_env("PV_WIKI_HTTP_TIMEOUT", 30.0, 1.0, 120.0),
             new_page_private=_bool_env("WIKIJS_NEW_PAGE_PRIVATE", True),
             new_page_published=_bool_env("WIKIJS_NEW_PAGE_PUBLISHED", False),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchSettings:
+    """Hard-bounded budgets for one product's inner research loop."""
+
+    max_rounds: int
+    max_queries: int
+    max_credits: int
+    max_seconds: float
+
+    @classmethod
+    def from_env(cls) -> "ResearchSettings":
+        return cls(
+            max_rounds=_int_env(
+                "PV_WIKI_RESEARCH_MAX_ROUNDS",
+                3,
+                1,
+                3,
+            ),
+            max_queries=_int_env(
+                "PV_WIKI_RESEARCH_MAX_QUERIES",
+                7,
+                3,
+                7,
+            ),
+            max_credits=_int_env(
+                "PV_WIKI_RESEARCH_MAX_CREDITS",
+                20,
+                3,
+                100,
+            ),
+            max_seconds=_float_env(
+                "PV_WIKI_RESEARCH_MAX_SECONDS",
+                600.0,
+                60.0,
+                1200.0,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalResearchBudgetSettings:
+    """UTC stop-loss limits across all products; zero disables one window."""
+
+    daily_credit_limit: int
+    monthly_credit_limit: int
+
+    @classmethod
+    def from_env(cls) -> "GlobalResearchBudgetSettings":
+        return cls(
+            daily_credit_limit=_int_env(
+                "PV_WIKI_GLOBAL_DAILY_CREDIT_LIMIT",
+                0,
+                0,
+                1_000_000,
+            ),
+            monthly_credit_limit=_int_env(
+                "PV_WIKI_GLOBAL_MONTHLY_CREDIT_LIMIT",
+                0,
+                0,
+                10_000_000,
+            ),
         )
 
 
@@ -104,25 +353,488 @@ def allow_mirrors() -> bool:
 
 
 def include_internal_search_hints() -> bool:
-    return _bool_env("PV_WIKI_TAVILY_INCLUDE_INTERNAL_HINTS", False)
+    return _bool_env("PV_WIKI_SEARCH_INCLUDE_INTERNAL_HINTS", False)
 
 
 def max_extract_chars() -> int:
     return _int_env("PV_WIKI_MAX_EXTRACT_CHARS", 30_000, 1_000, 200_000)
 
 
+def _validated_source_domain(value: object) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(
+            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON values must be hostnames"
+        )
+    domain = value.strip().rstrip(".").casefold()
+    labels = domain.split(".")
+    is_public_suffix = is_shared_source_hostname(domain) or (
+        len(labels) == 2
+        and len(labels[-1]) == 2
+        and labels[0] in _COMMON_COUNTRY_PUBLIC_SUFFIX_LABELS
+    )
+    if (
+        not domain
+        or len(domain) > 253
+        or "://" in domain
+        or "/" in domain
+        or "*" in domain
+        or is_public_suffix
+        or not re.fullmatch(
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            domain,
+        )
+    ):
+        raise ConfigError(
+            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON values must be narrow hostnames, "
+            "not public or shared hosting suffixes"
+        )
+    return domain
+
+
+def _validated_excluded_search_domain(value: object) -> str:
+    """Validate an Exa exclusion hostname, including known shared hosts."""
+
+    if not isinstance(value, str):
+        raise ConfigError(
+            "bundled excluded search domains must be hostname strings"
+        )
+    domain = value.strip().rstrip(".").casefold()
+    if (
+        not domain
+        or len(domain) > 253
+        or "://" in domain
+        or "/" in domain
+        or "*" in domain
+        or not re.fullmatch(
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            domain,
+        )
+    ):
+        raise ConfigError(
+            "bundled excluded search domains must be narrow hostnames"
+        )
+    return domain
+
+
+@lru_cache(maxsize=1)
+def _bundled_supplier_registry() -> dict[str, object]:
+    """Load and validate the versioned operator-owned supplier registry."""
+
+    path = Path(__file__).with_name("suppliers.json")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ConfigError("bundled suppliers.json is missing or invalid") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or not isinstance(value.get("brands"), dict)
+        or len(value["brands"]) > 500
+    ):
+        raise ConfigError("bundled suppliers.json has an invalid root schema")
+
+    raw_excluded = value.get("excluded_search_domains", [])
+    if (
+        not isinstance(raw_excluded, list)
+        or len(raw_excluded) > 50
+    ):
+        raise ConfigError(
+            "bundled suppliers.json excluded_search_domains is invalid"
+        )
+    excluded = tuple(
+        _validated_excluded_search_domain(domain) for domain in raw_excluded
+    )
+
+    brands: dict[str, dict[str, object]] = {}
+    for raw_code, raw_entry in value["brands"].items():
+        if (
+            not isinstance(raw_code, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,50}", raw_code)
+            or not isinstance(raw_entry, dict)
+        ):
+            raise ConfigError("bundled suppliers.json contains an invalid brand")
+        code = raw_code.casefold()
+        if code in brands:
+            raise ConfigError(
+                "bundled suppliers.json contains duplicate brand codes"
+            )
+        kind = raw_entry.get("kind")
+        if kind not in {"manufacturer", "category", "unassigned"}:
+            raise ConfigError(
+                f"bundled supplier {raw_code} has an invalid kind"
+            )
+        manufacturer = raw_entry.get("manufacturer", "")
+        if not isinstance(manufacturer, str) or len(manufacturer) > 200:
+            raise ConfigError(
+                f"bundled supplier {raw_code} has an invalid manufacturer"
+            )
+        manufacturer = " ".join(manufacturer.split())
+        if kind == "manufacturer" and (
+            not manufacturer
+            or not any(character.isalpha() for character in manufacturer)
+        ):
+            raise ConfigError(
+                f"bundled supplier {raw_code} needs a public manufacturer"
+            )
+        if kind != "manufacturer" and manufacturer:
+            raise ConfigError(
+                f"bundled supplier {raw_code} cannot declare a manufacturer"
+            )
+
+        raw_aliases = raw_entry.get("aliases", [])
+        if (
+            not isinstance(raw_aliases, list)
+            or len(raw_aliases) > 20
+            or any(
+                not isinstance(alias, str)
+                or not alias.strip()
+                or len(alias.strip()) > 200
+                for alias in raw_aliases
+            )
+        ):
+            raise ConfigError(
+                f"bundled supplier {raw_code} has invalid aliases"
+            )
+        aliases = tuple(" ".join(alias.split()) for alias in raw_aliases)
+
+        raw_domains = raw_entry.get("domains", [])
+        if not isinstance(raw_domains, list) or len(raw_domains) > 20:
+            raise ConfigError(
+                f"bundled supplier {raw_code} has invalid domains"
+            )
+        domains: list[dict[str, str]] = []
+        seen_domains: set[str] = set()
+        for raw_domain in raw_domains:
+            if (
+                not isinstance(raw_domain, dict)
+                or set(raw_domain) != {"host", "role"}
+                or not isinstance(raw_domain.get("role"), str)
+                or not re.fullmatch(
+                    r"[a-z][a-z0-9_]{1,49}",
+                    raw_domain["role"],
+                )
+            ):
+                raise ConfigError(
+                    f"bundled supplier {raw_code} has an invalid domain entry"
+                )
+            host = _validated_source_domain(raw_domain.get("host"))
+            if host in seen_domains:
+                raise ConfigError(
+                    f"bundled supplier {raw_code} has duplicate domains"
+                )
+            seen_domains.add(host)
+            domains.append({"host": host, "role": raw_domain["role"]})
+
+        description = raw_entry.get("description", "")
+        public_category = raw_entry.get("public_category", "")
+        if (
+            not isinstance(description, str)
+            or len(description) > 200
+            or not isinstance(public_category, str)
+            or len(public_category) > 100
+        ):
+            raise ConfigError(
+                f"bundled supplier {raw_code} has invalid descriptive fields"
+            )
+        brands[code] = {
+            "code": raw_code,
+            "kind": kind,
+            "manufacturer": manufacturer,
+            "aliases": aliases,
+            "domains": tuple(domains),
+            "description": " ".join(description.split()),
+            "public_category": " ".join(public_category.split()),
+        }
+    return {
+        "schema_version": 1,
+        "excluded_search_domains": excluded,
+        "brands": brands,
+    }
+
+
+def supplier_registry_entry(brand_code: str | None) -> dict[str, object]:
+    """Return one approved supplier/category record by catalogue code."""
+
+    brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
+    if not brand:
+        return {}
+    brands = _bundled_supplier_registry()["brands"]
+    assert isinstance(brands, dict)
+    entry = brands.get(brand)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def supplier_search_excluded_domains() -> frozenset[str]:
+    """Return operator-maintained low-value domains for open-web fallback."""
+
+    domains = _bundled_supplier_registry()["excluded_search_domains"]
+    assert isinstance(domains, tuple)
+    return frozenset(domains)
+
+
+def supplier_public_category(brand_code: str | None) -> str:
+    """Return a public category only for codes explicitly marked as categories."""
+
+    entry = supplier_registry_entry(brand_code)
+    if entry.get("kind") != "category":
+        return ""
+    value = entry.get("public_category")
+    return value if isinstance(value, str) else ""
+
+
+def _bundled_supplier_domains(brand_code: str | None) -> frozenset[str]:
+    entry = supplier_registry_entry(brand_code)
+    domains = entry.get("domains")
+    if not isinstance(domains, tuple):
+        return frozenset()
+    return frozenset(
+        item["host"]
+        for item in domains
+        if isinstance(item, dict) and isinstance(item.get("host"), str)
+    )
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigError(
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON has duplicate keys"
+            )
+        result[key] = value
+    return result
+
+
+def _unique_public_alias_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON has duplicate keys"
+            )
+        result[key] = value
+    return result
+
+
+def public_brand_alias_map() -> dict[str, str]:
+    """Return operator-approved public manufacturer names by catalogue brand.
+
+    Catalogue brand codes are internal authority boundaries.  The configured
+    value is the public manufacturer identity that may be sent to providers
+    and used for automatic manufacturer-domain verification.
+    """
+
+    raw = os.getenv("PV_WIKI_PUBLIC_BRAND_ALIASES_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=_unique_public_alias_object,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ConfigError(
+            "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON must be a JSON object"
+        ) from exc
+    if not isinstance(value, dict) or len(value) > 500:
+        raise ConfigError(
+            "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON must be a JSON object "
+            "with at most 500 entries"
+        )
+
+    mapping: dict[str, str] = {}
+    for raw_brand, raw_alias in value.items():
+        if (
+            not isinstance(raw_brand, str)
+            or not raw_brand.strip()
+            or len(raw_brand.strip()) > 200
+            or any(ord(character) < 32 for character in raw_brand)
+        ):
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON keys must be non-empty "
+                "catalogue brand strings"
+            )
+        brand = raw_brand.strip().casefold()
+        if brand in mapping:
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON has duplicate "
+                "case-insensitive catalogue brands"
+            )
+        if (
+            not isinstance(raw_alias, str)
+            or not raw_alias.strip()
+            or len(raw_alias.strip()) > 200
+            or any(ord(character) < 32 for character in raw_alias)
+            or not any(character.isalpha() for character in raw_alias)
+            or len(
+                "".join(
+                    character
+                    for character in raw_alias.casefold()
+                    if character.isalnum()
+                )
+            ) < 2
+            or "://" in raw_alias
+            or any(character in raw_alias for character in "{}[]<>")
+        ):
+            raise ConfigError(
+                "PV_WIKI_PUBLIC_BRAND_ALIASES_JSON values must be bounded "
+                "public manufacturer names"
+            )
+        mapping[brand] = " ".join(raw_alias.split())
+    return mapping
+
+
+def public_brand_alias(brand_code: str | None) -> str:
+    """Resolve an explicitly approved public name for one catalogue brand."""
+
+    brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
+    if not brand:
+        return ""
+    configured = public_brand_alias_map().get(brand)
+    if configured is not None:
+        return configured
+    entry = supplier_registry_entry(brand)
+    manufacturer = entry.get("manufacturer")
+    return (
+        manufacturer
+        if entry.get("kind") == "manufacturer"
+        and isinstance(manufacturer, str)
+        else ""
+    )
+
+
+def trusted_source_domain_map() -> dict[str, frozenset[str]]:
+    """Return optional overrides keyed by public manufacturer or legacy brand.
+
+    The map is a fast path for official hosts whose domain name does not
+    resemble the public manufacturer name.  It is deliberately optional:
+    ordinary manufacturer hosts can be verified from the current bounded
+    extract by the decision validator.
+    """
+
+    raw = os.getenv("PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw, object_pairs_hook=_unique_json_object)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ConfigError(
+            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON must be a JSON object"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ConfigError(
+            "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON must be a JSON object"
+        )
+    mapping: dict[str, frozenset[str]] = {}
+    for raw_brand, raw_domains in value.items():
+        if (
+            not isinstance(raw_brand, str)
+            or not raw_brand.strip()
+            or len(raw_brand.strip()) > 200
+            or any(ord(character) < 32 for character in raw_brand)
+        ):
+            raise ConfigError(
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON keys must be non-empty "
+                "brand code or manufacturer alias strings"
+            )
+        brand = raw_brand.strip().casefold()
+        if brand in mapping:
+            raise ConfigError(
+                "PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON has duplicate identities"
+            )
+        if (
+            not isinstance(raw_domains, list)
+            or not raw_domains
+            or len(raw_domains) > 50
+        ):
+            raise ConfigError(
+                "each trusted source identity must have 1-50 domain strings"
+            )
+        mapping[brand] = frozenset(
+            _validated_source_domain(domain) for domain in raw_domains
+        )
+    return mapping
+
+
+def trusted_source_domains(brand_code: str) -> frozenset[str]:
+    """Resolve trusted domains for one exact catalogue brand code."""
+
+    if not isinstance(brand_code, str) or not brand_code.strip():
+        raise TrustedSourceNotConfigured(
+            "a non-empty catalogue brand_code is required for trusted publishing"
+        )
+    domains = trusted_source_domains_for_product(brand_code, None)
+    if not domains:
+        raise TrustedSourceNotConfigured(
+            "no trusted source domains are configured for this catalogue brand_code"
+        )
+    return domains
+
+
+def trusted_source_domains_for_product(
+    brand_code: str | None,
+    discovered_manufacturer: str | None,
+) -> frozenset[str]:
+    """Return the override bound to the operator-owned catalogue identity.
+
+    ``discovered_manufacturer`` remains in the signature for compatibility,
+    but model output is never allowed to select or replace a trusted-domain
+    entry.  Operators can map legacy brand codes directly in the trusted
+    domain map and publish a separate public name via the explicit alias map.
+    """
+
+    mapping = trusted_source_domain_map()
+    brand = brand_code.strip().casefold() if isinstance(brand_code, str) else ""
+    if not brand:
+        return frozenset()
+    alias = public_brand_alias(brand).casefold()
+    brand_domains = mapping.get(brand, frozenset())
+    alias_domains = mapping.get(alias, frozenset()) if alias else frozenset()
+    if brand_domains and alias_domains and brand_domains != alias_domains:
+        raise ConfigError(
+            "trusted source domains conflict between the catalogue brand "
+            "and its explicit public alias"
+        )
+    configured = brand_domains or alias_domains
+    return configured or _bundled_supplier_domains(brand)
+
+
 def missing_environment(names: list[str] | tuple[str, ...]) -> list[str]:
-    return [name for name in names if not os.getenv(name, "").strip()]
+    return [
+        name
+        for name in names
+        if not os.getenv(name, "").strip()
+        or is_placeholder_value(os.getenv(name, ""))
+    ]
 
 
 __all__ = [
     "ConfigError",
+    "GlobalResearchBudgetSettings",
+    "ResearchSettings",
+    "TrustedSourceNotConfigured",
     "WikiSettings",
     "allow_mirrors",
     "include_internal_search_hints",
+    "is_shared_source_hostname",
+    "is_placeholder_value",
     "max_extract_chars",
     "min_fact_confidence",
     "min_publish_confidence",
     "missing_environment",
+    "public_brand_alias",
+    "public_brand_alias_map",
+    "redact_environment_secrets",
     "state_path",
+    "state_target",
+    "supplier_public_category",
+    "supplier_registry_entry",
+    "supplier_search_excluded_domains",
+    "trusted_source_domain_map",
+    "trusted_source_domains",
+    "trusted_source_domains_for_product",
 ]

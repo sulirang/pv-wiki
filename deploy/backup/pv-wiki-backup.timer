@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily PV Wiki and n8n recovery backup
+
+[Timer]
+OnCalendar=*-*-* 03:50:00 UTC
+Persistent=true
+RandomizedDelaySec=15m
+Unit=pv-wiki-backup.service
+
+[Install]
+WantedBy=timers.target

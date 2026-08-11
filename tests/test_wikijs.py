@@ -345,6 +345,18 @@ class WikiJSProtocolTests(unittest.TestCase):
 
 
 class WikiJSUpsertTests(unittest.TestCase):
+    def test_new_managed_tag_replaces_legacy_hermes_tag(self) -> None:
+        merged = wikijs._merge_page_tags(
+            ["managed-by-hermes", "human-review", "brand-old"],
+            ["managed-by-pv-wiki", "brand-new"],
+        )
+
+        self.assertIn("managed-by-pv-wiki", merged)
+        self.assertIn("human-review", merged)
+        self.assertIn("brand-new", merged)
+        self.assertNotIn("managed-by-hermes", merged)
+        self.assertNotIn("brand-old", merged)
+
     def test_create_uses_exact_lookup_and_all_page_fields(self) -> None:
         created = page(content=render.merge_auto_block("", "generated"))
         opener = ScriptedOpener(
@@ -435,6 +447,7 @@ class WikiJSUpsertTests(unittest.TestCase):
             content=current,
             tags=(
                 "brand-old",
+                "category-old",
                 "human-review",
                 "product",
                 "source-mirror",
@@ -464,6 +477,7 @@ class WikiJSUpsertTests(unittest.TestCase):
             render.AUTO_BEGIN + "\nnew\n" + render.AUTO_END,
             [
                 "brand-new",
+                "category-new",
                 "datasheet-found",
                 "managed-by-hermes",
                 "product",
@@ -472,7 +486,7 @@ class WikiJSUpsertTests(unittest.TestCase):
         )
 
         self.assertEqual("updated", result["action"])
-        self.assertIn("HermesCheckPageConflicts", opener.calls[1][2]["query"])
+        self.assertIn("PVWikiCheckPageConflicts", opener.calls[1][2]["query"])
         self.assertEqual(
             {"id": 42, "checkoutDate": "2026-07-14T00:00:00.000Z"},
             opener.calls[1][2]["variables"],
@@ -513,6 +527,7 @@ class WikiJSUpsertTests(unittest.TestCase):
         self.assertEqual(
             [
                 "brand-new",
+                "category-new",
                 "datasheet-found",
                 "human-review",
                 "managed-by-hermes",
@@ -522,6 +537,7 @@ class WikiJSUpsertTests(unittest.TestCase):
             variables["tags"],
         )
         self.assertNotIn("brand-old", variables["tags"])
+        self.assertNotIn("category-old", variables["tags"])
         self.assertNotIn("source-mirror", variables["tags"])
 
     def test_conflict_refuses_update(self) -> None:
@@ -608,9 +624,9 @@ class WikiJSUpsertTests(unittest.TestCase):
 
         self.assertEqual("updated", result["action"])
         self.assertEqual(5, len(opener.calls))
-        self.assertIn("HermesCreatePage", opener.calls[1][2]["query"])
-        self.assertIn("HermesPageByPath", opener.calls[2][2]["query"])
-        self.assertIn("HermesUpdatePage", opener.calls[4][2]["query"])
+        self.assertIn("PVWikiCreatePage", opener.calls[1][2]["query"])
+        self.assertIn("PVWikiPageByPath", opener.calls[2][2]["query"])
+        self.assertIn("PVWikiUpdatePage", opener.calls[4][2]["query"])
 
 
 if __name__ == "__main__":

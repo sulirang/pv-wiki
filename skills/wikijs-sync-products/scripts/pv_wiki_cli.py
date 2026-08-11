@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run PV wiki directly from an installed Hermes skill directory."""
+"""Run the PV Wiki worker from a source checkout."""
 
 from pv_wiki.cli import main
 

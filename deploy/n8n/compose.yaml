@@ -1,0 +1,115 @@
+name: pv-wiki-automation
+
+services:
+  n8n-db:
+    image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE in .env}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: n8n
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${N8N_DB_PASSWORD:?set N8N_DB_PASSWORD in .env}
+    volumes:
+      - n8n_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - database
+
+  pv-wiki-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    env_file:
+      - worker.env
+    volumes:
+      - type: bind
+        source: ${CATALOGUE_CA_PATH:?set CATALOGUE_CA_PATH in .env}
+        target: /run/pv-wiki/catalogue-ca.pem
+        read_only: true
+    expose:
+      - "8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - automation
+      - state_database
+
+  n8n:
+    image: ${N8N_IMAGE:?set N8N_IMAGE in .env}
+    restart: unless-stopped
+    depends_on:
+      n8n-db:
+        condition: service_healthy
+      pv-wiki-worker:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${N8N_PORT:-5678}:5678"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:?set N8N_DB_PASSWORD in .env}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      N8N_HOST: ${N8N_DOMAIN:?set N8N_DOMAIN in .env}
+      N8N_PROTOCOL: https
+      N8N_SECURE_COOKIE: "true"
+      N8N_PORT: 5678
+      N8N_EDITOR_BASE_URL: https://${N8N_DOMAIN}
+      WEBHOOK_URL: https://${N8N_DOMAIN}/
+      N8N_PROXY_HOPS: 1
+      GENERIC_TIMEZONE: Asia/Shanghai
+      TZ: Asia/Shanghai
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: 336
+      NODES_EXCLUDE: '["n8n-nodes-base.executeCommand","n8n-nodes-base.localFileTrigger"]'
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/files/workflows:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:5678/healthz/readiness').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - automation
+      - database
+
+networks:
+  automation:
+  database:
+    internal: true
+  state_database:
+    external: true
+    name: ${PV_WIKI_STATE_NETWORK:?set PV_WIKI_STATE_NETWORK in .env}
+
+volumes:
+  n8n_db_data:
+  n8n_data:

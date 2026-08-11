@@ -4,8 +4,8 @@ The module deliberately imports :mod:`psycopg` only when a connection is
 opened.  A deployment can therefore use the state and rendering utilities
 without installing the PostgreSQL driver.  libpq's standard ``PG*``
 environment variables remain the source of connection configuration, while a
-validated ``sslmode`` is passed explicitly so weaker service-file settings
-cannot downgrade the transport.
+validated, operator-selected ``sslmode`` is passed explicitly so a service
+file cannot silently change the transport policy.
 """
 
 from __future__ import annotations
@@ -57,7 +57,9 @@ ORDER BY COALESCE(updated_at, created_at), product_id
 """.strip()
 
 _READ_ONLY_TRANSACTION = "SET TRANSACTION READ ONLY"
-_ALLOWED_SSLMODES = frozenset({"disable", "allow", "prefer", "require", "verify-ca", "verify-full"})
+_ALLOWED_SSLMODES = frozenset(
+    {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+)
 
 
 class DatabaseConfigurationError(RuntimeError):
@@ -69,23 +71,26 @@ class DatabaseDependencyError(RuntimeError):
 
 
 def validate_postgres_sslmode() -> str:
-    """Return the normalized, mandatory PostgreSQL TLS mode.
+    """Return the normalized, explicitly selected PostgreSQL transport mode.
 
     The invalid value is deliberately omitted from errors because environment
-    input should not be copied into cron logs.  ``require`` is the minimum;
-    deployments with a verifiable CA and hostname should use ``verify-full``.
+    input should not be copied into scheduler logs. ``verify-full`` is
+    preferred. ``disable``, ``allow``, and ``prefer`` remain available for a
+    catalogue server that does not support TLS, when the operator accepts that
+    network risk.
     """
 
     raw = os.getenv("PGSSLMODE")
     if raw is None or not raw.strip():
         raise DatabaseConfigurationError(
-            "PGSSLMODE is required (disable, prefer, require, verify-ca, or verify-full)"
+            "PGSSLMODE is required (disable, allow, prefer, require, "
+            "verify-ca, or verify-full)"
         )
     normalized = raw.strip().casefold()
     if normalized not in _ALLOWED_SSLMODES:
         raise DatabaseConfigurationError(
-            "PGSSLMODE must be disable, prefer, require, verify-ca, or verify-full; "
-            "unknown modes are refused"
+            "PGSSLMODE must be disable, allow, prefer, require, verify-ca, "
+            "or verify-full; unknown modes are refused"
         )
     return normalized
 
@@ -148,7 +153,7 @@ def _connect_from_environment() -> Any:
 
     # Passing no DSN makes libpq consult PGHOST, PGPORT, PGDATABASE, PGUSER,
     # PGPASSWORD, PGSERVICE, and the other standard variables.  The explicit
-    # keyword prevents a service file from weakening the validated TLS mode.
+    # keyword prevents a service file from changing the validated mode.
     return psycopg.connect(sslmode=sslmode)
 
 

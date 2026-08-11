@@ -1,8 +1,9 @@
 """Deterministic, injection-resistant Markdown rendering for product pages.
 
 Only the block delimited by :data:`AUTO_BEGIN` and :data:`AUTO_END` belongs
-to Hermes.  Call :func:`merge_auto_block` before updating an existing page so
-text written by people outside that block remains byte-for-byte unchanged.
+to PV Wiki automation. Call :func:`merge_auto_block` before updating an
+existing page so text written by people outside that block remains
+byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -20,8 +21,10 @@ from datetime import date, datetime
 from typing import Any
 
 
-AUTO_BEGIN = "<!-- HERMES-AUTO:BEGIN -->"
-AUTO_END = "<!-- HERMES-AUTO:END -->"
+AUTO_BEGIN = "<!-- PV-WIKI-AUTO:BEGIN -->"
+AUTO_END = "<!-- PV-WIKI-AUTO:END -->"
+LEGACY_AUTO_BEGIN = "<!-- HERMES-AUTO:BEGIN -->"
+LEGACY_AUTO_END = "<!-- HERMES-AUTO:END -->"
 
 _BLOCKED_HOST_SUFFIXES = (
     ".localhost",
@@ -301,13 +304,14 @@ def _collect_sources(decision: Any) -> list[tuple[str, str, bool]]:
     return unique
 
 
-def _specifications(product: Any, decision: Any) -> list[tuple[str, Any]]:
-    merged: dict[str, Any] = {}
+def _specifications(product: Any, decision: Any) -> list[tuple[str, str, Any]]:
+    merged: dict[tuple[str, str], tuple[str, str, Any]] = {}
     for owner in (product, decision):
         value = _first(owner, ("specifications", "specs", "attributes", "facts"))
         if isinstance(value, Mapping):
             for key, item in value.items():
-                merged[_plain_text(key)] = item
+                name = _plain_text(key)
+                merged[("", name.casefold())] = ("", name, item)
         elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
             for item in value:
                 if not isinstance(item, Mapping):
@@ -318,16 +322,35 @@ def _specifications(product: Any, decision: Any) -> list[tuple[str, Any]]:
                     unit = _first(item, ("unit", "units"))
                     if unit is not None:
                         item_value = f"{_plain_text(item_value)} {_plain_text(unit)}"
-                    merged[_plain_text(key)] = item_value
-    return sorted(merged.items(), key=lambda item: (item[0].casefold(), item[0]))
+                    name = _plain_text(key)
+                    category = _plain_text(_get(item, "category"))
+                    merged[(category.casefold(), name.casefold())] = (
+                        category,
+                        name,
+                        item_value,
+                    )
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            item[0].casefold(),
+            item[0],
+            item[1].casefold(),
+            item[1],
+        ),
+    )
 
 
-def _product_rows(product: Any) -> list[tuple[str, Any]]:
+def _product_rows(product: Any, decision: Any) -> list[tuple[str, Any]]:
     fields = (
-        ("产品 ID", ("product_id", "id")),
-        ("品牌/制造商", ("manufacturer", "brand", "vendor", "maker", "brand_code")),
+        ("产品 ID", product, ("product_id", "id")),
+        (
+            "品牌/制造商",
+            decision,
+            ("manufacturer", "brand", "vendor", "maker"),
+        ),
         (
             "型号/料号",
+            decision,
             (
                 "model",
                 "model_number",
@@ -338,15 +361,35 @@ def _product_rows(product: Any) -> list[tuple[str, Any]]:
                 "code",
             ),
         ),
-        ("产品名称", ("product_name", "name", "title")),
-        ("产品系列", ("family_code", "family")),
-        ("类别", ("category", "product_type", "type")),
-        ("计量单位", ("unit_of_measure", "uom", "unit")),
-        ("数据库描述", ("description",)),
+        (
+            "产品类别",
+            decision,
+            ("product_category", "category", "product_type", "type"),
+        ),
+        ("产品名称", product, ("product_name", "name", "title")),
+        ("计量单位", product, ("unit_of_measure", "uom", "unit")),
+        ("数据库描述", product, ("description",)),
     )
     rows = []
-    for label, aliases in fields:
-        value = _first(product, aliases)
+    for label, owner, aliases in fields:
+        value = _first(owner, aliases)
+        if value is None and label == "品牌/制造商":
+            value = _first(
+                product, ("manufacturer", "brand", "vendor", "maker", "brand_code")
+            )
+        elif value is None and label == "型号/料号":
+            value = _first(
+                product,
+                (
+                    "model",
+                    "model_number",
+                    "part_number",
+                    "mpn",
+                    "sku",
+                    "product_code",
+                    "code",
+                ),
+            )
         if value is not None:
             rows.append((label, value))
     return rows
@@ -360,12 +403,241 @@ def _checked_at(value: Any) -> str:
     return _plain_text(value)
 
 
+def _internal_link(label: Any, path: Any) -> str:
+    """Build a safe root-relative Wiki.js link."""
+
+    clean_path = _plain_text(path).strip("/")
+    parts = clean_path.split("/")
+    if (
+        not clean_path
+        or any(not part or part in {".", ".."} for part in parts)
+        or any(ord(character) < 32 for character in clean_path)
+    ):
+        raise ValueError("internal Wiki.js path is invalid")
+    encoded = urllib.parse.quote(clean_path, safe="/-._~")
+    return f"[{_escape_markdown_text(label) or '查看'}](/{encoded})"
+
+
+def _tag_index_link(label: Any, prefix: str, value: Any) -> str:
+    tag = f"{prefix}-{stable_slug(value, max_length=64)}"
+    return _internal_link(label, f"t/{tag}")
+
+
+def _home_catalogue_entries(products: Sequence[Any]) -> list[dict[str, str]]:
+    if isinstance(products, (str, bytes, bytearray)) or not isinstance(
+        products, Sequence
+    ):
+        raise TypeError("published_products must be a sequence")
+
+    entries: list[dict[str, str]] = []
+    for index, product in enumerate(products):
+        product_id = _first(product, ("product_id", "id"))
+        title = _first(
+            product,
+            ("model", "product_name", "name", "title", "product_id", "id"),
+        )
+        wiki_path = _first(product, ("wiki_path", "path"))
+        published_at = _first(
+            product, ("published_at", "last_success_at", "updated_at")
+        )
+        if product_id is None or title is None or wiki_path is None:
+            raise ValueError(
+                f"published_products[{index}] needs product_id, title, and wiki_path"
+            )
+        published_text = _checked_at(published_at)
+        if not published_text:
+            raise ValueError(
+                f"published_products[{index}] needs a publication timestamp"
+            )
+        # Validate the path before it can influence counts or links.
+        _internal_link(title, wiki_path)
+        entries.append(
+            {
+                "product_id": _plain_text(product_id),
+                "title": _plain_text(title),
+                "brand": _plain_text(
+                    _first(
+                        product,
+                        ("manufacturer", "brand", "vendor", "maker", "brand_code"),
+                    )
+                ),
+                "category": _plain_text(
+                    _first(
+                        product,
+                        ("product_category", "category", "product_type", "type"),
+                    )
+                ),
+                "wiki_path": _plain_text(wiki_path).strip("/"),
+                "published_at": published_text,
+            }
+        )
+
+    # Select the newest successful publication if a caller supplies duplicates.
+    entries.sort(key=lambda item: (item["product_id"].casefold(), item["product_id"]))
+    entries.sort(key=lambda item: item["published_at"], reverse=True)
+    unique: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        unique.setdefault(entry["product_id"], entry)
+    return list(unique.values())
+
+
+def _group_counts(
+    entries: Sequence[Mapping[str, str]],
+    field: str,
+) -> list[tuple[str, int]]:
+    counts: dict[str, tuple[str, int]] = {}
+    for entry in entries:
+        value = entry.get(field, "").strip()
+        if not value:
+            continue
+        key = value.casefold()
+        label, count = counts.get(key, (value, 0))
+        counts[key] = (label, count + 1)
+    return sorted(
+        counts.values(),
+        key=lambda item: (-item[1], item[0].casefold(), item[0]),
+    )
+
+
+def _display_publication_date(value: str) -> str:
+    match = re.match(r"\d{4}-\d{2}-\d{2}", value)
+    return match.group(0) if match else value
+
+
+def render_home_page(
+    published_products: Sequence[Any],
+    *,
+    title: str = "PV Wiki",
+    recent_limit: int = 10,
+) -> str:
+    """Render a reader-facing Wiki.js product encyclopaedia landing page."""
+
+    if (
+        isinstance(recent_limit, bool)
+        or not isinstance(recent_limit, int)
+        or not 1 <= recent_limit <= 100
+    ):
+        raise ValueError("recent_limit must be an integer between 1 and 100")
+    clean_title = _plain_text(title)
+    if not clean_title:
+        raise ValueError("title must be non-empty")
+
+    entries = _home_catalogue_entries(published_products)
+    brands = _group_counts(entries, "brand")
+    categories = _group_counts(entries, "category")
+    unclassified = sum(1 for entry in entries if not entry["category"])
+    latest = (
+        _display_publication_date(entries[0]["published_at"]) if entries else "暂无"
+    )
+
+    lines = [
+        AUTO_BEGIN,
+        f"# {_escape_markdown_text(clean_title)}",
+        "",
+        "面向客户与新同事的产品百科。可按型号、品牌或产品类别查找已经核验的产品资料。",
+        "",
+        (
+            f"当前已更新 **{len(entries)}** 款产品，覆盖 **{len(brands)}** 个品牌"
+            f"和 **{len(categories)}** 个产品类别。"
+        ),
+        "",
+        "## 查找产品",
+        "",
+        "使用页面顶部的搜索框输入产品型号、品牌或产品 ID，或者从下面的品牌和类别入口开始浏览。",
+        "",
+        f"{_internal_link('浏览全部产品', 't/product')} · {_internal_link('浏览全部标签', 't')}",
+        "",
+        "## 收录概览",
+        "",
+        "| 指标 | 数量/时间 |",
+        "| --- | ---: |",
+        f"| 已更新产品 | {len(entries)} |",
+        f"| 已收录品牌 | {len(brands)} |",
+        f"| 已收录产品类别 | {len(categories)} |",
+        f"| 待分类产品 | {unclassified} |",
+        f"| 最近更新 | {escape_table_cell(latest)} |",
+        "",
+        "## 按产品类别浏览",
+        "",
+    ]
+    if categories:
+        lines.extend(
+            [
+                "| 产品类别 | 已更新产品 |",
+                "| --- | ---: |",
+                *(
+                    f"| {_tag_index_link(category, 'category', category)} | {count} |"
+                    for category, count in categories
+                ),
+            ]
+        )
+    else:
+        lines.append("暂无已分类产品。产品重新核验后会自动出现在这里。")
+
+    lines.extend(["", "## 按品牌浏览", ""])
+    if brands:
+        lines.extend(
+            [
+                "| 品牌 | 已更新产品 |",
+                "| --- | ---: |",
+                *(
+                    f"| {_tag_index_link(brand, 'brand', brand)} | {count} |"
+                    for brand, count in brands
+                ),
+            ]
+        )
+    else:
+        lines.append("暂无已收录品牌。")
+
+    lines.extend(["", "## 最近更新的产品", ""])
+    if entries:
+        lines.extend(
+            [
+                "| 产品 | 品牌 | 产品类别 | 更新时间 |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        for entry in entries[:recent_limit]:
+            product_link = _internal_link(entry["title"], entry["wiki_path"])
+            brand = (
+                _tag_index_link(entry["brand"], "brand", entry["brand"])
+                if entry["brand"]
+                else "待确认"
+            )
+            category = (
+                _tag_index_link(entry["category"], "category", entry["category"])
+                if entry["category"]
+                else "待分类"
+            )
+            lines.append(
+                f"| {product_link} | {brand} | {category} | "
+                f"{escape_table_cell(_display_publication_date(entry['published_at']))} |"
+            )
+    else:
+        lines.append("暂无已更新产品。")
+
+    lines.extend(
+        [
+            "",
+            "## 关于本 Wiki",
+            "",
+            (
+                "产品信息优先依据制造商官方数据表和可信公开资料整理。规格参数附有参考文献；"
+                "无法确认型号或资料相互冲突时，不会自动发布未经证实的结论。"
+            ),
+            "",
+            AUTO_END,
+        ]
+    )
+    return "\n".join(lines) + "\n"
+
+
 def render_product_page(
     product: Any,
     decision: Any | None,
     checked_at: Any | None = None,
 ) -> str:
-    """Render one complete Hermes-managed Markdown block.
+    """Render one complete PV Wiki-managed Markdown block.
 
     No current timestamp is generated implicitly; omitting ``checked_at``
     therefore produces byte-identical output for identical inputs.
@@ -380,14 +652,12 @@ def render_product_page(
         AUTO_BEGIN,
         f"# {_escape_markdown_text(title)}",
         "",
-        "> 此区块由 Hermes 自动维护；请在标记区块外添加人工内容。",
-        "",
-        "## 产品目录信息",
+        "## 产品信息",
         "",
         "| 字段 | 值 |",
         "| --- | --- |",
     ]
-    rows = _product_rows(product)
+    rows = _product_rows(product, decision)
     if rows:
         lines.extend(
             f"| {escape_table_cell(label)} | {escape_table_cell(value)} |"
@@ -396,26 +666,39 @@ def render_product_page(
     else:  # pragma: no cover - title guarantees a useful row for normal inputs
         lines.append("| 产品 | 未提供 |")
 
+    summary = _get(decision, "summary")
+    if summary is not None and _plain_text(summary):
+        lines.extend(["", _escape_markdown_text(summary)])
+
+    review_summary = _get(decision, "review_summary")
+    if review_summary is not None and _plain_text(review_summary):
+        lines.extend(
+            [
+                "",
+                f"**市场与用户反馈：** {_escape_markdown_text(review_summary)}",
+            ]
+        )
+
     specifications = _specifications(product, decision)
     if specifications:
-        lines.extend(["", "## 规格参数", "", "| 参数 | 值 |", "| --- | --- |"])
         lines.extend(
-            f"| {escape_table_cell(key)} | {escape_table_cell(value)} |"
-            for key, value in specifications
+            [
+                "",
+                "## 规格参数",
+                "",
+                "| 类别 | 参数 | 值 |",
+                "| --- | --- | --- |",
+            ]
+        )
+        lines.extend(
+            (
+                f"| {escape_table_cell(category or '其他')} | "
+                f"{escape_table_cell(key)} | {escape_table_cell(value)} |"
+            )
+            for category, key, value in specifications
         )
 
     sources = _collect_sources(decision)
-    datasheets = [source for source in sources if source[2]]
-    related = [source for source in sources if not source[2]]
-    lines.extend(["", "## Datasheet", ""])
-    if datasheets:
-        lines.extend(f"- {markdown_link(label, url)}" for label, url, _ in datasheets)
-    else:
-        lines.append("- 未找到可验证的公开 datasheet。")
-
-    if related:
-        lines.extend(["", "## 相关资料", ""])
-        lines.extend(f"- {markdown_link(label, url)}" for label, url, _ in related)
 
     conflicts = [
         item
@@ -446,17 +729,11 @@ def render_product_page(
                 f"{_escape_markdown_text(values)}{suffix}"
             )
 
-    summary = _first(
-        decision,
-        ("summary", "reasoning", "assessment", "notes", "decision_notes"),
-    )
     confidence = _get(decision, "confidence")
     outcome = _get(decision, "outcome")
     checked = _checked_at(checked_at)
-    if summary is not None or confidence is not None or outcome is not None or checked:
-        lines.extend(["", "## 检索判定", ""])
-        if summary is not None:
-            lines.append(_escape_markdown_text(summary))
+    if confidence is not None or outcome is not None or checked:
+        lines.extend(["", "## 资料核验", ""])
         if outcome is not None:
             lines.append(f"- 判定：{_escape_markdown_text(outcome)}")
         if confidence is not None:
@@ -472,6 +749,14 @@ def render_product_page(
             lines.append(f"- 置信度：{_escape_markdown_text(rendered_confidence)}")
         if checked:
             lines.append(f"- 核验时间：{_escape_markdown_text(checked)}")
+
+    lines.extend(["", "## 参考文献", ""])
+    if sources:
+        for label, url, is_datasheet in sources:
+            suffix = "（官方数据表）" if is_datasheet else ""
+            lines.append(f"- {markdown_link(label, url)}{suffix}")
+    else:
+        lines.append("- 暂无可验证的公开参考资料。")
 
     lines.extend(["", AUTO_END])
     return "\n".join(lines) + "\n"
@@ -494,7 +779,12 @@ def _canonical_managed_block(managed: str) -> str:
     else:
         raise ValueError("managed content must contain exactly one complete auto block")
 
-    if AUTO_BEGIN in body or AUTO_END in body:
+    if (
+        AUTO_BEGIN in body
+        or AUTO_END in body
+        or LEGACY_AUTO_BEGIN in body
+        or LEGACY_AUTO_END in body
+    ):
         raise ValueError("nested auto-block markers are not allowed")
     if body:
         return f"{AUTO_BEGIN}\n{body}\n{AUTO_END}"
@@ -502,7 +792,12 @@ def _canonical_managed_block(managed: str) -> str:
 
 
 def merge_auto_block(existing: str | None, managed: str) -> str:
-    """Replace only the Hermes block, preserving all human-authored bytes."""
+    """Replace only the automation block, preserving human-authored bytes.
+
+    Pages created by releases before the n8n worker migration used
+    ``HERMES-AUTO`` markers. A single well-formed legacy block is accepted and
+    replaced with the current ``PV-WIKI-AUTO`` block in-place.
+    """
 
     block = _canonical_managed_block(managed)
     if existing is None:
@@ -510,19 +805,37 @@ def merge_auto_block(existing: str | None, managed: str) -> str:
     if not isinstance(existing, str):
         raise TypeError("existing content must be a string or None")
 
-    begin_count = existing.count(AUTO_BEGIN)
-    end_count = existing.count(AUTO_END)
-    if begin_count == end_count == 0:
+    current_begin_count = existing.count(AUTO_BEGIN)
+    current_end_count = existing.count(AUTO_END)
+    legacy_begin_count = existing.count(LEGACY_AUTO_BEGIN)
+    legacy_end_count = existing.count(LEGACY_AUTO_END)
+    if (
+        current_begin_count
+        == current_end_count
+        == legacy_begin_count
+        == legacy_end_count
+        == 0
+    ):
         if not existing:
             return f"{block}\n"
         separator = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
         return f"{existing}{separator}{block}\n"
-    if begin_count != 1 or end_count != 1:
+    current_complete = (
+        current_begin_count == current_end_count == 1
+        and legacy_begin_count == legacy_end_count == 0
+    )
+    legacy_complete = (
+        legacy_begin_count == legacy_end_count == 1
+        and current_begin_count == current_end_count == 0
+    )
+    if not (current_complete or legacy_complete):
         raise ValueError("existing page has malformed or duplicate auto-block markers")
 
-    begin = existing.index(AUTO_BEGIN)
-    end = existing.index(AUTO_END)
-    if end < begin + len(AUTO_BEGIN):
+    begin_marker = AUTO_BEGIN if current_complete else LEGACY_AUTO_BEGIN
+    end_marker = AUTO_END if current_complete else LEGACY_AUTO_END
+    begin = existing.index(begin_marker)
+    end = existing.index(end_marker)
+    if end < begin + len(begin_marker):
         raise ValueError("existing page has auto-block markers in the wrong order")
-    end += len(AUTO_END)
+    end += len(end_marker)
     return f"{existing[:begin]}{block}{existing[end:]}"

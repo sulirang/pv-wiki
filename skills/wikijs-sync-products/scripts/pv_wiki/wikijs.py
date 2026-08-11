@@ -16,9 +16,14 @@ DEFAULT_TIMEOUT = 20.0
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 _DUPLICATE_PAGE_CODES = frozenset({6002, 6006})
 _MANAGED_TAGS = frozenset(
-    {"product", "datasheet-found", "managed-by-hermes"}
+    {
+        "product",
+        "datasheet-found",
+        "managed-by-hermes",
+        "managed-by-pv-wiki",
+    }
 )
-_MANAGED_TAG_PREFIXES = ("source-", "brand-", "family-")
+_MANAGED_TAG_PREFIXES = ("source-", "brand-", "category-", "family-")
 
 _PAGE_FIELDS = """
 id
@@ -58,7 +63,7 @@ tags { tag }
 """.strip()
 
 _SINGLE_BY_PATH = f"""
-query HermesPageByPath($locale: String!, $path: String!) {{
+query PVWikiPageByPath($locale: String!, $path: String!) {{
   pages {{
     singleByPath(locale: $locale, path: $path) {{
       {_PAGE_FIELDS}
@@ -68,7 +73,7 @@ query HermesPageByPath($locale: String!, $path: String!) {{
 """.strip()
 
 _CHECK_CONFLICTS = """
-query HermesCheckPageConflicts($id: Int!, $checkoutDate: Date!) {
+query PVWikiCheckPageConflicts($id: Int!, $checkoutDate: Date!) {
   pages {
     checkConflicts(id: $id, checkoutDate: $checkoutDate)
   }
@@ -76,7 +81,7 @@ query HermesCheckPageConflicts($id: Int!, $checkoutDate: Date!) {
 """.strip()
 
 _CREATE_PAGE = f"""
-mutation HermesCreatePage(
+mutation PVWikiCreatePage(
   $content: String!
   $description: String!
   $editor: String!
@@ -115,7 +120,7 @@ mutation HermesCreatePage(
 """.strip()
 
 _UPDATE_PAGE = f"""
-mutation HermesUpdatePage(
+mutation PVWikiUpdatePage(
   $id: Int!
   $content: String!
   $description: String!
@@ -307,7 +312,7 @@ def _merge_page_tags(
     existing_tags: Sequence[str],
     requested_tags: Sequence[str] | None,
 ) -> list[str]:
-    """Replace Hermes-owned tags while retaining every human-owned tag."""
+    """Replace PV Wiki-managed tags while retaining every human-owned tag."""
 
     human_tags = [tag for tag in existing_tags if not _is_managed_tag(tag)]
     return _normalize_tags([*human_tags, *_normalize_tags(requested_tags)])
@@ -410,7 +415,7 @@ class WikiJSClient:
                 "Authorization": f"Bearer {self.__token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "pv-wiki/1.0 (Wiki.js sync agent)",
+                "User-Agent": "pv-wiki/0.2 (Wiki.js worker)",
             },
             method="POST",
         )

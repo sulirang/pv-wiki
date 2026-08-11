@@ -13,7 +13,7 @@
   page fields. A detected conflict is terminal for the current lease. Wiki.js
   2.5 exposes no atomic compare-and-swap mutation, so this is best-effort; keep
   one worker and the check-to-update window short.
-- Ownership: preserve publish windows, page scripts/styles, and non-Hermes
+- Ownership: preserve publish windows, page scripts/styles, and human-owned
   tags. Replace only the known managed tag names/prefixes and auto block.
 - Validation: an HTTP 2xx response is insufficient. Reject top-level GraphQL
   `errors` and `responseResult.succeeded=false`.

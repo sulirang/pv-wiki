@@ -1,0 +1,212 @@
+{
+  "name": "PV Wiki - Product Cycle",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "59e201e8-924a-4d94-ae64-bf28a5c066f0",
+      "name": "Manual / New Key Start",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-800, 160]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "5 8 1 * *"
+            }
+          ]
+        }
+      },
+      "id": "880c75ed-3b3f-4bc2-96e2-06ea85af3830",
+      "name": "Monthly Credits Refresh",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-800, -40]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1,
+              "triggerAtMinute": 47
+            }
+          ]
+        }
+      },
+      "id": "8f0e4ab7-3f9b-42df-90f8-5b57f6f4483e",
+      "name": "Hourly Due Recovery",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-520, 260]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 3,
+              "triggerAtMinute": 17
+            }
+          ]
+        }
+      },
+      "id": "d4081786-bfde-414b-b91e-ea30a0a84316",
+      "name": "Daily Catalogue Recovery",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-800, 360]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pv-wiki-worker:8080/sync-catalogue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "4fb553d4-a3b0-4b86-83ae-d229ec231289",
+      "name": "Sync Catalogue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "position": [-520, 60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pv-wiki-worker:8080/refresh-catalogue",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "a57d4ca9-6588-4868-9dbc-b02c555a8fbe",
+      "name": "Refresh Catalogue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "position": [-520, 360]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pv-wiki-worker:8080/run-one",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 2700000
+        }
+      },
+      "id": "2cdf0411-34e7-468f-b00c-f5e3385f80c3",
+      "name": "Run One Product",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-220, 60]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d209f8b0-3f2d-49d9-91c7-8d67938dca4e",
+              "name": "batchStartedAt",
+              "value": "={{ $now.toMillis() }}",
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6991c665-0997-469c-a8d6-56a11db18ec6",
+      "name": "Initialize Batch",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-360, 60],
+      "notes": "One workflow execution may call /run-one at most 15 times and stops starting new calls after 45 minutes."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "62b0ed69-d64d-4fc0-a64a-28a556d55f85",
+              "leftValue": "={{ $json.processed === true && $runIndex < 14 && ($now.toMillis() - $('Initialize Batch').first().json.batchStartedAt) < 2700000 }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c4dfd873-9ae1-4fd3-adcf-0a7fb68f3bd5",
+      "name": "Continue While Processed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [80, 60],
+      "notes": "A zero-based run index below 14 permits at most 15 /run-one calls. The elapsed-time check prevents a new call after 45 minutes."
+    }
+  ],
+  "connections": {
+    "Manual / New Key Start": {
+      "main": [[{"node": "Sync Catalogue", "type": "main", "index": 0}]]
+    },
+    "Monthly Credits Refresh": {
+      "main": [[{"node": "Sync Catalogue", "type": "main", "index": 0}]]
+    },
+    "Hourly Due Recovery": {
+      "main": [[{"node": "Initialize Batch", "type": "main", "index": 0}]]
+    },
+    "Daily Catalogue Recovery": {
+      "main": [[{"node": "Refresh Catalogue", "type": "main", "index": 0}]]
+    },
+    "Sync Catalogue": {
+      "main": [[{"node": "Initialize Batch", "type": "main", "index": 0}]]
+    },
+    "Refresh Catalogue": {
+      "main": [[{"node": "Initialize Batch", "type": "main", "index": 0}]]
+    },
+    "Initialize Batch": {
+      "main": [[{"node": "Run One Product", "type": "main", "index": 0}]]
+    },
+    "Run One Product": {
+      "main": [[{"node": "Continue While Processed", "type": "main", "index": 0}]]
+    },
+    "Continue While Processed": {
+      "main": [
+        [{"node": "Run One Product", "type": "main", "index": 0}],
+        []
+      ]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Shanghai"
+  },
+  "tags": []
+}

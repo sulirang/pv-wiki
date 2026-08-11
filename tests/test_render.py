@@ -92,10 +92,72 @@ class UrlAndEscapingTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_home_page_is_a_deterministic_reader_catalogue(self) -> None:
+        products = [
+            {
+                "product_id": "HP-1",
+                "model": "HeatPro 1",
+                "manufacturer": "Acme",
+                "product_category": "热泵",
+                "wiki_path": "products/hp-1-a1",
+                "published_at": datetime(2026, 7, 18, tzinfo=timezone.utc),
+            },
+            {
+                "product_id": "INV-1",
+                "model": "SUN 1",
+                "manufacturer": "Huawei",
+                "product_category": "光伏逆变器",
+                "wiki_path": "products/inv-1-b2",
+                "published_at": datetime(2026, 7, 19, tzinfo=timezone.utc),
+            },
+            {
+                "product_id": "HP-2",
+                "model": "HeatPro 2",
+                "manufacturer": "Acme",
+                "product_category": "热泵",
+                "wiki_path": "products/hp-2-c3",
+                "published_at": datetime(2026, 7, 20, tzinfo=timezone.utc),
+            },
+        ]
+
+        rendered = render.render_home_page(
+            products,
+            title="PV Wiki",
+        )
+
+        self.assertTrue(rendered.startswith(render.AUTO_BEGIN + "\n"))
+        self.assertTrue(rendered.endswith(render.AUTO_END + "\n"))
+        self.assertIn("当前已更新 **3** 款产品", rendered)
+        self.assertIn("| 已更新产品 | 3 |", rendered)
+        self.assertIn("| [Acme](/t/brand-acme) | 2 |", rendered)
+        self.assertIn(
+            "| [热泵](/t/category-%E7%83%AD%E6%B3%B5) | 2 |",
+            rendered,
+        )
+        self.assertLess(rendered.index("HeatPro 2"), rendered.index("SUN 1"))
+        self.assertNotIn("Due now", rendered)
+        self.assertNotIn("family_code", rendered)
+        self.assertEqual(
+            rendered,
+            render.render_home_page(
+                list(reversed(products)),
+                title="PV Wiki",
+            ),
+        )
+
+    def test_empty_home_page_has_no_broken_tables_or_links(self) -> None:
+        rendered = render.render_home_page([], title="GTI 产品百科")
+
+        self.assertIn("当前已更新 **0** 款产品", rendered)
+        self.assertIn("暂无已分类产品", rendered)
+        self.assertIn("暂无已收录品牌", rendered)
+        self.assertIn("暂无已更新产品", rendered)
+
     def test_render_is_deterministic_and_sorts_unordered_content(self) -> None:
         product = {
             "product_id": "42",
             "brand_code": "ACME",
+            "family_code": "SO003",
             "product_name": "PV|42 <module>",
             "unit_of_measure": "piece",
         }
@@ -123,7 +185,14 @@ class RenderTests(unittest.TestCase):
         self.assertTrue(left.startswith(render.AUTO_BEGIN + "\n"))
         self.assertTrue(left.endswith(render.AUTO_END + "\n"))
         self.assertIn(r"PV\|42 &lt;module&gt;", left)
+        self.assertIn("| 产品 ID | 42 |", left)
         self.assertIn(r"Voltage\|input", left)
+        self.assertNotIn("Hermes 自动维护", left)
+        self.assertNotIn("SO003", left)
+        self.assertIn("## 产品信息", left)
+        self.assertIn("## 参考文献", left)
+        self.assertNotIn("## Datasheet", left)
+        self.assertNotIn("## 相关资料", left)
         self.assertLess(left.index("a.pdf"), left.index("b.pdf"))
         self.assertIn("2026-07-14T12:00:00+00:00", left)
 
@@ -140,7 +209,11 @@ class RenderTests(unittest.TestCase):
             {
                 "outcome": "publish",
                 "confidence": 0.93,
-                "summary": "Official source matched.",
+                "manufacturer": "Acme",
+                "model": "PV-42",
+                "product_category": "光伏逆变器",
+                "summary": "Acme PV-42 is a grid-connected inverter for commercial rooftops.",
+                "review_summary": "Installers praise its compact enclosure and clear commissioning workflow.",
                 "datasheets": [
                     {
                         "title": "Official datasheet",
@@ -152,11 +225,24 @@ class RenderTests(unittest.TestCase):
                 "facts": [
                     {
                         "name": "Input voltage",
+                        "category": "直流输入",
                         "value": 48,
                         "unit": "V",
                         "confidence": 0.95,
                         "evidence_urls": ["https://example.com/manual.html"],
                     }
+                ],
+                "sources": [
+                    {
+                        "title": "Installer review A",
+                        "url": "https://reviews.example.com/pv-42-a",
+                        "source_type": "community",
+                    },
+                    {
+                        "title": "Installer review B",
+                        "url": "https://reviews.example.com/pv-42-b",
+                        "source_type": "community",
+                    },
                 ],
                 "conflicts": [
                     {
@@ -168,7 +254,10 @@ class RenderTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("| Input voltage | 48 V |", rendered)
+        self.assertIn("| 产品类别 | 光伏逆变器 |", rendered)
+        self.assertIn("| 直流输入 | Input voltage | 48 V |", rendered)
+        self.assertIn("**市场与用户反馈：**", rendered)
+        self.assertIn("（官方数据表）", rendered)
         self.assertIn("[Input voltage（证据）](https://example.com/manual.html)", rendered)
         self.assertIn("- 判定：publish", rendered)
         self.assertIn("## 未解决的来源冲突", rendered)
@@ -201,6 +290,24 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(1, merged.count(render.AUTO_END))
         self.assertTrue(merged.startswith("Human notes\n\n"))
 
+    def test_migrates_one_legacy_hermes_block_in_place(self) -> None:
+        existing = (
+            "Manual before\n\n"
+            + render.LEGACY_AUTO_BEGIN
+            + "\nold generated text\n"
+            + render.LEGACY_AUTO_END
+            + "\n\nManual after\n"
+        )
+
+        merged = render.merge_auto_block(existing, "new generated text")
+
+        self.assertEqual(1, merged.count(render.AUTO_BEGIN))
+        self.assertEqual(1, merged.count(render.AUTO_END))
+        self.assertNotIn(render.LEGACY_AUTO_BEGIN, merged)
+        self.assertNotIn(render.LEGACY_AUTO_END, merged)
+        self.assertTrue(merged.startswith("Manual before\n\n"))
+        self.assertTrue(merged.endswith("\n\nManual after\n"))
+
     def test_malformed_existing_or_managed_markers_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             render.merge_auto_block(render.AUTO_BEGIN + "\nbroken", "new")
@@ -211,6 +318,27 @@ class MergeTests(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             render.merge_auto_block("", f"outside\n{render.AUTO_BEGIN}\nx\n{render.AUTO_END}")
+        with self.assertRaises(ValueError):
+            render.merge_auto_block(
+                "",
+                f"{render.LEGACY_AUTO_BEGIN}\nx\n{render.LEGACY_AUTO_END}",
+            )
+        with self.assertRaises(ValueError):
+            render.merge_auto_block(
+                render.AUTO_BEGIN
+                + "\nok\n"
+                + render.AUTO_END
+                + render.LEGACY_AUTO_BEGIN,
+                "new",
+            )
+        with self.assertRaises(ValueError):
+            render.merge_auto_block(
+                render.LEGACY_AUTO_BEGIN
+                + "\nok\n"
+                + render.LEGACY_AUTO_END
+                + render.AUTO_END,
+                "new",
+            )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,66 @@
+{
+  "name": "PV Wiki - Homepage Refresh",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "6c51f875-f1bf-42cf-8219-55e6623c59bc",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-360, 120]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 2,
+              "triggerAtMinute": 35
+            }
+          ]
+        }
+      },
+      "id": "684fac56-857d-4b04-9858-89b048d776cf",
+      "name": "Daily at 02:35",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-360, -80]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://pv-wiki-worker:8080/publish-home",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "8aebffbf-a576-4f2b-9e1a-f94de6531d0f",
+      "name": "Refresh Homepage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 60000,
+      "position": [-40, 20]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{"node": "Refresh Homepage", "type": "main", "index": 0}]]
+    },
+    "Daily at 02:35": {
+      "main": [[{"node": "Refresh Homepage", "type": "main", "index": 0}]]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Shanghai"
+  },
+  "tags": []
+}
