@@ -13,6 +13,10 @@ mcp_servers:
       # secret so fetched content can be verified at the save boundary.
       PV_WIKI_EVIDENCE_HMAC_KEY_FILE: "/run/secrets/pv-wiki/evidence-hmac-key"
       EXA_HTTP_TIMEOUT_SECONDS: "60"
+      # Optional exact operator-owned groups for cross-host PDF redirects.
+      # Without this setting, redirects must keep the same hostname. Shared
+      # multi-tenant hosts may never redirect across hostnames.
+      # PV_WIKI_PDF_TRUSTED_HOST_GROUPS_JSON: '[["docs.example.com","cdn.example.com"]]'
     enabled: true
     connect_timeout: 30
     timeout: 360

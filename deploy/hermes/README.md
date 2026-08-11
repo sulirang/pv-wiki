@@ -56,9 +56,12 @@ paths if necessary in `mcp-config.yaml.example`. The Exa MCP returns only HMAC
 receipts, never either secret; the PV Wiki MCP verifies the receipts before it
 accepts extracted evidence.
 
-Receipts are versioned, stateless HMACs over the normalized public URL and the
-SHA-256 of the exact UTF-8 content. They add no timestamps, leases, retries,
-action ledger, provider budget, or database table.
+Receipts are versioned and stateless. Version 1 binds a normalized public URL
+to the SHA-256 of exact UTF-8 content. PDF version 2 additionally signs the
+requested and final URLs, every redirect hop, content and artifact hashes,
+parser metadata, target models, and server-assigned `p001..` parameter rows.
+Both versions add no timestamps, leases, retries, provider budget, or business
+database state. Version 2 rejects unknown fields and non-canonical JSON.
 
 Put the research-state database and Wiki.js values in the Hermes service
 environment or `~/.hermes/.env` so `${VAR}` substitution can pass them only to
@@ -90,6 +93,10 @@ PV_WIKI_TRUSTED_SOURCE_DOMAINS_JSON='{"INTERNAL_BRAND":["manufacturer.example"]}
 PV_WIKI_AUTO_PUBLISH_MIN_CONFIDENCE=0.85
 PV_WIKI_MIN_FACT_CONFIDENCE=0.8
 PV_WIKI_ALLOW_MIRRORS=false
+# Optional exact operator groups for PDF redirects. Every redirect hostname
+# must belong to the same configured group; shared multi-tenant hosts still
+# cannot redirect across hostnames. With no setting, the hostname cannot change.
+PV_WIKI_PDF_TRUSTED_HOST_GROUPS_JSON='[["docs.example.com","cdn.example.com"]]'
 ```
 
 Do not configure `PGUSER` or `PGPASSWORD` for either MCP. When the user
@@ -211,6 +218,12 @@ uncertain-action replay ledger. Keep exactly one PV Wiki cron job and do not
 allow overlapping research sessions. The completion primary key prevents
 completed products from being researched again.
 
+`web_fetch_exa` accepts at most 20 URLs in one call. This is only a bounded
+transport input that protects the MCP process; it is not a product research,
+query, URL, credit, or provider budget. PDF fallback remains inside the Exa MCP
+and never acquires an Exa key a second time. Each PDF redirect hop is restricted
+to HTTPS, public pinned DNS, valid TLS, and the operator policy above.
+
 The Exa gateway does not rotate and replay a request whose provider result is
 ambiguous. Hermes itself may reconnect and invoke an MCP tool once more after a
 transport failure. That delegated retry is intentionally not tracked in PV
@@ -244,8 +257,9 @@ approved representative product:
 1. A manual `pv_refresh_catalogue` creates the local snapshot, then the
    zero-argument `pv_next_product` returns `product_id`, `source_hash`, and the
    source record without connecting to the business database.
-2. `pv_save_research` accepts a schema-version-`2` decision once; a replay
-   returns `created=false` without overwriting it.
+2. `pv_save_research` accepts a schema-version-`3` decision once; a replay
+   returns `created=false` without overwriting it. Stored version-`2` decisions
+   remain renderable as-is and are never rewritten or researched again.
    Every submitted evidence document must carry the unchanged `url`, exact
    `content`, and `receipt` returned together by `web_fetch_exa`; missing or
    altered receipts are rejected.
@@ -265,6 +279,25 @@ operator or separate service timer:
 ```
 
 Both commands are idempotent and never invoke Exa or a model.
+
+Completion-only publication administration is separate from research. It uses
+append-only publication/control side tables and leaves the immutable completion
+primary key untouched. Suppression hides a pending completion without deleting
+it; resume exposes the same completion again. Rerender defaults to preview,
+requires an already-published exact path, refuses missing pages and moves, and
+preserves all human-owned page bytes outside the managed block. Applying a
+rerender is explicit and fenced against concurrent publication/control events:
+
+```bash
+/opt/pv-wiki/.venv/bin/pv-wiki-admin status --product-id PRODUCT_ID
+/opt/pv-wiki/.venv/bin/pv-wiki-admin suppress --product-id PRODUCT_ID --reason 'operator hold'
+/opt/pv-wiki/.venv/bin/pv-wiki-admin resume --product-id PRODUCT_ID --reason 'review complete'
+/opt/pv-wiki/.venv/bin/pv-wiki-admin rerender --product-id PRODUCT_ID
+/opt/pv-wiki/.venv/bin/pv-wiki-admin rerender --product-id PRODUCT_ID --apply
+```
+
+These side tables do not change `StateStore` schema version 9 and contain no
+legacy lease, retry, budget, or schema-10-through-13 state.
 
 ## Optional Streamable HTTP isolation
 

@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 from pv_wiki.decision import (  # noqa: E402
     DecisionError,
     SourceVerificationError,
+    _structured_table_quote_supports_fact,
     catalogue_model_candidates,
     model_matches_catalogue_identity,
     preferred_catalogue_model,
@@ -591,6 +592,51 @@ class DecisionTests(unittest.TestCase):
                 trusted_source_domains={"foxess.example"},
                 evidence_text_by_url={url: f"{body}\n{ambiguous_row}"},
             )
+
+    def test_markdown_multi_table_context_cannot_cross_table_boundary(self) -> None:
+        model_row = "| Parameter | PV-42 | PV-43 |"
+        fact_row = "| Rated output power | 4200 W | 4300 W |"
+        same_table = "\n".join(
+            (
+                model_row,
+                "| --- | --- | --- |",
+                "| Input voltage | 48 V | 52 V |",
+                fact_row,
+            )
+        )
+        separate_tables = "\n\n".join(
+            (
+                "\n".join((model_row, "| --- | --- | --- |")),
+                "\n".join(
+                    (
+                        "| Parameter | Other-A | Other-B |",
+                        "| --- | --- | --- |",
+                        fact_row,
+                    )
+                ),
+            )
+        )
+
+        arguments = {
+            "model_quote": model_row,
+            "fact_quote": fact_row,
+            "name": "Rated output power",
+            "value": 4200,
+            "unit": "W",
+            "expected_product_name": "PV-42",
+        }
+        self.assertTrue(
+            _structured_table_quote_supports_fact(
+                **arguments,
+                source_body=same_table,
+            )
+        )
+        self.assertFalse(
+            _structured_table_quote_supports_fact(
+                **arguments,
+                source_body=separate_tables,
+            )
+        )
 
     def test_rejects_lease_mismatch_and_low_confidence(self) -> None:
         with self.assertRaisesRegex(DecisionError, "lease_token"):

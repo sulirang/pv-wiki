@@ -42,8 +42,9 @@ uncited claims.
    Do not impose fixed rounds, query counts, URL counts, credit limits, or a
    wall-clock deadline inside this workflow.
 6. When the decision is ready, call `pv_save_research` with the selected
-   `product_id`, its unchanged `source_hash`, a schema-version `2` decision,
-   and the extracted evidence documents. Saving is the durable completion
+   `product_id`, its unchanged `source_hash`, a schema-version `3` publish
+   decision (version `2` remains accepted only for compatibility), and the
+   extracted evidence documents. Saving is the durable completion
    boundary. Correct a deterministic validation error and resubmit the fixed
    payload. After a successful response, do not call save again. If the
    response is lost, safely retry the same payload: the completion primary key
@@ -69,6 +70,10 @@ uncited claims.
   `url`, exact `content`, and `receipt` together from one `web_fetch_exa` JSON
   result. Do not edit, normalize, summarize, concatenate, or reconstruct the
   content before saving it. Never invent or alter a receipt.
+- A PDF result carries a version-2 receipt and `parameter_rows`. Copy the exact
+  returned array into decision `parameters`; do not reassign IDs, change
+  whitespace, reorder rows, or derive it from prose. The server assigns
+  `p001..` in document order and stores its deterministic parameter-set hash.
 - Publish only facts supported by a declared source URL and at least one exact
   quote copied from that URL's fetched content. The quote must bind the exact
   model, fact name, value, and unit; for extracted tables, add an exact
@@ -91,7 +96,8 @@ Pass `evidence_documents` as objects containing the normalized public HTTP(S)
 `url`, exact fetched `content`, and `receipt` returned together by
 `web_fetch_exa`. The server verifies the receipt before all identity, source,
 and fact gates, then stores only the URL and content SHA-256. A search result
-or hand-written content cannot be used because it has no valid receipt.
+or hand-written content cannot be used because it has no valid receipt. PDF
+receipts are JSON objects; version-1 non-PDF receipts remain strings.
 
 ```json
 {
@@ -99,7 +105,18 @@ or hand-written content cannot be used because it has no valid receipt.
     {
       "url": "https://public.example/datasheet.pdf",
       "content": "Exact content returned by web_fetch_exa, including newlines",
-      "receipt": "pvwiki-evidence-v1.REDACTED_EXAMPLE_SIGNATURE"
+      "receipt": {
+        "version": "pvwiki-evidence-v2",
+        "requested_url": "https://public.example/datasheet.pdf",
+        "final_url": "https://public.example/datasheet.pdf",
+        "redirect_chain": ["https://public.example/datasheet.pdf"],
+        "content_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "parser_metadata": {"contract_version": "2026-07-29.2", "page_count": 2, "extracted_pages": 2, "truncated": false},
+        "target_models": ["EXACT-MODEL"],
+        "parameter_rows": [{"parameter_id": "p001", "model": "EXACT-MODEL", "source_label": "Rated output power", "value": "5000", "unit": "W", "section": "Output (AC)", "page": 2, "order": 1, "model_quote": "Type EXACT-MODEL", "quote": "Rated output power 5000 W", "table_title": "Technical data", "value_state": "explicit"}],
+        "signature": "REDACTED_EXAMPLE_SIGNATURE"
+      }
     }
   ]
 }
@@ -109,13 +126,17 @@ Use this decision shape:
 
 ```json
 {
-  "schema_version": "2",
+  "schema_version": "3",
   "product_id": "exact selected id",
   "outcome": "publish",
   "confidence": 0.95,
   "manufacturer": "Exact manufacturer",
+  "manufacturer_zh": "制造商中文名称",
   "model": "Exact model",
   "product_category": "Category",
+  "product_category_code": "inverter",
+  "product_type": "并网光伏逆变器",
+  "product_description_zh": "基于引用资料的简明中文产品描述。",
   "summary": "Short evidence-based summary",
   "review_summary": "Optional sourced market summary",
   "review_evidence_urls": ["https://public.example/review"],
@@ -129,6 +150,24 @@ Use this decision shape:
     }
   ],
   "sources": [],
+  "parameters": [
+    {
+      "parameter_id": "p001",
+      "model": "EXACT-MODEL",
+      "source_label": "Rated output power",
+      "value": "5000",
+      "unit": "W",
+      "section": "Output (AC)",
+      "page": 2,
+      "order": 1,
+      "model_quote": "Type EXACT-MODEL",
+      "quote": "Rated output power 5000 W",
+      "table_title": "Technical data",
+      "value_state": "explicit"
+    }
+  ],
+  "parameter_enrichment": null,
+  "derived_insights": [],
   "facts": [
     {
       "name": "Rated power",
@@ -148,6 +187,15 @@ Use this decision shape:
   "conflicts": []
 }
 ```
+
+`product_category_code` must be one of the server's published codes. Chinese
+manufacturer, description, and product type are required for a version-3
+publish. `parameters` must exactly equal one signed PDF parameter set. If
+`parameter_enrichment` is present, it must translate every parameter exactly
+once and every professional-analysis numeric claim must be deterministically
+grounded in its declared `p001..` basis rows. `derived_insights` accepts only
+bounded two-operand arithmetic whose literals exactly equal its two basis
+values; the server recomputes the result. Unknown future schemas fail closed.
 
 For a non-publish outcome, use empty `datasheets`, `sources`, `facts`, and
 review fields, explain the conclusion in `decision_notes`, and add at least one
