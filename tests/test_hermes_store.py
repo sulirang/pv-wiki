@@ -1328,7 +1328,11 @@ class HermesCompletionStoreTests(unittest.TestCase):
         # network-disabled local Docker validation opts into the real MCP
         # async tool runner and covers that bridge on this same machine.
         if os.environ.get("PV_WIKI_TEST_REAL_MCP_RUNNER") == "1":
-            output = asyncio.run(tools["pv_research_status"].run({}))
+            # MCP v2's runner requires a context. None is safe because this
+            # zero-argument tool declares no context parameter or resolver.
+            output = asyncio.run(
+                tools["pv_research_status"].run({}, None)
+            )
         else:
             output = tools["pv_research_status"].fn()
         self.assertFalse(output.is_error)
