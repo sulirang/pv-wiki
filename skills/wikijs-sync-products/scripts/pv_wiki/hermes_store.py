@@ -2322,8 +2322,10 @@ def publish_researched(
     summary = " ".join(
         str(render_model.decision.get("summary") or "").split()
     )
+    # Wiki.js pages.description is varchar(255); keep the description
+    # within the column limit (255 chars) instead of the previous 500.
     description = (summary or f"Datasheet and cited specifications for {title}.")[
-        :500
+        :255
     ]
     managed = render_product_page(
         product,

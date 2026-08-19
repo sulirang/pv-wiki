@@ -321,6 +321,30 @@ def _normalise_target_models(value: list[str] | str | None) -> list[str]:
     return normalized
 
 
+def _normalise_single_url(value: str) -> str:
+    """Validate and normalize one URL for the scrapling fallback fetcher."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("url must be a non-empty string")
+    if not value.startswith(("http://", "https://")):
+        raise ValueError("url must be an http(s) URL")
+    if "\n" in value or "\r" in value:
+        raise ValueError("url must not contain newlines")
+    return value.strip()
+
+
+def _positive_number(value: Any, *, default: float) -> float:
+    """Return a positive finite number from a number-like value or the default."""
+    if value is None:
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("value must be a number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError("value must be finite and greater than zero")
+    return number
+
+
 def _trusted_pdf_host_groups_from_environment(
     environ: Mapping[str, str],
 ) -> tuple[tuple[str, ...], ...]:
@@ -824,8 +848,87 @@ def build_server(
             message = _error_message(exc) if isinstance(exc, ExaPoolError) else str(exc)
             return text_result(f"web_fetch_exa error: {message}", is_error=True)
 
-    return server
+    @server.tool(
+        name="web_fetch_scrapling",
+        description=(
+            "Fallback page fetcher that renders JavaScript with a headless "
+            "browser (Scrapling DynamicFetcher). Use when web_fetch_exa reports "
+            "CRAWL_NOT_FOUND or returns no content for a page. Returns the same "
+            "JSON evidence-document shape as web_fetch_exa: each successful "
+            "result has url, exact content, content_sha256, and a receipt "
+            "accepted by pv_save_research. One call accepts a single URL; "
+            "browser rendering is resource-intensive, so prefer web_fetch_exa "
+            "first and use this tool only as a fallback."
+        ),
+        annotations=annotations,
+        structured_output=False,
+    )
+    def web_fetch_scrapling(
+        url: str,
+        wait_seconds: int | float | str | None = None,
+        max_characters: int | float | str | None = None,
+    ) -> Any:
+        """Fetch one URL with a JS-rendering browser and return a receipted document."""
+        try:
+            clean_url = _normalise_single_url(url)
+            timeout = _positive_number(wait_seconds, default=45.0)
+            max_chars = _positive_number(max_characters, default=200_000)
+            try:
+                from scrapling.fetchers import DynamicFetcher
+            except ImportError as exc:
+                return text_result(
+                    "web_fetch_scrapling error: Scrapling is not installed in this "
+                    "MCP environment; install the scrapling dependency to enable "
+                    "browser fallback fetching.",
+                    is_error=True,
+                )
+            import os as _os
+            _os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/data/.cache/ms-playwright")
+            page = DynamicFetcher.fetch(
+                clean_url,
+                headless=True,
+                network_idle=True,
+                timeout=int(timeout * 1000),
+            )
+            status = getattr(page, "status", None)
+            body = page.body if isinstance(page.body, (bytes, bytearray)) else b""
+            if isinstance(page.body, str):
+                body = page.body.encode("utf-8", errors="replace")
+            text = page.get_all_text() if hasattr(page, "get_all_text") else ""
+            if not isinstance(text, str) or not text.strip():
+                return text_result(
+                    "web_fetch_scrapling error: rendered page contains no text "
+                    f"(status={status}, bytes={len(body)})",
+                    is_error=True,
+                )
+            if len(text) > max_chars:
+                text = text[:max_chars]
+            normalized_url = normalize_evidence_url(clean_url)
+            receipt = issue_evidence_receipt(
+                active_receipt_key,
+                url=normalized_url,
+                content=text,
+            )
+            evidence = {
+                "url": normalized_url,
+                "content": text,
+                "content_sha256": content_sha256(text),
+                "receipt": receipt,
+                "fetcher": "scrapling",
+                "status": status,
+            }
+            return text_result(
+                json.dumps({"results": [evidence]}, ensure_ascii=False, separators=(",", ":"))
+            )
+        except (EvidenceReceiptError, ValueError, TypeError) as exc:
+            return text_result(f"web_fetch_scrapling error: {exc}", is_error=True)
+        except Exception as exc:
+            return text_result(
+                f"web_fetch_scrapling error: {type(exc).__name__}: {str(exc)[:300]}",
+                is_error=True,
+            )
 
+    return server
 
 def _positive_float_environment(name: str, default: float) -> float:
     raw = os.getenv(name)
